@@ -2,6 +2,7 @@ import sqlite3
 import hashlib
 import os
 import logging
+from datetime import datetime, timedelta
 
 DATABASE_NAME = "gscapy_user_data.db"
 
@@ -14,6 +15,14 @@ def get_db_connection():
 def hash_password(password):
     """Hashes a password using SHA-256."""
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+def _add_column_if_not_exists(cursor, table_name, column_name, column_type):
+    """Utility to add a column to a table if it doesn't already exist."""
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cursor.fetchall()]
+    if column_name not in columns:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+        logging.info(f"Added column '{column_name}' to table '{table_name}'.")
 
 def create_tables():
     """Creates the necessary tables in the database if they don't exist."""
@@ -32,6 +41,15 @@ def create_tables():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    # Add profile columns if they don't exist, for backward compatibility
+    _add_column_if_not_exists(cursor, "users", "full_name", "TEXT")
+    _add_column_if_not_exists(cursor, "users", "age", "INTEGER")
+    _add_column_if_not_exists(cursor, "users", "job_title", "TEXT")
+
+    # Add brute-force protection columns
+    _add_column_if_not_exists(cursor, "users", "failed_login_attempts", "INTEGER DEFAULT 0")
+    _add_column_if_not_exists(cursor, "users", "lockout_until", "TIMESTAMP")
 
     # Security questions table
     cursor.execute("""
@@ -110,19 +128,75 @@ def create_admin_user():
     logging.info("Default admin user created successfully.")
 
 def verify_user(username, password):
-    """Verifies user credentials against the database."""
+    """
+    Verifies user credentials, checks for lockouts, and records failed attempts.
+    Returns the user row on success.
+    Returns None on password mismatch or if user not found.
+    Returns a string 'locked:YYYY-MM-DD HH:MM:SS.ffffff' if the account is locked.
+    """
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # First, get the user and check their lockout status
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+
+    if not user:
+        conn.close()
+        return None  # User does not exist
+
+    # Check if the user is currently locked out
+    if user['lockout_until']:
+        try:
+            # The timestamp from the DB might not have microseconds
+            lockout_end_time = datetime.fromisoformat(user['lockout_until'])
+            if lockout_end_time > datetime.now():
+                conn.close()
+                return f"locked:{user['lockout_until']}"
+        except (ValueError, TypeError):
+            # Handle cases where the timestamp format is unexpected
+            logging.error(f"Could not parse lockout_until timestamp '{user['lockout_until']}' for user '{username}'.")
+
+    # Now, verify the password
     hashed_password = hash_password(password)
+    if user['password_hash'] == hashed_password and user['is_active'] == 1:
+        # On successful login, clear any previous failed attempts
+        clear_login_attempts(user['id'], cursor)
+        conn.commit()
+        conn.close()
+        return user
+    else:
+        # On failed login, record the attempt
+        record_failed_login(user['id'], user['failed_login_attempts'], cursor)
+        conn.commit()
+        conn.close()
+        return None
+
+def record_failed_login(user_id, current_attempts, cursor):
+    """
+    Increments the failed login counter and sets a lockout if the threshold is exceeded.
+    Takes a cursor to operate within an existing transaction.
+    """
+    new_attempts = current_attempts + 1
+    lockout_time = None
+
+    # Lock for 15 minutes after 5 failed attempts
+    if new_attempts >= 5:
+        lockout_time = datetime.now() + timedelta(minutes=15)
+        logging.warning(f"User ID {user_id} locked out until {lockout_time}.")
 
     cursor.execute("""
-        SELECT * FROM users WHERE username = ? AND password_hash = ? AND is_active = 1
-    """, (username, hashed_password))
+        UPDATE users
+        SET failed_login_attempts = ?, lockout_until = ?
+        WHERE id = ?
+    """, (new_attempts, lockout_time, user_id))
 
-    user = cursor.fetchone()
-    conn.close()
-    return user
+def clear_login_attempts(user_id, cursor):
+    """
+    Resets failed login attempts and lockout for a user.
+    Takes a cursor to operate within an existing transaction.
+    """
+    cursor.execute("UPDATE users SET failed_login_attempts = 0, lockout_until = NULL WHERE id = ?", (user_id,))
 
 def check_username_or_email_exists(username, email):
     """Checks if a username or email already exists in the database."""
@@ -170,10 +244,29 @@ def get_all_users():
     """Retrieves all users from the database for the admin panel."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, username, email, is_admin, is_active FROM users")
+    cursor.execute("SELECT id, username, email, is_admin, is_active, full_name, age, job_title FROM users")
     users = cursor.fetchall()
     conn.close()
     return users
+
+def update_user_profile(user_id, full_name, age, job_title):
+    """Updates the profile information for a given user."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Ensure age is an integer or None
+        age_int = int(age) if age else None
+    except (ValueError, TypeError):
+        age_int = None # Set to None if conversion fails
+        logging.warning(f"Could not convert age '{age}' to integer for user_id {user_id}. Setting to NULL.")
+
+    cursor.execute("""
+        UPDATE users
+        SET full_name = ?, age = ?, job_title = ?
+        WHERE id = ?
+    """, (full_name, age_int, job_title, user_id))
+    conn.commit()
+    conn.close()
 
 def set_user_active_status(user_id, is_active):
     """Updates the is_active status for a given user."""

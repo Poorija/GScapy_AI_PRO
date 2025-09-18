@@ -6,9 +6,11 @@ from PyQt6.QtWidgets import (
     QPushButton, QStackedWidget, QFormLayout, QMessageBox, QGroupBox, QComboBox,
     QGraphicsOpacityEffect
 )
+from qt_material import apply_stylesheet, list_themes
 from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QIcon, QPixmap
 import database
+from captcha import generate_captcha
 
 # This list must be kept in sync with the one in database.py
 SECURITY_QUESTIONS_LIST = [
@@ -156,6 +158,8 @@ class LoginDialog(QDialog):
         self.setWindowTitle("GScapy - Login")
         self.setModal(True)
         self.current_user = None
+        self.selected_theme = 'dark_blue.xml' # Default theme
+        self.captcha_text = None
 
         # --- Main Layout and Styling ---
         main_layout = QVBoxLayout(self)
@@ -204,16 +208,63 @@ class LoginDialog(QDialog):
         self.stacked_widget.addWidget(self.login_page)
         self.stacked_widget.addWidget(self.register_page)
 
-        self.setMinimumSize(500, 650) # Increased height for better spacing
+        self.setMinimumSize(500, 700) # Increased height for captcha
         self.adjustSize()
 
-        # --- Animation ---
+        # --- Animation & Initial State ---
         self.start_logo_animation()
+        self._refresh_captcha() # Load the first captcha
 
     def _handle_password_reset_request(self):
         """Opens the password reset dialog."""
         reset_dialog = PasswordResetDialog(self)
         reset_dialog.exec()
+
+    def _handle_theme_change(self, theme_name):
+        """Applies the selected theme to the entire application."""
+        self.selected_theme = f"{theme_name}.xml"
+        # This dictionary should be kept in sync with the one in gscapy.py
+        extra_qss = {
+            'QGroupBox': {
+                'border': '1px solid #444;',
+                'border-radius': '8px',
+                'margin-top': '10px',
+            },
+            'QGroupBox::title': {
+                'subcontrol-origin': 'margin',
+                'subcontrol-position': 'top left',
+                'padding': '0 10px',
+            },
+            'QTabWidget::pane': {
+                'border-top': '1px solid #444;',
+                'margin-top': '-1px',
+            },
+            'QFrame': {
+                'border-radius': '8px',
+            },
+            'QPushButton': {
+                'border-radius': '8px',
+            },
+            'QLineEdit': {
+                'border-radius': '8px',
+            },
+            'QComboBox': {
+                'border-radius': '8px',
+            },
+            'QTextEdit': {
+                'border-radius': '8px',
+            },
+            'QPlainTextEdit': {
+                'border-radius': '8px',
+            },
+            'QListWidget': {
+                'border-radius': '8px',
+            },
+            'QTreeWidget': {
+                'border-radius': '8px',
+            }
+        }
+        apply_stylesheet(QApplication.instance(), theme=self.selected_theme, extra=extra_qss)
 
     def start_logo_animation(self):
         """Creates and starts a fade-in animation for the logo."""
@@ -225,6 +276,17 @@ class LoginDialog(QDialog):
         self.animation.setEndValue(1.0)
         self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self.animation.start()
+
+    def _refresh_captcha(self):
+        """Generates a new captcha and updates the UI."""
+        try:
+            pixmap, text = generate_captcha()
+            self.captcha_image_label.setPixmap(pixmap)
+            self.captcha_text = text
+        except Exception as e:
+            self.captcha_image_label.setText("Captcha Failed")
+            self.captcha_text = "fallback" # Set a fallback to prevent login lockout
+            logging.error(f"Failed to generate captcha: {e}", exc_info=True)
 
     def _create_login_page(self):
         page = QWidget()
@@ -241,6 +303,28 @@ class LoginDialog(QDialog):
 
         form_layout.addRow("Username:", self.login_username_edit)
         form_layout.addRow("Password:", self.login_password_edit)
+
+        # --- Captcha ---
+        self.captcha_image_label = QLabel("Captcha loading...")
+        self.captcha_input_edit = QLineEdit()
+        self.captcha_input_edit.setPlaceholderText("Enter Captcha Text")
+        refresh_captcha_btn = QPushButton()
+        refresh_captcha_btn.setIcon(QIcon.fromTheme("view-refresh", QIcon("icons/refresh-cw.svg"))) # Use themed icon with fallback
+        refresh_captcha_btn.clicked.connect(self._refresh_captcha)
+
+        captcha_group_layout = QHBoxLayout()
+        captcha_group_layout.addWidget(self.captcha_image_label, 2) # Give more space to image
+        captcha_group_layout.addWidget(self.captcha_input_edit, 2)
+        captcha_group_layout.addWidget(refresh_captcha_btn, 1)
+        form_layout.addRow("Captcha:", captcha_group_layout)
+
+
+        # --- Theme Selector ---
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems([theme.replace('.xml', '') for theme in list_themes()])
+        self.theme_combo.setCurrentText(self.selected_theme.replace('.xml', ''))
+        self.theme_combo.textActivated.connect(self._handle_theme_change)
+        form_layout.addRow("Theme:", self.theme_combo)
 
         login_button = QPushButton("Login")
         login_button.clicked.connect(self._handle_login)
@@ -361,18 +445,44 @@ class LoginDialog(QDialog):
     def _handle_login(self):
         username = self.login_username_edit.text().strip()
         password = self.login_password_edit.text()
+        captcha_input = self.captcha_input_edit.text().strip()
 
-        if not username or not password:
-            QMessageBox.warning(self, "Input Error", "Username and password are required.")
+        if not username or not password or not captcha_input:
+            QMessageBox.warning(self, "Input Error", "Username, password, and captcha are required.")
             return
 
-        user = database.verify_user(username, password)
-        if user:
-            self.current_user = dict(user)
+        # Case-insensitive captcha check
+        if captcha_input.upper() != self.captcha_text.upper():
+            QMessageBox.warning(self, "Login Failed", "Incorrect captcha. Please try again.")
+            self._refresh_captcha()
+            self.captcha_input_edit.clear()
+            return
+
+        user_or_status = database.verify_user(username, password)
+
+        if isinstance(user_or_status, str) and user_or_status.startswith('locked:'):
+            from datetime import datetime
+            try:
+                timestamp_str = user_or_status.split(':', 1)[1]
+                lockout_end = datetime.fromisoformat(timestamp_str)
+                remaining = lockout_end - datetime.now()
+                # Ensure we don't show negative time
+                remaining_minutes = max(0, remaining.seconds // 60)
+                remaining_seconds = max(0, remaining.seconds % 60)
+                QMessageBox.warning(self, "Account Locked", f"This account is temporarily locked due to too many failed login attempts. Please try again in {remaining_minutes} minutes and {remaining_seconds} seconds.")
+            except (IndexError, ValueError):
+                 QMessageBox.warning(self, "Account Locked", "This account is temporarily locked.")
+            return
+
+        if user_or_status:
+            self.current_user = dict(user_or_status)
             QMessageBox.information(self, "Success", f"Welcome, {self.current_user['username']}!")
             self.accept()
         else:
             QMessageBox.warning(self, "Login Failed", "Invalid username or password, or account is inactive.")
+            # Refresh captcha on any failed login attempt for security
+            self._refresh_captcha()
+            self.captcha_input_edit.clear()
 
     def _handle_register(self):
         username = self.reg_username_edit.text().strip()

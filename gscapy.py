@@ -1270,6 +1270,7 @@ class GScapy(QMainWindow):
 
         # --- Admin Menu (Conditional) ---
         # Use .get() for safer dictionary access, in case current_user is None
+        logging.info(f"Updating menu bar for user: {self.current_user}")
         if self.current_user and self.current_user.get('is_admin'):
             admin_menu = self.menu_bar.addMenu("&Admin")
             admin_menu.addAction(QIcon("icons/shield.svg"), "Admin Panel...", self._show_admin_panel)
@@ -1497,7 +1498,50 @@ class GScapy(QMainWindow):
     def _handle_theme_change(self, theme_name):
         theme_file = f"{theme_name}.xml"
         invert_secondary = "light" in theme_name
-        apply_stylesheet(QApplication.instance(), theme=theme_file, invert_secondary=invert_secondary)
+
+        # This dictionary must be kept in sync with the one in login.py and main()
+        extra_qss = {
+            'QGroupBox': {
+                'border': '1px solid #444;',
+                'border-radius': '8px',
+                'margin-top': '10px',
+            },
+            'QGroupBox::title': {
+                'subcontrol-origin': 'margin',
+                'subcontrol-position': 'top left',
+                'padding': '0 10px',
+            },
+            'QTabWidget::pane': {
+                'border-top': '1px solid #444;',
+                'margin-top': '-1px',
+            },
+            'QFrame': {
+                'border-radius': '8px',
+            },
+            'QPushButton': {
+                'border-radius': '8px',
+            },
+            'QLineEdit': {
+                'border-radius': '8px',
+            },
+            'QComboBox': {
+                'border-radius': '8px',
+            },
+            'QTextEdit': {
+                'border-radius': '8px',
+            },
+            'QPlainTextEdit': {
+                'border-radius': '8px',
+            },
+            'QListWidget': {
+                'border-radius': '8px',
+            },
+            'QTreeWidget': {
+                'border-radius': '8px',
+            }
+        }
+
+        apply_stylesheet(QApplication.instance(), theme=theme_file, invert_secondary=invert_secondary, extra=extra_qss)
 
         # After applying the stylesheet, notify the AI tab to update its themed icons
         if hasattr(self, 'ai_assistant_tab'):
@@ -9516,7 +9560,7 @@ def main():
         extra_qss = {
             'QGroupBox': {
                 'border': '1px solid #444;',
-                'border-radius': '15px',
+                'border-radius': '8px',
                 'margin-top': '10px',
             },
             'QGroupBox::title': {
@@ -9529,16 +9573,38 @@ def main():
                 'margin-top': '-1px',
             },
             'QFrame': {
-                'border-radius': '15px',
+                'border-radius': '8px',
             },
             'QPushButton': {
-                'border-radius': '15px',
+                'border-radius': '8px',
+            },
+            'QLineEdit': {
+                'border-radius': '8px',
+            },
+            'QComboBox': {
+                'border-radius': '8px',
+            },
+            'QTextEdit': {
+                'border-radius': '8px',
+            },
+            'QPlainTextEdit': {
+                'border-radius': '8px',
+            },
+            'QListWidget': {
+                'border-radius': '8px',
+            },
+            'QTreeWidget': {
+                'border-radius': '8px',
             }
         }
-        apply_stylesheet(app, theme='dark_blue.xml', extra=extra_qss)
+        # Apply the theme selected in the login dialog, which is now the app's current theme
+        apply_stylesheet(app, theme=login_dialog.selected_theme, extra=extra_qss)
 
         window = GScapy()
         window.current_user = login_dialog.current_user
+        # Set window title with username
+        if window.current_user and 'username' in window.current_user:
+            window.setWindowTitle(f"Welcome, {window.current_user['username']} - GScapy + AI")
         window._update_menu_bar() # Populate the menu now that we have a user
         window.show()
         sys.exit(app.exec())
