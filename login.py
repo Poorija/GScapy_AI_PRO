@@ -177,7 +177,7 @@ class LoginDialog(QDialog):
         # Logo
         self.logo_label = QLabel()
         script_dir = os.path.dirname(os.path.realpath(__file__))
-        icon_path = os.path.join(script_dir, "icons", "shield.svg")
+        icon_path = os.path.join(script_dir, "icons", "new_logo.png")
         pixmap = QPixmap(icon_path)
         self.logo_label.setPixmap(pixmap.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         header_layout.addWidget(self.logo_label)
@@ -318,7 +318,7 @@ class LoginDialog(QDialog):
         self.lockout_widget = QWidget()
         lockout_layout = QHBoxLayout(self.lockout_widget)
         self.lockout_icon_label = QLabel()
-        self.lockout_icon_label.setPixmap(QIcon.fromTheme("dialog-error", QIcon("icons/x-circle.svg")).pixmap(24, 24))
+        self.lockout_icon_label.setPixmap(QIcon.fromTheme("dialog-error", QIcon("icons/new_logo.png")).pixmap(24, 24))
         self.lockout_label = QLabel()
         lockout_layout.addWidget(self.lockout_icon_label)
         lockout_layout.addWidget(self.lockout_label)
