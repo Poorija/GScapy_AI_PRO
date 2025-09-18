@@ -98,8 +98,8 @@ class LoginDialog(QDialog):
 
         for i in range(3):
             q_combo = QComboBox()
-            q_combo.addItems([q for _, q in available_questions])
-            q_combo.setUserData([id for id, _ in available_questions])
+            for q_id, q_text in available_questions:
+                q_combo.addItem(q_text, userData=q_id)
             a_edit = QLineEdit()
             a_edit.setPlaceholderText(f"Answer for question {i+1}")
             questions_layout.addRow(f"Question {i+1}:", q_combo)
@@ -156,16 +156,16 @@ class LoginDialog(QDialog):
         questions_with_answers = []
         selected_question_indices = set()
         for item in self.security_questions_widgets:
-            q_index = item['combo'].currentIndex()
+            q_id = item['combo'].currentData()
             answer = item['answer'].text().strip()
             if not answer:
                 QMessageBox.warning(self, "Input Error", "All three security questions must be answered.")
                 return
-            if q_index in selected_question_indices:
+            if q_id in selected_question_indices:
                 QMessageBox.warning(self, "Input Error", "Please select three different security questions.")
                 return
-            selected_question_indices.add(q_index)
-            questions_with_answers.append((q_index, answer))
+            selected_question_indices.add(q_id)
+            questions_with_answers.append((q_id, answer))
 
         # --- Database Interaction ---
         try:
