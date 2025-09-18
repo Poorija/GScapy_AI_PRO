@@ -10,6 +10,7 @@ from qt_material import apply_stylesheet, list_themes
 from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
 from PyQt6.QtGui import QIcon, QPixmap
 import database
+import logging
 from captcha import generate_captcha
 
 # This list must be kept in sync with the one in database.py
@@ -205,21 +206,23 @@ class LoginDialog(QDialog):
         self.login_page = self._create_login_page()
         self.register_page = self._create_register_page()
 
-        self.stacked_widget.addWidget(self.login_page)
+        # Create all pages first
+        self.login_page = self._create_login_page()
+        self.admin_login_page = self._create_admin_login_page()
+        self.register_page = self._create_register_page()
+
+        # Create the inner stack for login/admin-login
+        self.login_page_stack = QStackedWidget()
+        self.login_page_stack.addWidget(self.login_page)
+        self.login_page_stack.addWidget(self.admin_login_page)
+
+        # Add the two main views (the login stack and the register page) to the main stacked widget
+        self.stacked_widget.addWidget(self.login_page_stack)
         self.stacked_widget.addWidget(self.register_page)
 
         self.lockout_end_time = None
         self.lockout_timer = QTimer(self)
         self.lockout_timer.timeout.connect(self._update_lockout_timer)
-
-        self.login_page_stack = QStackedWidget()
-        self.login_page = self._create_login_page()
-        self.admin_login_page = self._create_admin_login_page()
-        self.login_page_stack.addWidget(self.login_page)
-        self.login_page_stack.addWidget(self.admin_login_page)
-
-        self.stacked_widget.addWidget(self.login_page_stack)
-        self.stacked_widget.addWidget(self.register_page)
 
         self.setMinimumSize(500, 750) # Increased height for new widgets
         self.adjustSize()
@@ -296,10 +299,10 @@ class LoginDialog(QDialog):
             pixmap, text = generate_captcha()
             self.captcha_image_label.setPixmap(pixmap)
             self.captcha_text = text
-        except Exception as e:
+        except Exception:
             self.captcha_image_label.setText("Captcha Failed")
             self.captcha_text = "fallback" # Set a fallback to prevent login lockout
-            logging.error(f"Failed to generate captcha: {e}", exc_info=True)
+            logging.error("Failed to generate captcha", exc_info=True)
 
     def _create_login_page(self):
         page = QWidget()
