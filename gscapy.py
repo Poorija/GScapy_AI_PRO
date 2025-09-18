@@ -82,6 +82,8 @@ from PyQt6.QtWidgets import (
     QHeaderView, QInputDialog, QGraphicsOpacityEffect, QStackedWidget
 )
 from ai_tab import AIAssistantTab, AISettingsDialog, AIGuideDialog
+from login import LoginDialog
+from admin_panel import AdminPanelDialog
 from PyQt6.QtCore import QObject, pyqtSignal, Qt, QThread, QTimer, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup, QPoint, QSize
 from PyQt6.QtGui import QAction, QIcon, QFont, QTextCursor, QActionGroup
 
@@ -1178,6 +1180,7 @@ class GScapy(QMainWindow):
         self.setWindowIcon(QIcon(icon_path))
         self.setGeometry(100, 100, 1200, 800)
 
+        self.current_user = None
         self.packets_data = []; self.sniffer_thread = None; self.channel_hopper = None
         self.packet_layers = []; self.current_field_widgets = []; self.tcp_flag_vars = {}
         self.tool_results_queue = Queue()
@@ -1252,16 +1255,30 @@ class GScapy(QMainWindow):
 
     def _create_menu_bar(self):
         """Creates the main menu bar (File, Help)."""
-        self.menu_bar = QMenuBar(self); self.setMenuBar(self.menu_bar)
+        self.menu_bar = QMenuBar(self)
+        self.setMenuBar(self.menu_bar)
+
         file_menu = self.menu_bar.addMenu("&File")
+
+        if self.current_user and self.current_user['is_admin']:
+            file_menu.addAction("Admin Panel...", self._show_admin_panel)
+            file_menu.addSeparator()
+
         file_menu.addAction("&Save Captured Packets", self.save_packets)
         file_menu.addAction("&Load Packets from File", self.load_packets)
-        file_menu.addSeparator(); file_menu.addAction("&Exit", self.close)
+        file_menu.addSeparator()
+        file_menu.addAction("&Exit", self.close)
+
         help_menu = self.menu_bar.addMenu("&Help")
         help_menu.addAction("&About GScapy", self._show_about_dialog)
         help_menu.addSeparator()
         help_menu.addAction("&AI Settings...", self._show_ai_settings_dialog)
         help_menu.addAction("AI Guide", self._show_ai_guide_dialog)
+
+    def _show_admin_panel(self):
+        """Shows the admin panel dialog."""
+        admin_dialog = AdminPanelDialog(self)
+        admin_dialog.exec()
 
     def _show_ai_settings_dialog(self):
         """Shows the AI settings dialog."""
@@ -9231,8 +9248,13 @@ class GScapy(QMainWindow):
         summary_box = QGroupBox("Executive Summary")
         summary_layout = QVBoxLayout(summary_box)
         self.report_summary_text = QTextEdit()
-        self.report_summary_text.setPlaceholderText("Write a high-level summary of the assessment's findings and recommendations for a non-technical audience...")
+        self.report_summary_text.setPlaceholderText("Write a high-level summary of the assessment's findings and recommendations for a non-technical audience, or generate one with AI.")
+
+        ai_summary_btn = QPushButton(QIcon("icons/terminal.svg"), " Generate Summary with AI")
+        ai_summary_btn.clicked.connect(self._handle_ai_summary_generation)
+
         summary_layout.addWidget(self.report_summary_text)
+        summary_layout.addWidget(ai_summary_btn)
         left_layout.addWidget(summary_box)
 
         left_panel.setLayout(left_layout)
@@ -9288,6 +9310,37 @@ class GScapy(QMainWindow):
         main_layout.addWidget(main_splitter)
 
         return widget
+
+    def _handle_ai_summary_generation(self):
+        """Gathers findings, sends them to the AI, and sets a callback to populate the summary."""
+        if self.report_findings_tree.topLevelItemCount() == 0:
+            QMessageBox.warning(self, "No Data", "There are no findings to summarize. Please run the 'Aggregate & Enrich Results' tool first.")
+            return
+
+        findings_text = ""
+        for i in range(self.report_findings_tree.topLevelItemCount()):
+            item = self.report_findings_tree.topLevelItem(i)
+            host = item.text(0)
+            service = item.text(1)
+            finding = item.text(2)
+            details = item.text(3)
+            findings_text += f"- Host: {host}, Service: {service}, Finding: {finding}\n  Details: {details}\n\n"
+
+        prompt = (
+            "Based on the following list of penetration testing findings, please write a concise executive summary "
+            "suitable for a non-technical audience. Focus on the overall risk posture, key areas of weakness, "
+            "and high-level recommendations. The summary should be a few paragraphs long.\n\n"
+            f"--- FINDINGS ---\n{findings_text}--- END FINDINGS ---"
+        )
+
+        def _populate_summary(generated_text):
+            self.report_summary_text.setPlainText(generated_text)
+            QMessageBox.information(self, "Success", "AI-generated summary has been populated.")
+
+        self.ai_assistant_tab.set_completion_callback(_populate_summary)
+        self.ai_assistant_tab.send_message(prompt)
+        self.tab_widget.setCurrentWidget(self.ai_assistant_tab)
+        QMessageBox.information(self, "AI Task Started", "The AI is generating the summary. You will be notified upon completion. You can watch the progress in the 'AI Assistant' tab.")
 
     def _create_lab_tab(self):
         """Creates the UI for the LAB / Test Chaining tab."""
@@ -9440,11 +9493,20 @@ class GScapy(QMainWindow):
             self.lab_config_stack.setCurrentIndex(0) # Fallback to placeholder
 
 
+import database
+
 def main():
     """Main function to launch the GScapy application."""
     try:
+        database.initialize_database()
         if 'scapy' not in sys.modules: raise ImportError
+
         app = QApplication(sys.argv)
+
+        login_dialog = LoginDialog()
+        if login_dialog.exec() != QDialog.DialogCode.Accepted:
+            sys.exit(0)
+
         extra_qss = {
             'QGroupBox': {
                 'border': '1px solid #444;',
@@ -9468,14 +9530,20 @@ def main():
             }
         }
         apply_stylesheet(app, theme='dark_blue.xml', extra=extra_qss)
+
         window = GScapy()
+        window.current_user = login_dialog.current_user
         window.show()
         sys.exit(app.exec())
+
     except ImportError:
-        app = QApplication(sys.argv); QMessageBox.critical(None, "Fatal Error", "Scapy is not installed."); sys.exit(1)
+        app = QApplication(sys.argv)
+        QMessageBox.critical(None, "Fatal Error", "Scapy is not installed.")
+        sys.exit(1)
     except Exception as e:
         logging.critical(f"An unhandled exception occurred: {e}", exc_info=True)
-        app = QApplication(sys.argv); QMessageBox.critical(None, "Unhandled Exception", f"An unexpected error occurred:\n\n{e}")
+        app = QApplication(sys.argv)
+        QMessageBox.critical(None, "Unhandled Exception", f"An unexpected error occurred:\n\n{e}")
         sys.exit(1)
 
 if __name__ == "__main__":

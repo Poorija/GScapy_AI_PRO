@@ -655,6 +655,7 @@ class AIAssistantTab(QWidget):
         self.thinking_widget = None
         self.current_ai_bubble = None
         self.ai_thread = None
+        self.completion_callback = None
 
         self.ai_prompts = {
             "General Security & Analysis": {
@@ -668,6 +669,8 @@ class AIAssistantTab(QWidget):
                 "Security Checklist": "Generate a security checklist for hardening a new Ubuntu 22.04 web server that will host a public-facing website.",
                 "Compare Tools": "Compare and contrast the use cases for Nmap, Masscan, and RustScan. When would I choose one over the others?",
                 "Latest CVEs for Tech": "What are the most recent critical CVEs (last 6 months) for Apache Tomcat version 9.x?",
+                "IOC Extraction": "Extract all Indicators of Compromise (IOCs) from the following text. Categorize them into IP addresses, domains, file hashes, and registry keys.",
+                "MITRE ATT&CK Mapping": "Map the following observed attacker techniques to the MITRE ATT&CK framework. Provide the Technique ID and a brief justification.",
             },
             "Reconnaissance & OSINT": {
                 "Subdomain Enumeration Strategy": "Outline a comprehensive strategy for subdomain enumeration for the domain {TARGET_DOMAIN}, using both passive and active techniques.",
@@ -680,6 +683,8 @@ class AIAssistantTab(QWidget):
                 "Analyze WHOIS Data": "Analyze the following WHOIS record for {TARGET_DOMAIN} and point out any information that could be useful for social engineering or infrastructure mapping.",
                 "Find Related Domains": "Given the domain {TARGET_DOMAIN}, what techniques can I use to find other domains owned by the same entity?",
                 "Wayback Machine Analysis": "Analyze the history of {TARGET_URL} on the Wayback Machine. Are there any old, forgotten endpoints or files visible that are no longer linked on the current site?",
+                "Shodan Query for IoT": "Construct a Shodan query to find exposed webcams of a specific brand (e.g., 'Axis') in a given country.",
+                "Analyze Social Media Profile": "Analyze the social media profile at {PROFILE_URL} for potential OSINT clues, such as location, employer, relationships, and technical skills.",
             },
             "Network & Infrastructure Pentesting": {
                 "Advanced Nmap Scan for Firewall Evasion": "Construct an advanced Nmap scan command to use against {TARGET_IP} that is designed to evade a stateful firewall. Explain each flag's purpose.",
@@ -692,6 +697,8 @@ class AIAssistantTab(QWidget):
                 "Analyze SNMP Output": "Analyze the following SNMP walk output. Are there any interesting community strings, user accounts, or system information disclosed?",
                 "Router Security Check": "I need to perform a security check on a router at {TARGET_IP}. What are the top 5 things I should look for?",
                 "FTP Anonymous Login": "How can I check for anonymous FTP login on {TARGET_IP} and list the contents of the root directory?",
+                "DNS Zone Transfer": "How can I attempt a DNS zone transfer against the domain {TARGET_DOMAIN} using `dig` or `dnsrecon`?",
+                "IPv6 Network Discovery": "What are some common techniques and tools for discovering live hosts on an IPv6 network?",
             },
             "Web Application Pentesting": {
                 "Test for SQL Injection": "Provide a list of 10 payloads to test for a classic, in-band SQL injection vulnerability in the URL parameter 'id' at {TARGET_URL}?id=1.",
@@ -704,6 +711,20 @@ class AIAssistantTab(QWidget):
                 "Fuzzing with ffuf": "Construct an ffuf command to fuzz for vhosts on {TARGET_URL} using the wordlist '/usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt'. The keyword should be in the Host header.",
                 "API Endpoint Discovery": "Outline a strategy for discovering hidden or undocumented API endpoints for the application at {TARGET_URL}.",
                 "Test for Race Conditions": "Describe a scenario and methodology to test for a race condition vulnerability in a web application's coupon code feature.",
+                "XML External Entity (XXE)": "Provide an XXE payload to read the `/etc/passwd` file.",
+                "Deserialization Exploit": "Explain how to test for a Java deserialization vulnerability using the `ysoserial` tool.",
+            },
+            "Malware Analysis & DFIR": {
+                "Static Malware Analysis": "I have a suspicious executable file. What are the first 5 steps I should take to perform static analysis without running the file?",
+                "Dynamic Malware Analysis": "Outline a safe environment setup for dynamic malware analysis (sandboxing). What tools are essential?",
+                "Analyze Obfuscated PowerShell": "De-obfuscate and explain the purpose of the following PowerShell script.",
+                "YARA Rule Creation": "Write a basic YARA rule to detect a specific string ('EvilCorpC2') and a specific file section (`.bad`) in a binary.",
+                "Memory Forensics with Volatility": "I have a memory dump from a compromised Windows machine. What Volatility 3 command would I use to list running processes?",
+                "Analyze Phishing Email Headers": "Analyze the following email headers and determine the true origin of the email and identify any signs of spoofing.",
+                "Incident Response Playbook": "Create a high-level incident response playbook for a ransomware attack.",
+                "Disk Imaging": "What is the difference between a logical and a physical disk image? When would you use `dd` vs `FTK Imager`?",
+                "Log Analysis for Intrusion": "Analyze the following Apache access log snippet and identify any potential web attack attempts.",
+                "Network Forensics with Wireshark": "I have a .pcap file from an incident. What Wireshark filter would I use to find all DNS queries that are NOT going to the approved internal DNS server (10.1.1.5)?",
             },
             "Wireless & Cracking": {
                 "WPA Handshake Capture": "What is the best way to capture a WPA/WPA2 4-way handshake from a client connected to the BSSID {TARGET_BSSID}?",
@@ -957,8 +978,25 @@ class AIAssistantTab(QWidget):
         if is_at_bottom:
             QTimer.singleShot(50, lambda: scroll_bar.setValue(scroll_bar.maximum()))
 
+    def set_completion_callback(self, callback):
+        """Sets a one-time callback to be executed when AI analysis completes."""
+        self.completion_callback = callback
+
     def on_ai_thread_finished(self):
         self._show_typing_indicator(False)
+
+        final_text = ""
+        if self.current_ai_bubble:
+            final_text = self.current_ai_bubble.text_browser.toPlainText()
+
+        if self.completion_callback and final_text:
+            try:
+                self.completion_callback(final_text)
+            except Exception as e:
+                logging.error(f"Error executing AI completion callback: {e}")
+            finally:
+                self.completion_callback = None # Reset callback after use
+
         self.thinking_widget = None
         self.current_ai_bubble = None
 
