@@ -1,6 +1,7 @@
 import sqlite3
 import hashlib
 import os
+import logging
 
 DATABASE_NAME = "gscapy_user_data.db"
 
@@ -196,10 +197,6 @@ def initialize_database():
     Initializes the database: creates tables and the default admin user.
     This function should be called once when the application starts.
     """
-    # Use a basic logger for now. This will be integrated with the app's logger.
-    import logging
-    logging.basicConfig(level=logging.INFO)
-
     logging.info("Initializing database...")
     create_tables()
     create_admin_user()
