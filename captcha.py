@@ -17,17 +17,13 @@ def generate_captcha(width=200, height=80, length=5):
     image = Image.new('RGB', (width, height), color = (255, 255, 255))
     draw = ImageDraw.Draw(image)
 
-    # Use a font. A default font is usually available, but this might need adjustment
-    # on some systems. For broad compatibility, we can try a few common ones.
-    font_path = "DejaVuSans.ttf" # A common font on Linux
+    # Use Pillow's default built-in font. This is guaranteed to be available.
     try:
-        font = ImageFont.truetype(font_path, size=45)
-    except IOError:
-        # Fallback to a basic font if the specific one isn't found
-        try:
-            font = ImageFont.load_default(size=45)
-        except AttributeError: # For older Pillow versions
-            font = ImageFont.load_default()
+        # The 'size' parameter is available in recent versions of Pillow
+        font = ImageFont.load_default(size=45)
+    except AttributeError:
+        # Fallback for older Pillow versions that don't support 'size'
+        font = ImageFont.load_default()
 
 
     # Draw the text on the image
