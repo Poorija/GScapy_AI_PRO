@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QTreeWidget, QTreeWidgetItem, QPushButton, QHBoxLayout,
     QMessageBox, QInputDialog, QHeaderView, QGroupBox, QFormLayout, QLineEdit,
-    QSplitter, QWidget
+    QSplitter, QWidget, QComboBox
 )
 from PyQt6.QtCore import Qt
 import database
@@ -47,7 +47,11 @@ class AdminPanelDialog(QDialog):
         profile_form = QFormLayout(profile_box)
         self.full_name_edit = QLineEdit()
         self.age_edit = QLineEdit()
-        self.job_title_edit = QLineEdit()
+
+        self.job_title_edit = QComboBox()
+        self.job_title_edit.addItems(["Red Team", "Blue Team", "Purple Team", "IT Team", "Network Team", "Manager", "Other"])
+        self.job_title_edit.setEditable(True)
+
         self.save_profile_btn = QPushButton("Save Profile Changes")
         profile_form.addRow("Full Name:", self.full_name_edit)
         profile_form.addRow("Age:", self.age_edit)
@@ -95,7 +99,8 @@ class AdminPanelDialog(QDialog):
         """Clears the text from the profile editing fields."""
         self.full_name_edit.clear()
         self.age_edit.clear()
-        self.job_title_edit.clear()
+        self.job_title_edit.setCurrentIndex(-1)
+        self.job_title_edit.clearEditText()
 
     def _populate_users(self):
         """Fetches all users from the database and populates the tree widget."""
@@ -149,7 +154,7 @@ class AdminPanelDialog(QDialog):
         # Handle age, which can be None
         age = profile_data.get("age")
         self.age_edit.setText(str(age) if age is not None else "")
-        self.job_title_edit.setText(profile_data.get("job_title") or "")
+        self.job_title_edit.setCurrentText(profile_data.get("job_title") or "")
 
     def _save_profile(self):
         """Saves the changes from the profile fields to the database."""
@@ -159,7 +164,7 @@ class AdminPanelDialog(QDialog):
 
         full_name = self.full_name_edit.text()
         age = self.age_edit.text()
-        job_title = self.job_title_edit.text()
+        job_title = self.job_title_edit.currentText()
 
         try:
             database.update_user_profile(user_id, full_name, age, job_title)

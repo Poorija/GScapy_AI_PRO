@@ -9554,9 +9554,8 @@ def main():
         app = QApplication(sys.argv)
 
         login_dialog = LoginDialog()
-        if login_dialog.exec() != QDialog.DialogCode.Accepted:
-            sys.exit(0)
 
+        # Define the custom stylesheet additions
         extra_qss = {
             'QGroupBox': {
                 'border': '1px solid #444;',
@@ -9597,7 +9596,15 @@ def main():
                 'border-radius': '8px',
             }
         }
-        # Apply the theme selected in the login dialog, which is now the app's current theme
+
+        # Apply the default theme before showing the login dialog
+        apply_stylesheet(app, theme=login_dialog.selected_theme, extra=extra_qss)
+
+        if login_dialog.exec() != QDialog.DialogCode.Accepted:
+            sys.exit(0)
+
+        # Re-apply the theme in case the user changed it in the dialog.
+        # This ensures the main window gets the final selected theme.
         apply_stylesheet(app, theme=login_dialog.selected_theme, extra=extra_qss)
 
         window = GScapy()

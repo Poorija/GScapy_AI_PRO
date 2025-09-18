@@ -50,6 +50,7 @@ def create_tables():
     # Add brute-force protection columns
     _add_column_if_not_exists(cursor, "users", "failed_login_attempts", "INTEGER DEFAULT 0")
     _add_column_if_not_exists(cursor, "users", "lockout_until", "TIMESTAMP")
+    _add_column_if_not_exists(cursor, "users", "lockout_level", "INTEGER DEFAULT 0")
 
     # Security questions table
     cursor.execute("""
@@ -161,40 +162,52 @@ def verify_user(username, password):
         conn.close()
         return user
     else:
-        register_failed_login_attempt(username) # Failure, record attempt
+        # Do not register a failed attempt for an already inactive user
+        if user['is_active'] == 1:
+            register_failed_login_attempt(username) # Failure, record attempt
         conn.close()
         return None
 
 def register_failed_login_attempt(username):
-    """Increments the failed login counter and sets a lockout if the threshold is exceeded."""
+    """Implements the progressive lockout logic."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, failed_login_attempts FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT id, failed_login_attempts, lockout_level FROM users WHERE username = ? AND is_active = 1", (username,))
     user = cursor.fetchone()
 
     if user:
         user_id = user['id']
         new_attempts = (user['failed_login_attempts'] or 0) + 1
-        lockout_time = None
+        current_level = user['lockout_level'] or 0
 
-        if new_attempts >= 5: # Lock after 5 failed attempts
-            lockout_time = datetime.now() + timedelta(minutes=15)
-            logging.warning(f"User '{username}' (ID: {user_id}) locked out until {lockout_time}.")
-
-        cursor.execute(
-            "UPDATE users SET failed_login_attempts = ?, lockout_until = ? WHERE id = ?",
-            (new_attempts, lockout_time, user_id)
-        )
+        if new_attempts >= 3:
+            new_level = current_level + 1
+            if new_level >= 6:
+                # Deactivate account after 5 lockouts (3, 6, 9, 12, 15 mins)
+                cursor.execute("UPDATE users SET is_active = 0, failed_login_attempts = 0, lockout_level = ? WHERE id = ?", (new_level, user_id))
+                logging.warning(f"User '{username}' (ID: {user_id}) has been deactivated due to excessive failed login attempts.")
+            else:
+                # Set progressive lockout time and reset attempt counter for the next cycle
+                lockout_minutes = new_level * 3
+                lockout_time = datetime.now() + timedelta(minutes=lockout_minutes)
+                cursor.execute(
+                    "UPDATE users SET failed_login_attempts = 0, lockout_level = ?, lockout_until = ? WHERE id = ?",
+                    (new_level, lockout_time, user_id)
+                )
+                logging.warning(f"User '{username}' (ID: {user_id}) locked out for {lockout_minutes} minutes (Level {new_level}).")
+        else:
+            # Just increment the attempt counter if it's below the threshold
+            cursor.execute("UPDATE users SET failed_login_attempts = ? WHERE id = ?", (new_attempts, user_id))
 
     conn.commit()
     conn.close()
 
 def clear_login_attempts(user_id):
-    """Resets failed login attempts and lockout for a user upon successful login."""
+    """Resets failed login attempts and lockout level for a user upon successful login."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET failed_login_attempts = 0, lockout_until = NULL WHERE id = ?", (user_id,))
+    cursor.execute("UPDATE users SET failed_login_attempts = 0, lockout_until = NULL, lockout_level = 0 WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
 

@@ -4,10 +4,10 @@ import os
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QStackedWidget, QFormLayout, QMessageBox, QGroupBox, QComboBox,
-    QGraphicsOpacityEffect
+    QGraphicsOpacityEffect, QCheckBox
 )
 from qt_material import apply_stylesheet, list_themes
-from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
 from PyQt6.QtGui import QIcon, QPixmap
 import database
 from captcha import generate_captcha
@@ -208,7 +208,20 @@ class LoginDialog(QDialog):
         self.stacked_widget.addWidget(self.login_page)
         self.stacked_widget.addWidget(self.register_page)
 
-        self.setMinimumSize(500, 700) # Increased height for captcha
+        self.lockout_end_time = None
+        self.lockout_timer = QTimer(self)
+        self.lockout_timer.timeout.connect(self._update_lockout_timer)
+
+        self.login_page_stack = QStackedWidget()
+        self.login_page = self._create_login_page()
+        self.admin_login_page = self._create_admin_login_page()
+        self.login_page_stack.addWidget(self.login_page)
+        self.login_page_stack.addWidget(self.admin_login_page)
+
+        self.stacked_widget.addWidget(self.login_page_stack)
+        self.stacked_widget.addWidget(self.register_page)
+
+        self.setMinimumSize(500, 750) # Increased height for new widgets
         self.adjustSize()
 
         # --- Animation & Initial State ---
@@ -295,14 +308,26 @@ class LoginDialog(QDialog):
 
         login_box = QGroupBox("User Login")
         login_box.setStyleSheet("QGroupBox { border: 1px solid #444; padding: 15px; }")
-        form_layout = QFormLayout(login_box)
+
+        self.login_form_layout = QFormLayout(login_box)
+
+        # --- Lockout UI ---
+        self.lockout_widget = QWidget()
+        lockout_layout = QHBoxLayout(self.lockout_widget)
+        self.lockout_icon_label = QLabel()
+        self.lockout_icon_label.setPixmap(QIcon.fromTheme("dialog-error", QIcon("icons/x-circle.svg")).pixmap(24, 24))
+        self.lockout_label = QLabel()
+        lockout_layout.addWidget(self.lockout_icon_label)
+        lockout_layout.addWidget(self.lockout_label)
+        self.lockout_widget.setVisible(False) # Hidden by default
+        self.login_form_layout.addRow(self.lockout_widget)
 
         self.login_username_edit = QLineEdit()
         self.login_password_edit = QLineEdit()
         self.login_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
 
-        form_layout.addRow("Username:", self.login_username_edit)
-        form_layout.addRow("Password:", self.login_password_edit)
+        self.login_form_layout.addRow("Username:", self.login_username_edit)
+        self.login_form_layout.addRow("Password:", self.login_password_edit)
 
         # --- Captcha ---
         self.captcha_image_label = QLabel("Captcha loading...")
@@ -313,35 +338,38 @@ class LoginDialog(QDialog):
         refresh_captcha_btn.clicked.connect(self._refresh_captcha)
 
         captcha_group_layout = QHBoxLayout()
-        captcha_group_layout.addWidget(self.captcha_image_label, 2) # Give more space to image
+        captcha_group_layout.addWidget(self.captcha_image_label, 2)
         captcha_group_layout.addWidget(self.captcha_input_edit, 2)
         captcha_group_layout.addWidget(refresh_captcha_btn, 1)
-        form_layout.addRow("Captcha:", captcha_group_layout)
-
+        self.login_form_layout.addRow("Captcha:", captcha_group_layout)
 
         # --- Theme Selector ---
         self.theme_combo = QComboBox()
         self.theme_combo.addItems([theme.replace('.xml', '') for theme in list_themes()])
         self.theme_combo.setCurrentText(self.selected_theme.replace('.xml', ''))
         self.theme_combo.textActivated.connect(self._handle_theme_change)
-        form_layout.addRow("Theme:", self.theme_combo)
+        self.login_form_layout.addRow("Theme:", self.theme_combo)
 
-        login_button = QPushButton("Login")
-        login_button.setMaximumWidth(200)
-        login_button.clicked.connect(self._handle_login)
-        form_layout.addRow(login_button)
+        self.login_button = QPushButton("Login")
+        self.login_button.setMaximumWidth(200)
+        self.login_button.clicked.connect(self._handle_login)
+        self.login_form_layout.addRow(self.login_button)
 
-        links_layout = QHBoxLayout()
+        self.links_widget = QWidget() # Put links in a container to hide them
+        links_layout = QHBoxLayout(self.links_widget)
         register_link = QLabel("<a href='#'>Register a new account</a>")
         register_link.linkActivated.connect(lambda: self.stacked_widget.setCurrentWidget(self.register_page))
-
         forgot_password_link = QLabel("<a href='#'>Forgot Password?</a>")
         forgot_password_link.linkActivated.connect(self._handle_password_reset_request)
-
         links_layout.addWidget(register_link)
         links_layout.addStretch()
         links_layout.addWidget(forgot_password_link)
-        form_layout.addRow(links_layout)
+        self.login_form_layout.addRow(self.links_widget)
+
+        # --- Admin Override Checkbox ---
+        admin_override_checkbox = QCheckBox("I'm an Administrator")
+        admin_override_checkbox.toggled.connect(lambda checked: self.login_page_stack.setCurrentIndex(1 if checked else 0))
+        self.login_form_layout.addRow(admin_override_checkbox)
 
         layout.addWidget(login_box)
         return page
@@ -469,52 +497,116 @@ class LoginDialog(QDialog):
         from datetime import datetime
         try:
             timestamp_str = status_string.split(':', 1)[1]
-            lockout_end = datetime.fromisoformat(timestamp_str)
-            remaining = lockout_end - datetime.now()
-            # Ensure we don't show negative time
+            self.lockout_end_time = datetime.fromisoformat(timestamp_str)
+            self._set_login_form_enabled(False)
+            self.lockout_timer.start(1000) # Update every second
+            self._update_lockout_timer() # Initial call to show time immediately
+            self.lockout_widget.setVisible(True)
+        except (IndexError, ValueError) as e:
+             QMessageBox.warning(self, "Account Locked", "This account is temporarily locked.")
+             logging.error(f"Could not parse lockout timestamp: {e}")
+
+    def _update_lockout_timer(self):
+        """Called by the QTimer to update the lockout countdown."""
+        from datetime import datetime
+        if self.lockout_end_time and self.lockout_end_time > datetime.now():
+            remaining = self.lockout_end_time - datetime.now()
             remaining_minutes = max(0, remaining.seconds // 60)
             remaining_seconds = max(0, remaining.seconds % 60)
-            QMessageBox.warning(self, "Account Locked", f"This account is temporarily locked due to too many failed login attempts. Please try again in {remaining_minutes} minutes and {remaining_seconds} seconds.")
-        except (IndexError, ValueError):
-             QMessageBox.warning(self, "Account Locked", "This account is temporarily locked.")
+            self.lockout_label.setText(f"Account locked. Try again in {remaining_minutes:02d}:{remaining_seconds:02d}")
+        else:
+            self.lockout_timer.stop()
+            self.lockout_label.setText("Lockout expired. You can try again.")
+            self.lockout_icon_label.setPixmap(QIcon.fromTheme("object-select", QIcon("icons/check-circle.svg")).pixmap(24, 24))
+            self._set_login_form_enabled(True)
+
+    def _set_login_form_enabled(self, enabled):
+        """Disables or enables the login form widgets during lockout."""
+        self.login_username_edit.setEnabled(enabled)
+        self.login_password_edit.setEnabled(enabled)
+        self.captcha_input_edit.setEnabled(enabled)
+        self.login_button.setEnabled(enabled)
+        self.theme_combo.setEnabled(enabled)
+        self.links_widget.setVisible(enabled) # Hide register/forgot password links
+
+    def _create_admin_login_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        admin_box = QGroupBox("Administrator Login")
+        admin_box.setStyleSheet("QGroupBox { border: 1px solid #ccaa00; padding: 15px; }")
+        form_layout = QFormLayout(admin_box)
+
+        self.admin_password_edit = QLineEdit()
+        self.admin_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        form_layout.addRow("Admin Password:", self.admin_password_edit)
+
+        admin_login_btn = QPushButton("Login as Admin")
+        admin_login_btn.clicked.connect(self._handle_admin_login)
+        form_layout.addRow(admin_login_btn)
+
+        layout.addWidget(admin_box)
+        return page
+
+    def _handle_admin_login(self):
+        """Dedicated login handler for the admin override form."""
+        password = self.admin_password_edit.text()
+        if not password:
+            QMessageBox.warning(self, "Input Error", "Password is required.")
+            return
+
+        # We directly call verify_user for 'admin'
+        user = database.verify_user('admin', password)
+        if user:
+            self.current_user = dict(user)
+            QMessageBox.information(self, "Success", "Welcome, Administrator!")
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Login Failed", "Invalid admin password.")
 
     def _handle_login(self):
         username = self.login_username_edit.text().strip()
         password = self.login_password_edit.text()
         captcha_input = self.captcha_input_edit.text().strip()
 
-        if not username or not password or not captcha_input:
-            QMessageBox.warning(self, "Input Error", "Username, password, and captcha are required.")
+        if not username or not password:
+            QMessageBox.warning(self, "Input Error", "Username and password are required.")
             return
 
-        # Case-insensitive captcha check
-        if captcha_input.upper() != self.captcha_text.upper():
-            QMessageBox.warning(self, "Login Failed", "Incorrect captcha. Please try again.")
-            database.register_failed_login_attempt(username)
-            self._refresh_captcha()
-            self.captcha_input_edit.clear()
-            # We must now check if this failed attempt caused a lockout
-            # We pass a dummy password because we only care about the lockout status here
-            status_check = database.verify_user(username, "dummypass_for_status_check")
-            if isinstance(status_check, str) and status_check.startswith('locked:'):
-                 self._handle_lockout_message(status_check)
-            return
-
-        user_or_status = database.verify_user(username, password)
-
+        # Always check for existing lockout first
+        user_or_status = database.verify_user(username, "dummypass_for_status_check")
         if isinstance(user_or_status, str) and user_or_status.startswith('locked:'):
             self._handle_lockout_message(user_or_status)
             return
 
-        if user_or_status:
+        # Check captcha
+        if not captcha_input or (captcha_input.upper() != self.captcha_text.upper()):
+            QMessageBox.warning(self, "Login Failed", "Incorrect captcha. Please try again.")
+            database.register_failed_login_attempt(username)
+            self._refresh_captcha()
+            self.captcha_input_edit.clear()
+            # Check if this failed attempt caused a lockout
+            user_or_status = database.verify_user(username, "dummypass_for_status_check")
+            if isinstance(user_or_status, str) and user_or_status.startswith('locked:'):
+                self._handle_lockout_message(user_or_status)
+            return
+
+        # If captcha is correct, proceed with real password verification
+        user_or_status = database.verify_user(username, password)
+
+        if user_or_status: # This will only be a user object on success
             self.current_user = dict(user_or_status)
             QMessageBox.information(self, "Success", f"Welcome, {self.current_user['username']}!")
             self.accept()
         else:
-            QMessageBox.warning(self, "Login Failed", "Invalid username or password, or account is inactive.")
-            # Refresh captcha on any failed login attempt for security
+            QMessageBox.warning(self, "Login Failed", "Invalid username or password.")
             self._refresh_captcha()
             self.captcha_input_edit.clear()
+            # Check if this failed attempt caused a lockout
+            user_or_status = database.verify_user(username, "dummypass_for_status_check")
+            if isinstance(user_or_status, str) and user_or_status.startswith('locked:'):
+                self._handle_lockout_message(user_or_status)
 
     def _handle_register(self):
         username = self.reg_username_edit.text().strip()
