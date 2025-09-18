@@ -1224,7 +1224,11 @@ class GScapy(QMainWindow):
         self.main_layout = QVBoxLayout(self.central_widget)
 
         self._create_resource_bar()
-        self._create_menu_bar(); self._create_status_bar(); self._create_header_bar()
+        self.menu_bar = QMenuBar(self)
+        self.setMenuBar(self.menu_bar)
+        # The menu bar will be populated after login by calling _update_menu_bar()
+        self._create_status_bar()
+        self._create_header_bar()
 
         # Config widgets are now created inside their respective tool tabs.
 
@@ -1253,22 +1257,24 @@ class GScapy(QMainWindow):
         logging.info("GScapy application initialized.")
 
 
-    def _create_menu_bar(self):
-        """Creates the main menu bar (File, Help)."""
-        self.menu_bar = QMenuBar(self)
-        self.setMenuBar(self.menu_bar)
+    def _update_menu_bar(self):
+        """Creates or updates the main menu bar based on the current user's role."""
+        self.menu_bar.clear()
 
+        # --- File Menu ---
         file_menu = self.menu_bar.addMenu("&File")
-
-        if self.current_user and self.current_user['is_admin']:
-            file_menu.addAction("Admin Panel...", self._show_admin_panel)
-            file_menu.addSeparator()
-
         file_menu.addAction("&Save Captured Packets", self.save_packets)
         file_menu.addAction("&Load Packets from File", self.load_packets)
         file_menu.addSeparator()
         file_menu.addAction("&Exit", self.close)
 
+        # --- Admin Menu (Conditional) ---
+        # Use .get() for safer dictionary access, in case current_user is None
+        if self.current_user and self.current_user.get('is_admin'):
+            admin_menu = self.menu_bar.addMenu("&Admin")
+            admin_menu.addAction(QIcon("icons/shield.svg"), "Admin Panel...", self._show_admin_panel)
+
+        # --- Help Menu ---
         help_menu = self.menu_bar.addMenu("&Help")
         help_menu.addAction("&About GScapy", self._show_about_dialog)
         help_menu.addSeparator()
@@ -9533,6 +9539,7 @@ def main():
 
         window = GScapy()
         window.current_user = login_dialog.current_user
+        window._update_menu_bar() # Populate the menu now that we have a user
         window.show()
         sys.exit(app.exec())
 

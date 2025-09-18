@@ -192,6 +192,49 @@ def update_user_password(user_id, new_password):
     conn.commit()
     conn.close()
 
+def get_user_by_username_or_email(identifier):
+    """Fetches a user by their username or email."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE (username = ? OR email = ?) AND is_active = 1", (identifier, identifier))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def get_user_security_questions(user_id):
+    """Fetches the question IDs for a given user."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT question_id FROM security_questions WHERE user_id = ?", (user_id,))
+    question_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return question_ids
+
+def verify_security_answers(user_id, answers_dict):
+    """
+    Verifies a dictionary of {question_id: answer} against the database.
+    Returns True if all answers are correct, False otherwise.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if len(answers_dict) == 0:
+        return False
+
+    for q_id, answer in answers_dict.items():
+        hashed_answer = hash_password(answer.lower().strip())
+        cursor.execute("""
+            SELECT id FROM security_questions
+            WHERE user_id = ? AND question_id = ? AND answer_hash = ?
+        """, (user_id, q_id, hashed_answer))
+
+        if not cursor.fetchone():
+            conn.close()
+            return False # One incorrect answer is enough to fail
+
+    conn.close()
+    return True # All answers were correct
+
 def initialize_database():
     """
     Initializes the database: creates tables and the default admin user.
