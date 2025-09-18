@@ -158,7 +158,7 @@ class LoginDialog(QDialog):
         self.setWindowTitle("GScapy - Login")
         self.setModal(True)
         self.current_user = None
-        self.selected_theme = 'dark_blue.xml' # Default theme
+        self.selected_theme = 'dark_cyan.xml' # Default theme
         self.captcha_text = None
 
         # --- Main Layout and Styling ---
@@ -308,7 +308,7 @@ class LoginDialog(QDialog):
         self.captcha_image_label = QLabel("Captcha loading...")
         self.captcha_input_edit = QLineEdit()
         self.captcha_input_edit.setPlaceholderText("Enter Captcha Text")
-        refresh_captcha_btn = QPushButton()
+        refresh_captcha_btn = QPushButton(" Regenerate")
         refresh_captcha_btn.setIcon(QIcon.fromTheme("view-refresh", QIcon("icons/refresh-cw.svg"))) # Use themed icon with fallback
         refresh_captcha_btn.clicked.connect(self._refresh_captcha)
 
@@ -327,6 +327,7 @@ class LoginDialog(QDialog):
         form_layout.addRow("Theme:", self.theme_combo)
 
         login_button = QPushButton("Login")
+        login_button.setMaximumWidth(200)
         login_button.clicked.connect(self._handle_login)
         form_layout.addRow(login_button)
 
@@ -454,24 +455,55 @@ class LoginDialog(QDialog):
         # Case-insensitive captcha check
         if captcha_input.upper() != self.captcha_text.upper():
             QMessageBox.warning(self, "Login Failed", "Incorrect captcha. Please try again.")
+            database.register_failed_login_attempt(username)
             self._refresh_captcha()
             self.captcha_input_edit.clear()
+            # We must now check if this failed attempt caused a lockout
+            user_or_status = database.verify_user(username, "") # We pass an empty pass to re-check status
+            if isinstance(user_or_status, str) and user_or_status.startswith('locked:'):
+                 self._handle_lockout_message(user_or_status)
+            return
+
+    def _handle_lockout_message(self, status_string):
+        """Parses a lockout status string and shows a formatted message box."""
+        from datetime import datetime
+        try:
+            timestamp_str = status_string.split(':', 1)[1]
+            lockout_end = datetime.fromisoformat(timestamp_str)
+            remaining = lockout_end - datetime.now()
+            # Ensure we don't show negative time
+            remaining_minutes = max(0, remaining.seconds // 60)
+            remaining_seconds = max(0, remaining.seconds % 60)
+            QMessageBox.warning(self, "Account Locked", f"This account is temporarily locked due to too many failed login attempts. Please try again in {remaining_minutes} minutes and {remaining_seconds} seconds.")
+        except (IndexError, ValueError):
+             QMessageBox.warning(self, "Account Locked", "This account is temporarily locked.")
+
+    def _handle_login(self):
+        username = self.login_username_edit.text().strip()
+        password = self.login_password_edit.text()
+        captcha_input = self.captcha_input_edit.text().strip()
+
+        if not username or not password or not captcha_input:
+            QMessageBox.warning(self, "Input Error", "Username, password, and captcha are required.")
+            return
+
+        # Case-insensitive captcha check
+        if captcha_input.upper() != self.captcha_text.upper():
+            QMessageBox.warning(self, "Login Failed", "Incorrect captcha. Please try again.")
+            database.register_failed_login_attempt(username)
+            self._refresh_captcha()
+            self.captcha_input_edit.clear()
+            # We must now check if this failed attempt caused a lockout
+            # We pass a dummy password because we only care about the lockout status here
+            status_check = database.verify_user(username, "dummypass_for_status_check")
+            if isinstance(status_check, str) and status_check.startswith('locked:'):
+                 self._handle_lockout_message(status_check)
             return
 
         user_or_status = database.verify_user(username, password)
 
         if isinstance(user_or_status, str) and user_or_status.startswith('locked:'):
-            from datetime import datetime
-            try:
-                timestamp_str = user_or_status.split(':', 1)[1]
-                lockout_end = datetime.fromisoformat(timestamp_str)
-                remaining = lockout_end - datetime.now()
-                # Ensure we don't show negative time
-                remaining_minutes = max(0, remaining.seconds // 60)
-                remaining_seconds = max(0, remaining.seconds % 60)
-                QMessageBox.warning(self, "Account Locked", f"This account is temporarily locked due to too many failed login attempts. Please try again in {remaining_minutes} minutes and {remaining_seconds} seconds.")
-            except (IndexError, ValueError):
-                 QMessageBox.warning(self, "Account Locked", "This account is temporarily locked.")
+            self._handle_lockout_message(user_or_status)
             return
 
         if user_or_status:

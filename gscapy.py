@@ -9604,7 +9604,7 @@ def main():
         window.current_user = login_dialog.current_user
         # Set window title with username
         if window.current_user and 'username' in window.current_user:
-            window.setWindowTitle(f"Welcome, {window.current_user['username']} - GScapy + AI")
+            window.setWindowTitle(f"Welcome, {window.current_user['username']} - GScapy + AI - The Modern Scapy Interface with AI")
         window._update_menu_bar() # Populate the menu now that we have a user
         window.show()
         sys.exit(app.exec())

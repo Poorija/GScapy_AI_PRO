@@ -129,74 +129,74 @@ def create_admin_user():
 
 def verify_user(username, password):
     """
-    Verifies user credentials, checks for lockouts, and records failed attempts.
+    Verifies user credentials and checks for lockouts.
     Returns the user row on success.
-    Returns None on password mismatch or if user not found.
-    Returns a string 'locked:YYYY-MM-DD HH:MM:SS.ffffff' if the account is locked.
+    Returns None on password mismatch.
+    Returns a string 'locked:...' if the account is locked.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # First, get the user and check their lockout status
     cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
     user = cursor.fetchone()
 
     if not user:
         conn.close()
-        return None  # User does not exist
+        return None
 
-    # Check if the user is currently locked out
+    # Check if locked
     if user['lockout_until']:
         try:
-            # The timestamp from the DB might not have microseconds
             lockout_end_time = datetime.fromisoformat(user['lockout_until'])
             if lockout_end_time > datetime.now():
                 conn.close()
                 return f"locked:{user['lockout_until']}"
         except (ValueError, TypeError):
-            # Handle cases where the timestamp format is unexpected
             logging.error(f"Could not parse lockout_until timestamp '{user['lockout_until']}' for user '{username}'.")
 
-    # Now, verify the password
+    # Verify password
     hashed_password = hash_password(password)
     if user['password_hash'] == hashed_password and user['is_active'] == 1:
-        # On successful login, clear any previous failed attempts
-        clear_login_attempts(user['id'], cursor)
-        conn.commit()
+        clear_login_attempts(user['id']) # Success, clear attempts
         conn.close()
         return user
     else:
-        # On failed login, record the attempt
-        record_failed_login(user['id'], user['failed_login_attempts'], cursor)
-        conn.commit()
+        register_failed_login_attempt(username) # Failure, record attempt
         conn.close()
         return None
 
-def record_failed_login(user_id, current_attempts, cursor):
-    """
-    Increments the failed login counter and sets a lockout if the threshold is exceeded.
-    Takes a cursor to operate within an existing transaction.
-    """
-    new_attempts = current_attempts + 1
-    lockout_time = None
+def register_failed_login_attempt(username):
+    """Increments the failed login counter and sets a lockout if the threshold is exceeded."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    # Lock for 15 minutes after 5 failed attempts
-    if new_attempts >= 5:
-        lockout_time = datetime.now() + timedelta(minutes=15)
-        logging.warning(f"User ID {user_id} locked out until {lockout_time}.")
+    cursor.execute("SELECT id, failed_login_attempts FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
 
-    cursor.execute("""
-        UPDATE users
-        SET failed_login_attempts = ?, lockout_until = ?
-        WHERE id = ?
-    """, (new_attempts, lockout_time, user_id))
+    if user:
+        user_id = user['id']
+        new_attempts = (user['failed_login_attempts'] or 0) + 1
+        lockout_time = None
 
-def clear_login_attempts(user_id, cursor):
-    """
-    Resets failed login attempts and lockout for a user.
-    Takes a cursor to operate within an existing transaction.
-    """
+        if new_attempts >= 5: # Lock after 5 failed attempts
+            lockout_time = datetime.now() + timedelta(minutes=15)
+            logging.warning(f"User '{username}' (ID: {user_id}) locked out until {lockout_time}.")
+
+        cursor.execute(
+            "UPDATE users SET failed_login_attempts = ?, lockout_until = ? WHERE id = ?",
+            (new_attempts, lockout_time, user_id)
+        )
+
+    conn.commit()
+    conn.close()
+
+def clear_login_attempts(user_id):
+    """Resets failed login attempts and lockout for a user upon successful login."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     cursor.execute("UPDATE users SET failed_login_attempts = 0, lockout_until = NULL WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
 def check_username_or_email_exists(username, email):
     """Checks if a username or email already exists in the database."""
