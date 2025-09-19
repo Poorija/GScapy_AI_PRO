@@ -7,10 +7,17 @@ Welcome to the official user guide for GScapy + AI. This document provides a det
 2.  [Main Window Overview](#main-window-overview)
     -   [Resource Bar](#resource-bar)
     -   [Header Bar (Interface & Theme)](#header-bar)
+    -   [User Profile Menu](#user-profile-menu)
     -   [Live Log](#live-log)
-3.  [Packet Sniffer](#packet-sniffer)
-4.  [Packet Crafter](#packet-crafter)
-5.  [Network Tools](#network-tools)
+3.  [User & Admin Management](#user--admin-management)
+    -   [User Profile Dialog](#user-profile-dialog)
+    -   [Admin Panel (For Admins)](#admin-panel-for-admins)
+4.  [Threat Intelligence](#threat-intelligence)
+    -   [Recent Threats](#recent-threats)
+    -   [CVE & Exploit Search](#cve--exploit-search)
+5.  [Packet Sniffer](#packet-sniffer)
+6.  [Packet Crafter](#packet-crafter)
+7.  [Network Tools](#network-tools)
     -   [Nmap Scan](#nmap-scan)
     -   [Subdomain Scanner](#subdomain-scanner)
     -   [Nikto Scan](#nikto-scan)
@@ -21,23 +28,27 @@ Welcome to the official user guide for GScapy + AI. This document provides a det
     -   [ARP Scan](#arp-scan)
     -   [Ping Sweep](#ping-sweep)
     -   [Traceroute](#traceroute)
-6.  [Advanced Tools](#advanced-tools)
+8.  [Advanced Tools](#advanced-tools)
     -   [Packet Flooder](#packet-flooder)
     -   [Firewall Tester](#firewall-tester)
     -   [ARP Spoofer](#arp-spoofer)
     -   [SQLMap](#sqlmap)
     -   [Hashcat](#hashcat)
-7.  [Wireless Tools](#wireless-tools)
+9.  [Wireless Tools](#wireless-tools)
     -   [Wi-Fi Scanner](#wi-fi-scanner)
     -   [Deauthentication Tool](#deauthentication-tool)
     -   [Beacon Flood](#beacon-flood)
     -   [WPA Handshake Tool](#wpa-handshake-tool)
     -   [KRACK Scanner](#krack-scanner)
     -   [Wifite Auditor](#wifite-auditor)
-8.  [AI Assistant](#ai-assistant)
-9.  [System Info](#system-info)
-10. [Community Tools](#community-tools)
-11. [Exporting Results](#exporting-results)
+10. [Reporting & Analysis](#reporting--analysis)
+    -   [Rules of Engagement (ROE)](#rules-of-engagement-roe)
+    -   [Aggregated Findings](#aggregated-findings)
+    -   [AI-Assisted Reporting](#ai-assisted-reporting)
+    -   [Generating Reports](#generating-reports)
+11. [AI Assistant](#ai-assistant)
+12. [System Info](#system-info)
+13. [Community Tools](#community-tools)
 
 ---
 
@@ -60,8 +71,52 @@ The top-most bar provides a real-time overview of your system's performance.
 -   **Network Interface:** A crucial dropdown menu where you select the network interface for tools to use. For many tools (especially wireless ones), you must select the correct interface. "Automatic" will let Scapy decide, which is suitable for basic wired connections.
 -   **Theme:** Customize the application's look and feel by choosing from a list of themes.
 
+### User Profile Menu
+Located in the top-right corner of the resource bar, this menu provides access to user-specific functions.
+-   **Profile:** Opens the User Profile dialog, where you can change your email, password, and profile avatar.
+-   **Logout:** Logs you out of the application.
+
 ### Live Log
 The panel at the bottom of the window shows a live log of the application's actions, including tool commands, errors, and status updates. It is invaluable for debugging and understanding what the application is doing in the background.
+
+---
+
+## User & Admin Management
+
+GScapy now includes multi-user support with different roles.
+
+### User Profile Dialog
+Accessible from the user profile menu, this dialog allows you to:
+-   View your username.
+-   Change your email address.
+-   Update your password.
+-   Upload a profile picture (avatar).
+
+### Admin Panel (For Admins)
+If you are logged in as an administrator, a new "Admin" menu will appear.
+-   **Purpose:** To manage all users in the database.
+-   **Features:**
+    -   View a list of all registered users and their status.
+    -   Add new users.
+    -   Edit existing users, including their username and email address.
+    -   Delete users.
+
+---
+
+## Threat Intelligence
+
+This tab provides tools to stay updated on the latest vulnerabilities.
+
+### Recent Threats
+-   **Purpose:** To automatically display the latest 30 CVEs for up-to-the-minute threat awareness.
+-   **UI Layout:**
+    -   The tab automatically fetches and displays a list of the most recent CVEs from the CIRCL API.
+    -   The list is paginated, and you can control how many items are shown per page (10, 20, 30, or 40).
+    -   Clicking a CVE in the list shows its full details in the pane below.
+
+### CVE & Exploit Search
+-   **CVE Search:** A frontend for the `nvdlib` library to search the National Vulnerability Database.
+-   **Exploit-DB Search:** A frontend for the `getsploit` tool to search Exploit-DB for public exploits. Requires `getsploit` to be installed.
 
 ---
 
@@ -316,6 +371,40 @@ This tab contains tools specifically for 802.11 Wi-Fi network analysis and testi
 
 ---
 
+## Reporting & Analysis
+
+This tab is a powerful workspace for consolidating your findings and generating professional penetration test reports.
+
+### Rules of Engagement (ROE)
+-   **Purpose:** To formally document the scope, objectives, and permissions for the engagement.
+-   **UI Layout:** A tabbed interface guides you through filling out the critical components of the ROE:
+    -   **General:** Client name, assessment dates, and high-level objectives.
+    -   **Scope:** Detailed fields for in-scope and out-of-scope targets and restrictions.
+    -   **Authorization & POCs:** A field to list Points of Contact and a crucial checkbox to confirm you have written authorization to conduct the test.
+
+### Aggregated Findings
+-   **Purpose:** To collect findings from various tools and enrich them with vulnerability data.
+-   **UI Layout:**
+    -   **Aggregate & Enrich Results:** This button parses the results from other tools (like Nmap) and automatically queries for relevant CVEs and exploits.
+    -   **Use offline CVE_DB:** Check this box to use a local copy of the NVD for enrichment. The database can be downloaded from the "Threat Intelligence" -> "Offline DB Settings" tab.
+    -   The results are displayed in a table, showing the host, service, finding, and enriched details.
+
+### AI-Assisted Reporting
+-   **Purpose:** To leverage an LLM to help write report sections.
+-   **UI Layout:**
+    -   **AI Persona:** Select a target audience for the report (e.g., Executive, Technical Manager). The AI will tailor its language and focus accordingly.
+    -   **AI Instructions:** Provide specific, custom instructions to the AI (e.g., "Focus on the financial impact").
+    -   **Generate AI Content:** Sends the aggregated findings, persona, and instructions to the AI assistant.
+    -   The AI's response appears in the text box below, ready to be edited or copied into the Executive Summary.
+
+### Generating Reports
+-   **Purpose:** To create the final deliverable.
+-   **UI Layout:**
+    -   **Generate HTML Report:** Compiles all the ROE information and findings into a polished HTML report.
+    -   **Generate DOCX Report:** Creates a formal report in a Microsoft Word (`.docx`) file.
+
+---
+
 ## AI Assistant
 
 The AI Assistant integrates with large language models (LLMs) to provide analysis and guidance.
@@ -330,12 +419,7 @@ The AI Assistant integrates with large language models (LLMs) to provide analysi
 
 ---
 
-## System Info, Community Tools, and Exporting
+## System Info & Community Tools
 
 -   **System Info:** Displays detailed information about your operating system, hardware (CPU, memory, GPU), network interfaces, and key library versions.
 -   **Community Tools:** Provides a curated list of other popular open-source tools in the Scapy and network security ecosystem, with links to their websites.
--   **Exporting Results:** Most tools that produce results in a table have an "Export Results" button. This allows you to save the data in various formats for reporting and analysis:
-    -   **CSV:** Comma-Separated Values, for use in spreadsheets.
-    -   **HTML:** A web page for easy viewing.
-    -   **PDF:** A portable document format for reports.
-    -   **DOCX:** A Microsoft Word document.

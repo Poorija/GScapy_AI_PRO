@@ -59,7 +59,19 @@ GScapy is organized into a series of tabs, each dedicated to a specific function
 - **WPA Handshake & Cracker:** A comprehensive tool to capture WPA/WPA2 handshakes and then crack the password using `aircrack-ng` with a provided wordlist. Includes a helper to generate wordlists with `crunch`.
 - **KRACK Scanner:** Passively sniff for retransmitted EAPOL messages to detect networks vulnerable to Key Reinstallation Attacks (KRACK).
 
-### 7. System & Community
+### 7. Reporting & Analysis
+- **Comprehensive ROE:** A tabbed interface to define detailed Rules of Engagement, including scope, objectives, and points of contact.
+- **AI-Assisted Reporting:**
+    - **AI Personas:** Select a persona (e.g., Executive, Technical Manager) to tailor the tone and content of AI-generated report sections.
+    - **Custom Instructions:** Provide specific instructions to the AI to focus its analysis.
+- **Multi-Format Export:** Generate final reports in both HTML and DOCX formats.
+- **Offline CVE Database:** Download the NVD database to perform vulnerability enrichment without an internet connection.
+
+### 8. User & Admin Management
+- **User Profiles:** Users can manage their own profile, including changing their email, password, and avatar.
+- **Admin Panel:** A dedicated panel for administrators to manage users, including updating their username and email address.
+
+### 9. System & Community
 - **System Info:** View detailed information about your system, including OS, CPU, memory, disk, and network interfaces in a modern card-style layout.
 - **Community Tools:** A curated list of other popular open-source network security tools.
 

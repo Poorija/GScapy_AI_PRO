@@ -52,6 +52,9 @@ def create_tables():
     _add_column_if_not_exists(cursor, "users", "lockout_until", "TIMESTAMP")
     _add_column_if_not_exists(cursor, "users", "lockout_level", "INTEGER DEFAULT 0")
 
+    # Add avatar column
+    _add_column_if_not_exists(cursor, "users", "avatar", "BLOB")
+
     # Security questions table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS security_questions (
@@ -281,11 +284,66 @@ def update_user_profile(user_id, full_name, age, job_title):
     conn.commit()
     conn.close()
 
+def update_user_email_by_admin(user_id, new_email):
+    """Updates the email for a given user, checking for uniqueness."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE email = ? AND id != ?", (new_email, user_id))
+    if cursor.fetchone():
+        conn.close()
+        raise ValueError("Email address is already in use by another account.")
+    cursor.execute("UPDATE users SET email = ? WHERE id = ?", (new_email, user_id))
+    conn.commit()
+    conn.close()
+
+def update_user_username_by_admin(user_id, new_username):
+    """Updates the username for a given user, checking for uniqueness."""
+    if new_username.lower() == 'admin' and user_id != 1: # Assuming admin ID is 1
+         raise ValueError("Cannot rename a user to 'admin'.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE username = ? AND id != ?", (new_username, user_id))
+    if cursor.fetchone():
+        conn.close()
+        raise ValueError("Username is already in use by another account.")
+    cursor.execute("UPDATE users SET username = ? WHERE id = ?", (new_username, user_id))
+    conn.commit()
+    conn.close()
+
 def set_user_active_status(user_id, is_active):
     """Updates the is_active status for a given user."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET is_active = ? WHERE id = ?", (int(is_active), user_id))
+    conn.commit()
+    conn.close()
+
+def get_user_by_id(user_id):
+    """Fetches a user by their ID."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def update_user_email(user_id, new_email):
+    """Updates the email for a given user, checking for uniqueness."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE email = ? AND id != ?", (new_email, user_id))
+    if cursor.fetchone():
+        conn.close()
+        raise ValueError("Email address is already in use by another account.")
+    cursor.execute("UPDATE users SET email = ? WHERE id = ?", (new_email, user_id))
+    conn.commit()
+    conn.close()
+
+def update_user_avatar(user_id, avatar_data):
+    """Updates the avatar for a given user."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET avatar = ? WHERE id = ?", (avatar_data, user_id))
     conn.commit()
     conn.close()
 
