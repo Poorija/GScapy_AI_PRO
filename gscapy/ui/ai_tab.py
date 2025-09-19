@@ -17,28 +17,9 @@ from PyQt6.QtWidgets import (
     QSizePolicy
 )
 
-from ai_threads import FetchModelsThread, TestAPIThread, AIAnalysisThread
+from ..threads.ai_threads import FetchModelsThread, TestAPIThread, AIAnalysisThread
 
-# This function is used by the AIAssistantTab and its components
-def create_themed_icon(icon_path, color_str):
-    """Loads an SVG, intelligently replaces its color, and returns a QIcon."""
-    try:
-        with open(icon_path, 'r', encoding='utf-8') as f:
-            svg_data = f.read()
-
-        # First, try to replace a stroke color in a style block (for paper-airplane.svg)
-        themed_svg_data, count = re.subn(r'stroke:#[0-9a-fA-F]{6}', f'stroke:{color_str}', svg_data)
-
-        # If no stroke was found in a style, fall back to injecting a fill attribute (for gear.svg)
-        if count == 0 and '<svg' in themed_svg_data:
-            themed_svg_data = themed_svg_data.replace('<svg', f'<svg fill="{color_str}"')
-
-        image = QImage.fromData(themed_svg_data.encode('utf-8'))
-        pixmap = QPixmap.fromImage(image)
-        return QIcon(pixmap)
-    except Exception as e:
-        logging.warning(f"Could not create themed icon for {icon_path}: {e}")
-        return QIcon(icon_path) # Fallback to original icon
+from ..utils.helpers import create_themed_icon
 
 
 class AISettingsDialog(QDialog):
