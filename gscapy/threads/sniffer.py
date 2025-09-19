@@ -1,8 +1,13 @@
 import logging
 import queue
 from threading import Event
+from multiprocessing import Process, Queue
+
 from PyQt6.QtCore import QThread, pyqtSignal
-from scapy.all import sniff, Ether
+
+# This will cause an error if not handled carefully, as scapy is a large import.
+# It's better to import it inside the process where it's needed.
+# from scapy.all import sniff, bytes
 
 def sniffer_process_target(queue, iface, bpf_filter):
     """
@@ -10,6 +15,9 @@ def sniffer_process_target(queue, iface, bpf_filter):
     into a multiprocessing.Queue. This completely isolates the blocking
     sniff() call from the main GUI application.
     """
+    # Import scapy here to avoid issues with multiprocessing on some platforms.
+    from scapy.all import sniff, bytes
+
     try:
         # The packet handler now simply puts the raw packet into the queue
         def packet_handler(packet):
@@ -39,7 +47,6 @@ class SnifferThread(QThread):
         self.stop_event = Event()
 
     def run(self):
-        from multiprocessing import Process, Queue
         self.queue = Queue()
         self.process = Process(
             target=sniffer_process_target,

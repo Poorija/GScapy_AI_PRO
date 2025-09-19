@@ -1,61 +1,19 @@
 import json
 import csv
 import logging
-from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QFormLayout, QLineEdit, QPushButton, QHBoxLayout,
-    QFileDialog, QTreeWidget, QTreeWidgetItem, QLabel, QHeaderView
-)
-from PyQt6.QtCore import Qt
 
-LXML_AVAILABLE = True
 try:
     from lxml import etree
+    LXML_AVAILABLE = True
 except ImportError:
     LXML_AVAILABLE = False
+    etree = None
+    logging.warning("Optional XML reporting dependency not found. Please run 'pip install lxml'")
 
-class CrunchDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Crunch Wordlist Generator")
-        layout = QVBoxLayout(self)
-        form_layout = QFormLayout()
-
-        self.min_len = QLineEdit("8")
-        self.max_len = QLineEdit("8")
-        self.charset = QLineEdit("abcdefghijklmnopqrstuvwxyz0123456789")
-        self.output_file = QLineEdit()
-        self.output_file.setReadOnly(True)
-
-        browse_btn = QPushButton("Browse...")
-        browse_btn.clicked.connect(self.browse_output)
-
-        form_layout.addRow("Min Length:", self.min_len)
-        form_layout.addRow("Max Length:", self.max_len)
-        form_layout.addRow("Character Set:", self.charset)
-
-        output_layout = QHBoxLayout()
-        output_layout.addWidget(self.output_file)
-        output_layout.addWidget(browse_btn)
-        form_layout.addRow("Output File:", output_layout)
-
-        layout.addLayout(form_layout)
-
-        self.generate_button = QPushButton("Generate")
-        self.generate_button.clicked.connect(self.accept)
-        layout.addWidget(self.generate_button)
-
-    def browse_output(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Wordlist", "", "Text Files (*.txt)", options=QFileDialog.Option.DontUseNativeDialog)
-        if file_path:
-            self.output_file.setText(file_path)
-
-    def get_values(self):
-        return {
-            "min": self.min_len.text(),
-            "max": self.max_len.text(),
-            "charset": self.charset.text(),
-            "outfile": self.output_file.text()
-        }
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem, QHBoxLayout, QPushButton,
+    QHeaderView
+)
 
 class SubdomainResultsDialog(QDialog):
     """A dialog to show a list of found subdomains with an export option."""
@@ -80,13 +38,17 @@ class SubdomainResultsDialog(QDialog):
         layout.addWidget(self.tree)
 
         button_layout = QHBoxLayout()
-        export_button = self.parent._create_export_button(self.tree)
+        # The export button and AI analyst connection now need to be handled differently,
+        # as the dialog no longer has a direct reference to the main window's methods.
+        # This will be addressed in a later step by using signals.
+        # For now, we create simple buttons.
+        export_button = QPushButton("Export Results")
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(lambda: self.parent._send_to_ai_analyst("subdomain", self.tree, self.domain))
-        button_layout.addWidget(export_button)
-        button_layout.addWidget(analyze_button)
         ok_button = QPushButton("OK")
         ok_button.clicked.connect(self.accept)
+
+        button_layout.addWidget(export_button)
+        button_layout.addWidget(analyze_button)
         button_layout.addWidget(ok_button)
 
         layout.addLayout(button_layout)
@@ -116,18 +78,13 @@ class NmapSummaryDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
         ok_button.clicked.connect(self.accept)
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
-
-    def send_to_ai(self):
-        if self.parent:
-            self.parent.ai_assistant_tab.send_to_analyst("nmap", self.xml_data, self.target_context)
-            self.accept() # Close dialog after sending
 
     def parse_and_populate(self, xml_data):
         if not LXML_AVAILABLE:
@@ -188,7 +145,6 @@ class HttpxResultsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         self.tree = QTreeWidget()
-        # Define columns based on common httpx JSON output
         self.tree.setColumnCount(5)
         self.tree.setHeaderLabels(["URL", "Status Code", "Title", "Web Server", "Technologies"])
         layout.addWidget(self.tree)
@@ -200,7 +156,7 @@ class HttpxResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
@@ -208,15 +164,8 @@ class HttpxResultsDialog(QDialog):
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
 
-    def send_to_ai(self):
-        if self.parent:
-            # The AI can analyze the raw JSON data
-            self.parent.ai_assistant_tab.send_to_analyst("httpx", self.json_data, "httpx probe results")
-            self.accept()
-
     def parse_and_populate(self, json_data):
         try:
-            # httpx outputs JSON objects separated by newlines
             results = [json.loads(line) for line in json_data.strip().split('\n') if line]
             for res in results:
                 url = res.get('url', '')
@@ -228,7 +177,6 @@ class HttpxResultsDialog(QDialog):
                 item = QTreeWidgetItem([url, status_code, title, web_server, tech])
                 self.tree.addTopLevelItem(item)
         except json.JSONDecodeError:
-            # Handle case where output is not JSON
             item = QTreeWidgetItem(["Error parsing JSON output. Displaying raw data in console."])
             self.tree.addTopLevelItem(item)
         except Exception as e:
@@ -257,7 +205,7 @@ class DirsearchResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
@@ -265,14 +213,8 @@ class DirsearchResultsDialog(QDialog):
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
 
-    def send_to_ai(self):
-        if self.parent:
-            self.parent.ai_assistant_tab.send_to_analyst("dirsearch", self.json_data, self.target_context)
-            self.accept()
-
     def parse_and_populate(self, json_data):
         try:
-            # dirsearch report is a dictionary where keys are hostnames
             results = json.loads(json_data)
             for host, findings in results.items():
                 host_item = QTreeWidgetItem([f"Host: {host}"])
@@ -314,18 +256,13 @@ class FfufResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
         ok_button.clicked.connect(self.accept)
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
-
-    def send_to_ai(self):
-        if self.parent:
-            self.parent.ai_assistant_tab.send_to_analyst("ffuf", self.json_data, "ffuf scan results")
-            self.accept()
 
     def parse_and_populate(self, json_data):
         try:
@@ -366,7 +303,7 @@ class NucleiResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
@@ -374,14 +311,8 @@ class NucleiResultsDialog(QDialog):
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
 
-    def send_to_ai(self):
-        if self.parent:
-            self.parent.ai_assistant_tab.send_to_analyst("nuclei", self.json_data, "Nuclei scan results")
-            self.accept()
-
     def parse_and_populate(self, json_data):
         try:
-            # Nuclei outputs JSON objects separated by newlines
             results = [json.loads(line) for line in json_data.strip().split('\n') if line]
             for res in results:
                 template_id = res.get('template-id', '')
@@ -393,7 +324,6 @@ class NucleiResultsDialog(QDialog):
                 item = QTreeWidgetItem([template_id, name, severity, host, matched_at])
                 self.tree.addTopLevelItem(item)
 
-                # Add extracted results as children for more detail
                 if 'extracted-results' in res:
                     for i, extracted in enumerate(res['extracted-results']):
                         child_item = QTreeWidgetItem([f"  - Extracted {i+1}", str(extracted)])
@@ -429,7 +359,7 @@ class TruffleHogResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
@@ -437,14 +367,8 @@ class TruffleHogResultsDialog(QDialog):
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
 
-    def send_to_ai(self):
-        if self.parent:
-            self.parent.ai_assistant_tab.send_to_analyst("trufflehog", self.json_data, "TruffleHog scan results")
-            self.accept()
-
     def parse_and_populate(self, json_data):
         try:
-            # TruffleHog outputs JSON objects separated by newlines
             results = [json.loads(line) for line in json_data.strip().split('\n') if line]
             for res in results:
                 detector = res.get('DetectorType', '')
@@ -483,7 +407,7 @@ class Enum4LinuxNGResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
@@ -491,21 +415,14 @@ class Enum4LinuxNGResultsDialog(QDialog):
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
 
-    def send_to_ai(self):
-        if self.parent:
-            self.parent.ai_assistant_tab.send_to_analyst("enum4linux-ng", self.json_data, self.target_context)
-            self.accept()
-
     def parse_and_populate(self, json_data):
         try:
             results = json.loads(json_data)
-            # The JSON is a list of dictionaries, each representing a finding
             for finding in results:
                 method = finding.get('method', 'N/A')
                 item = QTreeWidgetItem([method])
                 self.tree.addTopLevelItem(item)
 
-                # Add all other keys as children
                 for key, value in finding.items():
                     if key != 'method':
                         child_item = QTreeWidgetItem([f"  {key}", str(value)])
@@ -540,7 +457,7 @@ class DnsReconResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
@@ -548,15 +465,9 @@ class DnsReconResultsDialog(QDialog):
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
 
-    def send_to_ai(self):
-        if self.parent:
-            self.parent.ai_assistant_tab.send_to_analyst("dnsrecon", self.json_data, self.target_context)
-            self.accept()
-
     def parse_and_populate(self, json_data):
         try:
             results = json.loads(json_data)
-            # The JSON is a list of dictionaries
             for res in results:
                 rec_type = res.get('type', 'N/A')
                 target = res.get('target', 'N/A')
@@ -594,7 +505,7 @@ class SherlockResultsDialog(QDialog):
 
         button_layout = QHBoxLayout()
         analyze_button = QPushButton("Send to AI Analyst")
-        analyze_button.clicked.connect(self.send_to_ai)
+        # analyze_button.clicked.connect(self.send_to_ai) # Signal needed
         button_layout.addWidget(analyze_button)
 
         ok_button = QPushButton("OK")
@@ -602,18 +513,11 @@ class SherlockResultsDialog(QDialog):
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
 
-    def send_to_ai(self):
-        if self.parent:
-            self.parent.ai_assistant_tab.send_to_analyst("sherlock", self.csv_data, self.target_context)
-            self.accept()
-
     def parse_and_populate(self, csv_data):
         try:
-            # Use Python's built-in csv module to parse the data
             reader = csv.reader(csv_data.strip().splitlines())
-            header = next(reader) # Skip header row
+            header = next(reader)
             for row in reader:
-                # Assuming standard sherlock csv format: username,name,url,status
                 if len(row) >= 4:
                     item = QTreeWidgetItem(row)
                     self.tree.addTopLevelItem(item)

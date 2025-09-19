@@ -13,7 +13,6 @@ import psutil
 import ipaddress
 from PyQt6.QtCore import PYQT_VERSION_STR
 import subprocess
-import numpy as np
 import json
 import urllib.request
 import tempfile
@@ -34,7 +33,45 @@ import re
 from qt_material import apply_stylesheet, list_themes
 from PyQt6.QtGui import QActionGroup, QPixmap, QImage, QPalette
 
-from .utils.helpers import create_themed_icon, get_vendor, _get_random_ip
+def create_themed_icon(icon_path, color_str):
+    """Loads an SVG, intelligently replaces its color, and returns a QIcon."""
+    try:
+        with open(icon_path, 'r', encoding='utf-8') as f:
+            svg_data = f.read()
+
+        # First, try to replace a stroke color in a style block (for paper-airplane.svg)
+        themed_svg_data, count = re.subn(r'stroke:#[0-9a-fA-F]{6}', f'stroke:{color_str}', svg_data)
+
+        # If no stroke was found in a style, fall back to injecting a fill attribute (for gear.svg)
+        if count == 0 and '<svg' in themed_svg_data:
+            themed_svg_data = themed_svg_data.replace('<svg', f'<svg fill="{color_str}"')
+
+        image = QImage.fromData(themed_svg_data.encode('utf-8'))
+        pixmap = QPixmap.fromImage(image)
+        return QIcon(pixmap)
+    except Exception as e:
+        logging.warning(f"Could not create themed icon for {icon_path}: {e}")
+        return QIcon(icon_path) # Fallback to original icon
+
+def get_vendor(mac_address):
+    """Retrieves the vendor for a given MAC address from an online API."""
+    if not mac_address or mac_address == "N/A":
+        return "N/A"
+    try:
+        # Use a timeout to prevent the application from hanging on network issues
+        with urllib.request.urlopen(f"https://api.macvendors.com/{mac_address}", timeout=3) as url:
+            data = url.read().decode()
+            return data
+    except Exception as e:
+        logging.warning(f"Could not retrieve vendor for MAC {mac_address}: {e}")
+        return "Unknown Vendor"
+
+def _get_random_ip():
+    """Generates a random, non-private IP address."""
+    while True:
+        ip = ".".join(str(random.randint(1, 223)) for _ in range(4))
+        if not (ip.startswith('10.') or ip.startswith('192.168.') or (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31)):
+             return ip
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QStatusBar, QMenuBar, QTabWidget, QWidget,
@@ -45,15 +82,13 @@ from PyQt6.QtWidgets import (
     QHeaderView, QInputDialog, QGraphicsOpacityEffect, QStackedWidget
 )
 from .ui.ai_tab import AIAssistantTab, AISettingsDialog, AIGuideDialog
+from .ui.login import LoginDialog
 from .ui.admin_panel import AdminPanelDialog
 from PyQt6.QtCore import QObject, pyqtSignal, Qt, QThread, QTimer, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup, QPoint, QSize
 from PyQt6.QtGui import QAction, QIcon, QFont, QTextCursor, QActionGroup
 
-
-from .threads.sniffer import SnifferThread
-
-
-from .threads.wireless import KrackScanThread, AircrackThread, ChannelHopperThread, HandshakeSnifferThread
+from .threads.krack_scanner import KrackScanThread
+from .threads.aircrack import AircrackThread
 
 try:
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
@@ -63,15 +98,6 @@ try:
     import docx
 except ImportError:
     logging.warning("Optional PDF/DOCX export dependencies not found. Please run 'pip install reportlab python-docx'")
-
-try:
-    import pyqtgraph as pg
-    PYQTGRAPH_AVAILABLE = True
-except ImportError:
-    PYQTGRAPH_AVAILABLE = False
-    pg = None # Define pg as None to prevent other errors if it's referenced
-    logging.warning("Optional graphing dependency not found. Please run 'pip install pyqtgraph'")
-
 
 try:
     import GPUtil
@@ -89,36 +115,112 @@ try:
 except ImportError:
     logging.critical("Scapy is not installed.")
 
-from .utils.constants import (
-    AVAILABLE_PROTOCOLS, PACKET_TEMPLATES, FIREWALL_PROBES,
-    SCAN_TYPES, COMMON_FILTERS, COMMUNITY_TOOLS
+# --- Constants ---
+AVAILABLE_PROTOCOLS = {"Ethernet": Ether, "ARP": ARP, "IP": IP, "IPv6": IPv6, "TCP": TCP, "UDP": UDP, "ICMP": ICMP, "DNS": DNS, "Raw": Raw}
+PACKET_TEMPLATES = {
+    "ICMP Ping (google.com)": [IP(dst="8.8.8.8"), ICMP()],
+    "DNS Query (google.com)": [IP(dst="8.8.8.8"), UDP(dport=53), DNS(rd=1, qd=DNSQR(qname="google.com"))],
+    "TCP SYN (localhost:80)": [IP(dst="127.0.0.1"), TCP(dport=80, flags="S")],
+    "ARP Request (who-has 192.168.1.1)": [Ether(dst="ff:ff:ff:ff:ff:ff"), ARP(pdst="192.168.1.1")],
+    "NTP Query (pool.ntp.org)": [IP(dst="pool.ntp.org"), UDP(sport=123, dport=123), NTP()],
+    "SNMP GetRequest (public)": [IP(dst="127.0.0.1"), UDP(), SNMP(community="public", PDU=SNMPget(varbindlist=[SNMPvarbind(oid=ASN1_OID('1.3.6.1.2.1.1.1.0'))]))]
+}
+FIREWALL_PROBES = {
+    "Standard SYN Scan (Top Ports)": [(lambda t: IP(dst=t)/TCP(dport=p, flags="S"), f"TCP SYN to port {p}") for p in [21, 22, 25, 53, 80, 110, 143, 443, 445, 3389, 8080]],
+    "Stealthy Scans (FIN, Xmas, Null)": [
+        (lambda t, p=p: IP(dst=t)/TCP(dport=p, flags="F"), f"FIN Scan to port {p}") for p in [80, 443]
+    ] + [
+        (lambda t, p=p: IP(dst=t)/TCP(dport=p, flags="FPU"), f"Xmas Scan to port {p}") for p in [80, 443]
+    ] + [
+        (lambda t, p=p: IP(dst=t)/TCP(dport=p, flags=""), f"Null Scan to port {p}") for p in [80, 443]
+    ],
+    "ACK Scan (Firewall Detection)": [(lambda t, p=p: IP(dst=t)/TCP(dport=p, flags="A"), f"ACK Scan to port {p}") for p in [22, 80, 443]],
+    "Source Port Evasion (DNS)": [(lambda t, p=p: IP(dst=t)/TCP(sport=53, dport=p, flags="S"), f"SYN from port 53 to {p}") for p in [80, 443, 8080]],
+    "Fragmented SYN Scan": [(lambda t, p=p: fragment(IP(dst=t)/TCP(dport=p, flags="S")), f"Fragmented SYN to port {p}") for p in [80, 443]],
+    "TCP Options Probes (WScale, TS)": [
+        (lambda t, p=p: IP(dst=t)/TCP(dport=p, flags="S", options=[('WScale', 10), ('Timestamp', (12345, 0))]), f"SYN+WScale+TS to port {p}") for p in [80, 443]
+    ],
+    "ECN Flag Probes": [
+        (lambda t, p=p: IP(dst=t)/TCP(dport=p, flags="SE"), f"SYN+ECE to port {p}") for p in [80, 443]
+    ] + [
+        (lambda t, p=p: IP(dst=t)/TCP(dport=p, flags="SC"), f"SYN+CWR to port {p}") for p in [80, 443]
+    ],
+    "HTTP Payload Probe": [
+        (lambda t, p=p: IP(dst=t)/TCP(dport=p, flags="PA")/Raw(load="GET / HTTP/1.0\r\n\r\n"), f"HTTP GET probe to port {p}") for p in [80, 8080, 443]
+    ],
+    "Common UDP Probes": [(lambda t, p=p: IP(dst=t)/UDP(dport=p), f"UDP Probe to port {p}") for p in [53, 123, 161]],
+    "ICMP Probes (Advanced)": [
+        (lambda t: IP(dst=t)/ICMP(type=ty), f"ICMP Echo Request (Type 8)") for ty in [8]
+    ] + [
+        (lambda t: IP(dst=t)/ICMP(type=ty), f"ICMP Timestamp Request (Type 13)") for ty in [13]
+    ] + [
+        (lambda t: IP(dst=t)/ICMP(type=ty), f"ICMP Address Mask Request (Type 17)") for ty in [17]
+    ]
+}
+SCAN_TYPES = ["TCP SYN Scan", "TCP FIN Scan", "TCP Xmas Scan", "TCP Null Scan", "TCP ACK Scan", "UDP Scan"]
+
+# --- UI Imports ---
+from .ui.sniffer_tab import SnifferTab
+from .ui.crafter_tab import CrafterTab
+from .ui.dialogs.crunch_dialog import CrunchDialog
+from .ui.dialogs.results_dialogs import (
+    SubdomainResultsDialog,
+    NmapSummaryDialog,
+    HttpxResultsDialog,
+    DirsearchResultsDialog,
+    FfufResultsDialog,
+    NucleiResultsDialog,
+    TruffleHogResultsDialog,
+    Enum4LinuxNGResultsDialog,
+    DnsReconResultsDialog,
+    SherlockResultsDialog,
 )
 
-from .ui.dialogs import (
-    CrunchDialog, SubdomainResultsDialog, NmapSummaryDialog, HttpxResultsDialog,
-    DirsearchResultsDialog, FfufResultsDialog, NucleiResultsDialog,
-    TruffleHogResultsDialog, Enum4LinuxNGResultsDialog, DnsReconResultsDialog,
-    SherlockResultsDialog
-)
-
-from .core.log_handler import QtLogHandler
+COMMUNITY_TOOLS = {
+    "Interpreters and REPLs": [
+        ("scapy-console", "https://github.com/gpotter2/scapy-console", "A Scapy console with many other tools and features."),
+        ("Scapy REPL", "https://github.com/GabrielCama/scapy-repl", "An interactive Scapy REPL with customized commands.")
+    ],
+    "Networking": [
+        ("bettercap", "https://github.com/bettercap/bettercap", "A powerful, flexible and portable tool for network attacks and monitoring."),
+        ("Routersploit", "https://github.com/threat9/routersploit", "An open-source exploitation framework dedicated to embedded devices."),
+        ("Batfish", "https://www.batfish.org/", "A network configuration analysis tool for validating and verifying network designs.")
+    ],
+    "Network Scanners & Analyzers": [
+        ("Wireshark", "https://www.wireshark.org/", "The world's foremost and widely-used network protocol analyzer."),
+        ("Nmap", "https://nmap.org/", "The Network Mapper - a free and open source utility for network discovery and security auditing."),
+        ("Zeek", "https://zeek.org/", "A powerful network analysis framework that is much different from a typical IDS."),
+        ("BruteShark", "https://github.com/odedshimon/BruteShark", "An open-source, cross-platform network forensic analysis tool (NFAT).")
+    ],
+    "Wireless": [
+        ("Kismet", "https://www.kismetwireless.net/", "A wireless network detector, sniffer, and intrusion detection system."),
+        ("Airgeddon", "https://github.com/v1s1t0r1sh3r3/airgeddon", "A multi-use bash script for Linux systems to audit wireless networks."),
+        ("wifiphisher", "https://github.com/wifiphisher/wifisher", "A rogue Access Point framework for conducting red team engagements or Wi-Fi security testing."),
+        ("Wifite2", "https://github.com/derv82/wifite2", "A complete rewrite of the popular wireless network auditing tool, wifite.")
+    ],
+    "Password Cracking": [
+        ("John the Ripper", "https://www.openwall.com/john/", "A fast password cracker, available for many operating systems."),
+        ("Hashcat", "https://hashcat.net/hashcat/", "The world's fastest and most advanced password recovery utility."),
+        ("hcxtools", "https://github.com/ZerBea/hcxtools", "Tools to convert Wi-Fi captures into hash formats for Hashcat or John.")
+    ],
+    "Web & API Security": [
+        ("reNgine", "https://github.com/yogeshojha/rengine", "An automated reconnaissance framework for web applications."),
+        ("Astra", "https://github.com/flipkart-incubator/Astra", "Automated Security Testing For REST APIs.")
+    ],
+    "Industrial Control Systems (ICS)": [
+        ("Scapy-cip-enip", "https://github.com/scapy-cip/scapy-cip-enip", "An EtherNet/IP and CIP implementation for Scapy."),
+        ("Scapy-dnp3", "https://github.com/scapy-dnp3/scapy-dnp3", "A DNP3 implementation for Scapy."),
+        ("Scapy-modbus", "https://github.com/scapy-modbus/scapy-modbus", "A Modbus implementation for Scapy.")
+    ]
+}
 
 # --- Logging and Threads ---
-
-
-
-from .threads.monitor import ResourceMonitorThread
-from .threads.workers import (
-    WorkerThread, _nmap_scan_thread, _sublist3r_thread, _send_thread,
-    _traceroute_thread, _port_scan_thread, _arp_scan_thread,
-    _ping_sweep_thread, _flood_thread, _firewall_test_thread,
-    _deauth_thread, _beacon_flood_thread, _arp_spoof_thread,
-    _cve_search_thread, _exploit_search_thread
-)
-# ... and other worker imports as I create them ...
-
-
-from .ui.widgets import ResourceGraph
+from .core.logging import QtLogHandler
+from .threads.worker import WorkerThread
+from .threads.resource_monitor import ResourceMonitorThread
+from .threads.channel_hopper import ChannelHopperThread
+from .threads.handshake_sniffer import HandshakeSnifferThread
+from .ui.resource_graph import ResourceGraph, PYQTGRAPH_AVAILABLE
 
 
 # --- Main Application ---
@@ -128,14 +230,17 @@ class GScapy(QMainWindow):
         """Initializes the main window, UI components, and internal state."""
         super().__init__()
         self.setWindowTitle("GScapy + AI - The Modern Scapy Interface with AI")
-        # Construct path to icon relative to the script's location for robustness
-        script_dir = os.path.dirname(os.path.realpath(__file__))
-        icon_path = os.path.join(script_dir, "icons", "new_logo.png")
-        self.setWindowIcon(QIcon(icon_path))
+        # Define the base path for resources relative to this file's location
+        self.base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        self.icons_dir = os.path.join(self.base_dir, "icons")
+
+        self.setWindowIcon(QIcon(os.path.join(self.icons_dir, "new_logo.png")))
         self.setGeometry(100, 100, 1200, 800)
 
         self.current_user = None
-        self.sniffer_thread = None; self.channel_hopper = None
+        # Sniffer-related attributes are now in SnifferTab
+        self.channel_hopper = None
+        # Crafter-related attributes are now in CrafterTab
         self.tool_results_queue = Queue()
         self.is_tool_running = False
         self.loaded_flood_packet = None
@@ -188,7 +293,6 @@ class GScapy(QMainWindow):
         self._setup_result_handlers()
         self.results_processor = QTimer(self); self.results_processor.timeout.connect(self._process_tool_results); self.results_processor.start(100)
 
-
         # Setup timer for the clock
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self._update_clock)
@@ -220,7 +324,7 @@ class GScapy(QMainWindow):
         logging.info(f"Updating menu bar for user: {self.current_user}")
         if self.current_user and self.current_user.get('is_admin'):
             admin_menu = self.menu_bar.addMenu("&Admin")
-            admin_menu.addAction(QIcon("icons/new_logo.png"), "Admin Panel...", self._show_admin_panel)
+            admin_menu.addAction(QIcon(os.path.join(self.icons_dir, "new_logo.png")), "Admin Panel...", self._show_admin_panel)
 
         # --- Help Menu ---
         help_menu = self.menu_bar.addMenu("&Help")
@@ -311,7 +415,7 @@ class GScapy(QMainWindow):
         dialog.setWindowTitle("About GScapy + AI")
 
         # Add the logo
-        pixmap = QIcon(os.path.join("icons", "new_logo.png")).pixmap(80, 80)
+        pixmap = QIcon(os.path.join(self.icons_dir, "new_logo.png")).pixmap(80, 80)
         dialog.setIconPixmap(pixmap)
 
         about_text = """
@@ -336,7 +440,7 @@ class GScapy(QMainWindow):
 
         # Add Logo and Tooltip
         logo_label = QLabel()
-        logo_pixmap = QIcon(os.path.join("icons", "new_logo.png")).pixmap(40, 40)
+        logo_pixmap = QIcon(os.path.join(self.icons_dir, "new_logo.png")).pixmap(40, 40)
         logo_label.setPixmap(logo_pixmap)
         logo_label.setToolTip("GScapy made by Poorija, Email: mohammadmahdi.farhadianfard@gmail.com")
         resource_layout.addWidget(logo_label)
@@ -518,25 +622,22 @@ class GScapy(QMainWindow):
             }
         """)
         self.main_layout.addWidget(self.tab_widget)
-        from .ui.sniffer_tab import SnifferTab
-        self.sniffer_tab = SnifferTab(self)
-        self.tab_widget.addTab(self.sniffer_tab, QIcon("icons/search.svg"), "Packet Sniffer")
-        from .ui.crafter_tab import CrafterTab
+        self.tab_widget.addTab(self._create_sniffer_tab(), QIcon(os.path.join(self.icons_dir, "search.svg")), "Packet Sniffer")
         self.crafter_tab = CrafterTab(self)
-        self.tab_widget.addTab(self.crafter_tab, QIcon("icons/edit-3.svg"), "Packet Crafter")
-        self.tab_widget.addTab(self._create_tools_tab(), QIcon("icons/tool.svg"), "Network Tools")
-        self.tab_widget.addTab(self._create_advanced_tools_tab(), QIcon("icons/shield.svg"), "Advanced Tools")
-        self.tab_widget.addTab(self._create_wireless_tools_tab(), QIcon("icons/wifi.svg"), "Wireless Tools")
-        self.tab_widget.addTab(self._create_reporting_tab(), QIcon("icons/file-text.svg"), "Reporting")
-        self.tab_widget.addTab(self._create_lab_tab(), QIcon("icons/layers.svg"), "LAB")
+        self.tab_widget.addTab(self.crafter_tab, QIcon(os.path.join(self.icons_dir, "edit-3.svg")), "Packet Crafter")
+        self.tab_widget.addTab(self._create_tools_tab(), QIcon(os.path.join(self.icons_dir, "tool.svg")), "Network Tools")
+        self.tab_widget.addTab(self._create_advanced_tools_tab(), QIcon(os.path.join(self.icons_dir, "shield.svg")), "Advanced Tools")
+        self.tab_widget.addTab(self._create_wireless_tools_tab(), QIcon(os.path.join(self.icons_dir, "wifi.svg")), "Wireless Tools")
+        self.tab_widget.addTab(self._create_reporting_tab(), QIcon(os.path.join(self.icons_dir, "file-text.svg")), "Reporting")
+        self.tab_widget.addTab(self._create_lab_tab(), QIcon(os.path.join(self.icons_dir, "layers.svg")), "LAB")
 
         self.ai_assistant_tab = AIAssistantTab(self)
-        self.tab_widget.addTab(self.ai_assistant_tab, QIcon("icons/terminal.svg"), "AI Assistant")
+        self.tab_widget.addTab(self.ai_assistant_tab, QIcon(os.path.join(self.icons_dir, "terminal.svg")), "AI Assistant")
 
-        self.tab_widget.addTab(self._create_threat_intelligence_tab(), QIcon("icons/database.svg"), "Threat Intelligence")
+        self.tab_widget.addTab(self._create_threat_intelligence_tab(), QIcon(os.path.join(self.icons_dir, "database.svg")), "Threat Intelligence")
 
-        self.tab_widget.addTab(self._create_community_tools_tab(), QIcon("icons/users.svg"), "Community Tools")
-        self.tab_widget.addTab(self._create_system_info_tab(), QIcon("icons/info.svg"), "System Info")
+        self.tab_widget.addTab(self._create_community_tools_tab(), QIcon(os.path.join(self.icons_dir, "users.svg")), "Community Tools")
+        self.tab_widget.addTab(self._create_system_info_tab(), QIcon(os.path.join(self.icons_dir, "info.svg")), "System Info")
 
     def _create_threat_intelligence_tab(self):
         """Creates the tab container for the Threat Intelligence tools."""
@@ -612,9 +713,52 @@ class GScapy(QMainWindow):
         except FileNotFoundError:
             logging.info("NVD API key file ('nvd_api.key') not found. Using public, rate-limited access.")
 
-        self.worker = WorkerThread(_cve_search_thread, args=(self, query, api_key))
+        self.worker = WorkerThread(self._cve_search_thread, args=(query, api_key))
         self.active_threads.append(self.worker)
         self.worker.start()
+
+    def _cve_search_thread(self, query, api_key):
+        """Worker thread to search for CVEs using nvdlib."""
+        q = self.tool_results_queue
+        try:
+            import nvdlib
+            # nvdlib handles a cveId search automatically if the format matches
+            if re.match(r"CVE-\d{4}-\d{4,7}", query, re.IGNORECASE):
+                results = nvdlib.searchCVE(cveId=query, key=api_key, delay=6 if not api_key else 0)
+            else:
+                results = nvdlib.searchCVE(keywordSearch=query, key=api_key, delay=6 if not api_key else 0)
+
+            if not results:
+                q.put(('cve_search_status', "No CVEs found for your query."))
+            else:
+                q.put(('cve_search_status', f"Found {len(results)} CVEs."))
+
+            for r in results:
+                # Get the English description
+                description = "No description available."
+                for desc in r.descriptions:
+                    if desc.lang == 'en':
+                        description = desc.value
+                        break
+
+                # Get V3.1 score/severity, fall back to V2 if not available
+                severity = "N/A"
+                score = "N/A"
+                if hasattr(r, 'v31severity') and r.v31severity:
+                    severity = r.v31severity
+                    score = r.v31score
+                elif hasattr(r, 'v2severity') and r.v2severity:
+                    severity = r.v2severity
+                    score = r.v2score
+
+                # Send a tuple of the data and the full object
+                q.put(('cve_result', (r.id, severity, score, description[:100] + '...'), r))
+
+        except Exception as e:
+            logging.error(f"nvdlib search failed: {e}", exc_info=True)
+            q.put(('error', 'CVE Search Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'cve_search'))
 
     def display_cve_details(self, current_item, previous_item):
         """Displays full details for the selected CVE."""
@@ -746,9 +890,61 @@ class GScapy(QMainWindow):
         self.exploitdb_results_table.clear()
         self.status_bar.showMessage(f"Searching for exploits related to '{query}'...")
 
-        self.worker = WorkerThread(_exploit_search_thread, args=(self, query, api_key))
+        self.worker = WorkerThread(self._exploit_search_thread, args=(query, api_key))
         self.active_threads.append(self.worker)
         self.worker.start()
+
+    def _exploit_search_thread(self, query, api_key):
+        """Worker thread to search for exploits using getsploit."""
+        q = self.tool_results_queue
+        command = ["getsploit", "--api", api_key, query]
+
+        try:
+            # Use CREATE_NO_WINDOW flag on Windows to hide the console
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            output, _ = process.communicate()
+
+            if process.returncode != 0:
+                raise Exception(output)
+
+            # Parse the table-formatted output
+            lines = output.strip().split('\n')
+            # Find the header line to start parsing from
+            header_index = -1
+            for i, line in enumerate(lines):
+                if 'ID' in line and 'Exploit Title' in line and 'URL' in line:
+                    header_index = i
+                    break
+
+            if header_index == -1:
+                q.put(('exploit_search_status', "No results found or could not parse output."))
+                return
+
+            results = []
+            # Start from 2 lines after the header to skip the header and the '======' line
+            for line in lines[header_index + 2:]:
+                if line.startswith('+--'): # End of table
+                    break
+                parts = [p.strip() for p in line.split('|') if p.strip()]
+                if len(parts) >= 3:
+                    results.append(parts)
+
+            q.put(('exploit_search_results', results))
+            q.put(('exploit_search_status', f"Found {len(results)} exploits."))
+
+        except FileNotFoundError:
+            q.put(('error', 'GetSploit Error', "'getsploit' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"getsploit search failed: {e}", exc_info=True)
+            q.put(('error', 'Exploit Search Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'exploit_search'))
 
     def open_exploit_url(self, item, column):
         """Opens the selected exploit URL in the default web browser."""
@@ -802,7 +998,11 @@ class GScapy(QMainWindow):
         root_logger.addHandler(qt_handler)
         root_logger.setLevel(logging.INFO)
 
-
+    def _create_sniffer_tab(self):
+        """Creates the UI for the Packet Sniffer tab by instantiating the SnifferTab class."""
+        # The main window still needs a reference to the tab to pass to other components if needed
+        self.sniffer_tab = SnifferTab(self)
+        return self.sniffer_tab
 
     def _create_nmap_scanner_tool(self):
         widget = QWidget()
@@ -1086,7 +1286,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.nmap_output_console.clear()
 
-        self.worker = WorkerThread(_nmap_scan_thread, args=(self, command,))
+        self.worker = WorkerThread(self._nmap_scan_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -1139,6 +1339,125 @@ class GScapy(QMainWindow):
             logging.error(f"Failed to generate or save Nmap report: {e}", exc_info=True)
             QMessageBox.critical(self, "Report Generation Error", f"An unexpected error occurred:\n{e}")
 
+    def _nmap_scan_thread(self, command):
+        q = self.tool_results_queue
+        logging.info(f"Starting Nmap scan with command: {' '.join(command)}")
+        q.put(('nmap_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            with self.thread_finish_lock:
+                self.nmap_process = process
+
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate() # Terminate the process if cancelled
+                    q.put(('nmap_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('nmap_output', line))
+
+            process.stdout.close()
+            process.wait()
+
+        except FileNotFoundError:
+            q.put(('error', 'Nmap Error', "'nmap' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            q.put(('error', 'Nmap Error', str(e)))
+        finally:
+            # After scan, read the XML report from the temp file
+            if self.nmap_xml_temp_file and os.path.exists(self.nmap_xml_temp_file):
+                try:
+                    with open(self.nmap_xml_temp_file, 'r', encoding='utf-8') as f:
+                        xml_content = f.read()
+                    if xml_content:
+                        q.put(('nmap_xml_result', xml_content))
+                except Exception as e:
+                    logging.error(f"Could not read Nmap XML report: {e}")
+                finally:
+                    os.remove(self.nmap_xml_temp_file)
+                    self.nmap_xml_temp_file = None
+
+            q.put(('tool_finished', 'nmap_scan'))
+            with self.thread_finish_lock:
+                self.nmap_process = None
+            logging.info("Nmap scan thread finished.")
+
+    def _sublist3r_thread(self, domain):
+        """Worker thread to run the Sublist3r script."""
+        q = self.tool_results_queue
+        command = ["python", "tools/sublist3r/sublist3r.py", "-d", domain]
+        logging.info(f"Starting Sublist3r scan with command: {' '.join(command)}")
+        q.put(('sublist3r_output', f"$ {' '.join(command)}\n\n"))
+
+        try:
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+            with self.thread_finish_lock:
+                self.sublist3r_process = process
+
+            full_output = []
+            for line in iter(process.stdout.readline, ''):
+                if self.tool_stop_event.is_set():
+                    process.terminate()
+                    q.put(('sublist3r_output', "\n\n--- Scan Canceled By User ---\n"))
+                    break
+                q.put(('sublist3r_output', line))
+                full_output.append(line)
+
+            process.stdout.close()
+            process.wait()
+
+            # If scan was not canceled, parse the results and show the popup
+            if not self.tool_stop_event.is_set():
+                results = []
+                try:
+                    # New method: Find the last non-empty line which should contain the JSON array
+                    json_line = ""
+                    for line in reversed(full_output):
+                        stripped_line = line.strip()
+                        if stripped_line:
+                            json_line = stripped_line
+                            break
+
+                    if json_line.startswith('[') and json_line.endswith(']'):
+                        results = json.loads(json_line)
+                        logging.info(f"Successfully parsed {len(results)} subdomains from sublist3r JSON output.")
+                    else:
+                        # This will trigger the fallback logic
+                        raise ValueError("Could not find JSON list in output.")
+
+                except (json.JSONDecodeError, IndexError, ValueError) as e:
+                    logging.warning(f"Could not parse JSON from sublist3r output ({e}), falling back to fragile text parsing.")
+                    # Fallback to old, fragile parsing method
+                    for line in reversed(full_output):
+                        if "Total Unique Subdomains Found" in line:
+                            break # Stop when we hit the summary line
+                        # A simple check to see if the line is likely a subdomain
+                        if f'.{domain}' in line and not any(c in '<> ' for c in line):
+                             results.append(line.strip())
+                    results.reverse()
+
+                q.put(('subdomain_results', domain, results))
+
+        except FileNotFoundError:
+            q.put(('error', 'Sublist3r Error', "'python' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            q.put(('error', 'Sublist3r Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'sublist3r_scan'))
+            with self.thread_finish_lock:
+                self.sublist3r_process = None
+            logging.info("Sublist3r scan thread finished.")
 
     def _create_subfinder_tool(self):
         """Creates the UI for the Subfinder tool."""
@@ -1235,7 +1554,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.subfinder_output.clear()
 
-        self.worker = WorkerThread(_subfinder_thread, args=(self, command,))
+        self.worker = WorkerThread(self._subfinder_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -1416,7 +1735,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.httpx_output.clear()
 
-        self.worker = WorkerThread(_httpx_thread, args=(self, command,))
+        self.worker = WorkerThread(self._httpx_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -1572,7 +1891,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.rustscan_output.clear()
 
-        self.worker = WorkerThread(_rustscan_thread, args=(self, command,))
+        self.worker = WorkerThread(self._rustscan_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -1732,7 +2051,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.dirsearch_output_console.clear()
 
-        self.worker = WorkerThread(_dirsearch_thread, args=(self, command, url))
+        self.worker = WorkerThread(self._dirsearch_thread, args=(command, url))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -1909,7 +2228,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.ffuf_output_console.clear()
 
-        self.worker = WorkerThread(_ffuf_thread, args=(self, command,))
+        self.worker = WorkerThread(self._ffuf_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -2092,7 +2411,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.enum4linux_ng_output_console.clear()
 
-        self.worker = WorkerThread(_enum4linux_ng_thread, args=(self, command, target))
+        self.worker = WorkerThread(self._enum4linux_ng_thread, args=(command, target))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -2261,7 +2580,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.dnsrecon_output_console.clear()
 
-        self.worker = WorkerThread(_dnsrecon_thread, args=(self, command, domain))
+        self.worker = WorkerThread(self._dnsrecon_thread, args=(command, domain))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -2408,7 +2727,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.fierce_output_console.clear()
 
-        self.worker = WorkerThread(_fierce_thread, args=(self, command,))
+        self.worker = WorkerThread(self._fierce_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -2540,7 +2859,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.sublist3r_output.clear()
 
-        self.worker = WorkerThread(_sublist3r_thread, args=(self, domain,))
+        self.worker = WorkerThread(self._sublist3r_thread, args=(domain,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -2728,7 +3047,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.nikto_output_console.clear()
 
-        self.worker = WorkerThread(_nikto_thread, args=(self, command,))
+        self.worker = WorkerThread(self._nikto_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -2922,7 +3241,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.gobuster_output_console.clear()
 
-        self.worker = WorkerThread(_gobuster_thread, args=(self, command,))
+        self.worker = WorkerThread(self._gobuster_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -3021,7 +3340,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.whatweb_output_console.clear()
 
-        self.worker = WorkerThread(_whatweb_thread, args=(self, command,))
+        self.worker = WorkerThread(self._whatweb_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -3279,7 +3598,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.sqlmap_output_console.clear()
 
-        self.worker = WorkerThread(_sqlmap_thread, args=(self, command,))
+        self.worker = WorkerThread(self._sqlmap_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -3524,7 +3843,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.hashcat_output_console.clear()
 
-        self.worker = WorkerThread(_hashcat_thread, args=(self, command,))
+        self.worker = WorkerThread(self._hashcat_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -3740,7 +4059,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.nuclei_output_console.clear()
 
-        self.worker = WorkerThread(_nuclei_thread, args=(self, command,))
+        self.worker = WorkerThread(self._nuclei_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -3925,7 +4244,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.trufflehog_output_console.clear()
 
-        self.worker = WorkerThread(_trufflehog_thread, args=(self, command,))
+        self.worker = WorkerThread(self._trufflehog_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -4097,7 +4416,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.jtr_output_console.clear()
 
-        self.worker = WorkerThread(_jtr_thread, args=(self, command,))
+        self.worker = WorkerThread(self._jtr_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -4263,7 +4582,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.hydra_output_console.clear()
 
-        self.worker = WorkerThread(_hydra_thread, args=(self, command,))
+        self.worker = WorkerThread(self._hydra_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -4405,7 +4724,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.sherlock_output_console.clear()
 
-        self.worker = WorkerThread(_sherlock_thread, args=(self, command, usernames))
+        self.worker = WorkerThread(self._sherlock_thread, args=(command, usernames))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -4555,7 +4874,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.spiderfoot_output_console.clear()
 
-        self.worker = WorkerThread(_spiderfoot_thread, args=(self, command,))
+        self.worker = WorkerThread(self._spiderfoot_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -4721,7 +5040,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.masscan_output_console.clear()
 
-        self.worker = WorkerThread(_masscan_thread, args=(self, command,))
+        self.worker = WorkerThread(self._masscan_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -5601,7 +5920,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.wifite_output_console.clear()
 
-        self.worker = WorkerThread(_wifite_thread, args=(self, command,))
+        self.worker = WorkerThread(self._wifite_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -5882,7 +6201,7 @@ class GScapy(QMainWindow):
                     except Exception as e:
                         self.tool_results_queue.put(('error', 'Crunch Error', str(e)))
 
-                self.worker = WorkerThread(target=run_crunch, args=(self,))
+                self.worker = WorkerThread(target=run_crunch)
                 self.worker.start()
 
             except Exception as e:
@@ -5930,7 +6249,7 @@ class GScapy(QMainWindow):
             QMessageBox.warning(self, "Target Error", "Please select a target network to deauthenticate.")
             return
         args = (bssid, "ff:ff:ff:ff:ff:ff", 5)
-        self.worker = WorkerThread(_deauth_thread, args=(self, *args))
+        self.worker = WorkerThread(self._deauth_thread, args=args)
         self.worker.start()
         QMessageBox.information(self, "Deauth Sent", f"Sent 5 deauth packets to the network {bssid} to encourage re-association.")
 
@@ -6051,57 +6370,16 @@ class GScapy(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load SSID file: {e}")
 
-
-
-    def save_packets(self):
-        """Saves captured packets to a pcap file."""
-        if not self.sniffer_tab.packets_data: QMessageBox.information(self, "Info", "There are no packets to save."); return
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Packets", "", "Pcap Files (*.pcap *.pcapng);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
-        if file_path:
-            try: wrpcap(file_path, self.sniffer_tab.packets_data); self.status_bar.showMessage(f"Saved {len(self.sniffer_tab.packets_data)} packets to {file_path}")
-            except Exception as e: QMessageBox.critical(self, "Error", f"Failed to save packets: {e}")
-
-    def load_packets(self):
-        """Loads packets from a pcap file into the sniffer view."""
-        if self.sniffer_tab.packets_data and QMessageBox.question(self, "Confirm", "Clear captured packets?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.No: return
-        self.sniffer_tab.clear_sniffer_display()
-        file_path, _ = QFileDialog.getOpenFileName(self, "Load Packets", "", "Pcap Files (*.pcap *.pcapng);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
-        if file_path:
-            try:
-                loaded_packets = rdpcap(file_path)
-                for packet in loaded_packets: self.sniffer_tab.add_packet_to_list(packet)
-                self.status_bar.showMessage(f"Loaded {len(loaded_packets)} packets from {file_path}")
-            except Exception as e: QMessageBox.critical(self, "Error", f"Failed to load packets: {e}")
-
-    def _send_thread(self, c, i):
-        iface = self.get_selected_iface()
-        q = self.tool_results_queue
-        try:
-            ans_list = []
-            unans_list = []
-            for pkt_num in range(c):
-                if self.tool_stop_event.is_set():
-                    logging.info("Packet sending cancelled.")
-                    break
-
-                pkt = self.build_packet()
-                if not pkt:
-                    logging.error("Failed to build packet in send thread.")
-                    break
-
-                send_receive_func = srp1 if pkt.haslayer(Ether) else sr1
-                reply = send_receive_func(pkt, timeout=2, iface=iface, verbose=0)
-                if reply:
-                    ans_list.append((pkt, reply))
-                else:
-                    unans_list.append(pkt)
-                time.sleep(i)
-            q.put(('send_results', ans_list, unans_list))
-        except Exception as e:
-            logging.error("Send packet failed", exc_info=True)
-            q.put(('error', 'Send Error', str(e)))
-        finally:
-            q.put(('send_finished',))
+    # --- Backend Methods: Crafter & Tools ---
+    def load_flood_packet(self):
+        # This method now needs to get the packet from the crafter_tab instance
+        packet = self.crafter_tab.build_packet()
+        if not packet:
+            QMessageBox.critical(self, "Error", "Please craft a packet in the Packet Crafter tab first.")
+            return
+        self.loaded_flood_packet = packet
+        self.flood_packet_label.setText(f"Loaded: {self.loaded_flood_packet.summary()}")
+        logging.info(f"Loaded flood packet: {self.loaded_flood_packet.summary()}")
 
     def start_traceroute(self):
         """Starts the traceroute worker thread."""
@@ -6112,7 +6390,7 @@ class GScapy(QMainWindow):
         self.trace_cancel_button.setEnabled(True)
         self.is_tool_running = True
         self.tool_stop_event.clear()
-        self.worker = WorkerThread(_traceroute_thread, args=(self, t,)); self.worker.start()
+        self.worker = WorkerThread(self._traceroute_thread, args=(t,)); self.worker.start()
 
     def _traceroute_thread(self,t):
         q=self.tool_results_queue; iface=self.get_selected_iface()
@@ -6160,7 +6438,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
 
         args = (t, ports, scan_protocols, tcp_scan_type, use_frags)
-        self.worker = WorkerThread(_port_scan_thread, args=(self, *args)); self.worker.start()
+        self.worker = WorkerThread(self._port_scan_thread, args=args); self.worker.start()
 
     def _parse_ports(self,ps):
         ports=[]
@@ -6245,7 +6523,7 @@ class GScapy(QMainWindow):
         t=self.arp_target.text()
         if not t: QMessageBox.critical(self, "Error", "Please enter a target network."); return
         self.arp_scan_button.setEnabled(False); self.is_tool_running=True
-        self.worker = WorkerThread(_arp_scan_thread, args=(self, t,)); self.worker.start()
+        self.worker = WorkerThread(self._arp_scan_thread, args=(t,)); self.worker.start()
 
     def _arp_scan_thread(self,t):
         q=self.tool_results_queue; iface=self.get_selected_iface()
@@ -6366,7 +6644,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.arp_scan_cli_output_console.clear()
 
-        self.worker = WorkerThread(_arp_scan_cli_thread, args=(self, command,))
+        self.worker = WorkerThread(self._arp_scan_cli_thread, args=(command,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -6442,7 +6720,7 @@ class GScapy(QMainWindow):
         self.ps_tree.clear()
 
         args = (net, probe_type, ports, timeout, num_threads)
-        self.worker = WorkerThread(_ping_sweep_thread, args=(self, *args))
+        self.worker = WorkerThread(self._ping_sweep_thread, args=args)
         self.worker.start()
 
     def _ping_sweep_thread(self, net, probe_type, ports, timeout, num_threads):
@@ -6564,7 +6842,7 @@ class GScapy(QMainWindow):
             if count_for_this_thread == 0:
                 continue
 
-            worker = WorkerThread(_flood_thread, args=(self, flood_params, count_for_this_thread, interval, num_threads))
+            worker = WorkerThread(self._flood_thread, args=(flood_params, count_for_this_thread, interval, num_threads))
             self.active_threads.append(worker)
             worker.start()
 
@@ -6650,7 +6928,7 @@ class GScapy(QMainWindow):
         t=self.fw_target.text(); ps_name=self.fw_probe_set.currentText()
         if not t: QMessageBox.critical(self, "Error", "Please enter a target."); return
         self.fw_test_button.setEnabled(False); self.is_tool_running=True
-        self.worker = WorkerThread(_firewall_test_thread, args=(self, t,ps_name)); self.worker.start()
+        self.worker = WorkerThread(self._firewall_test_thread, args=(t,ps_name)); self.worker.start()
 
     def _firewall_test_thread(self,t,ps_name):
         q=self.tool_results_queue; iface=self.get_selected_iface()
@@ -6748,7 +7026,7 @@ class GScapy(QMainWindow):
         if QMessageBox.question(self, "Confirm Deauth", warning_msg) == QMessageBox.StandardButton.No: return
         self.deauth_button.setEnabled(False); self.is_tool_running = True
         args = (bssid, client, count)
-        self.worker = WorkerThread(_deauth_thread, args=(self, *args)); self.worker.start()
+        self.worker = WorkerThread(self._deauth_thread, args=args); self.worker.start()
 
     def _deauth_thread(self, bssid, client, count):
         q = self.tool_results_queue; iface = self.get_selected_iface()
@@ -6801,7 +7079,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
 
         args = (iface, ssids, bssid, count, interval, enc_type, channel)
-        self.worker = WorkerThread(_beacon_flood_thread, args=(self, *args))
+        self.worker = WorkerThread(self._beacon_flood_thread, args=args)
         self.worker.start()
 
     def _build_beacon_frame(self, ssid, bssid, channel, enc_type):
@@ -6949,7 +7227,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
 
         args = (victim_ip, target_ip)
-        self.worker = WorkerThread(_arp_spoof_thread, args=(self, *args))
+        self.worker = WorkerThread(self._arp_spoof_thread, args=args)
         self.worker.start()
 
     def stop_arp_spoof(self):
@@ -7350,7 +7628,7 @@ class GScapy(QMainWindow):
         self.report_findings_tree.clear()
         self.status_bar.showMessage("Aggregating and enriching results...")
 
-        self.worker = WorkerThread(self._aggregation_thread, args=(self,))
+        self.worker = WorkerThread(self._aggregation_thread)
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -7443,7 +7721,7 @@ class GScapy(QMainWindow):
         # 3. Start worker thread
         self.status_bar.showMessage("Generating report...")
         self.report_generate_btn.setEnabled(False)
-        self.worker = WorkerThread(_report_generation_thread, args=(self, report_data, file_path, template_name))
+        self.worker = WorkerThread(self._report_generation_thread, args=(report_data, file_path, template_name))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -8407,7 +8685,7 @@ class GScapy(QMainWindow):
         # Deepcopy the chain to avoid race conditions if the user edits it while running
         chain_to_run = copy.deepcopy(self.lab_test_chain)
 
-        self.worker = WorkerThread(_lab_chain_thread, args=(self, chain_to_run,))
+        self.worker = WorkerThread(self._lab_chain_thread, args=(chain_to_run,))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -8437,3 +8715,7 @@ class GScapy(QMainWindow):
 
         q.put(('tool_finished', 'lab_chain'))
         logging.info("LAB chain execution finished.")
+
+
+# This file no longer contains the main() function.
+# It has been moved to gscapy/main.py to act as the proper entry point.

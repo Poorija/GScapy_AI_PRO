@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QWidget, QComboBox
 )
 from PyQt6.QtCore import Qt
-import database
+from ..core import database
 
 class AdminPanelDialog(QDialog):
     def __init__(self, parent=None):

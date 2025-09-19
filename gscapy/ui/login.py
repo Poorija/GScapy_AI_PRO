@@ -9,9 +9,9 @@ from PyQt6.QtWidgets import (
 from qt_material import apply_stylesheet, list_themes
 from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
 from PyQt6.QtGui import QIcon, QPixmap
-import database
+from ..core import database
 import logging
-from captcha import generate_captcha
+from ..core.captcha import generate_captcha
 
 # This list must be kept in sync with the one in database.py
 SECURITY_QUESTIONS_LIST = [
@@ -177,7 +177,8 @@ class LoginDialog(QDialog):
         # Logo
         self.logo_label = QLabel()
         script_dir = os.path.dirname(os.path.realpath(__file__))
-        icon_path = os.path.join(script_dir, "icons", "new_logo.png")
+        base_dir = os.path.dirname(os.path.dirname(script_dir))
+        icon_path = os.path.join(base_dir, "icons", "new_logo.png")
         pixmap = QPixmap(icon_path)
         self.logo_label.setPixmap(pixmap.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         header_layout.addWidget(self.logo_label)
@@ -657,20 +658,3 @@ class LoginDialog(QDialog):
             sys.exit(0)
         event.accept()
 
-if __name__ == '__main__':
-    # This is a minimal example for testing the dialog directly
-    from qt_material import apply_stylesheet
-    app = QApplication(sys.argv)
-
-    # You might need to create a dummy database for direct testing
-    if not os.path.exists(database.DATABASE_NAME):
-        database.initialize_database()
-
-    # Apply a theme to see the effect
-    apply_stylesheet(app, theme='dark_blue.xml')
-
-    dialog = LoginDialog()
-    if dialog.exec() == QDialog.DialogCode.Accepted:
-        print(f"Login successful for user: {dialog.current_user['username']}")
-    else:
-        print("Login dialog closed or failed.")

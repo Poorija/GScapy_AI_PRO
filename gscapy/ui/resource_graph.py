@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PyQt6.QtCore import Qt
@@ -8,6 +9,7 @@ try:
 except ImportError:
     PYQTGRAPH_AVAILABLE = False
     pg = None
+    logging.warning("Optional graphing dependency not found. Please run 'pip install pyqtgraph'")
 
 if PYQTGRAPH_AVAILABLE:
     class ResourceGraph(pg.PlotWidget):
@@ -45,7 +47,6 @@ else:
             label.setStyleSheet("color: #888;")
             layout.addWidget(label)
             self.setMinimumHeight(60)
-            # Make the placeholder visible
             self.setStyleSheet("background-color: #2d313a; border: 1px solid #444;")
 
         def update_data(self, new_value):

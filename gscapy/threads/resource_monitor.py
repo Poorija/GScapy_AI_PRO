@@ -1,6 +1,7 @@
-import logging
 import time
+import logging
 from threading import Event
+
 import psutil
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -9,6 +10,7 @@ try:
 except ImportError:
     GPUtil = None
     logging.warning("Optional GPU monitoring dependency not found. Please run 'pip install gputil'")
+
 
 class ResourceMonitorThread(QThread):
     """A thread that monitors and emits system resource usage statistics."""

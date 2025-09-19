@@ -2,15 +2,22 @@ import sys
 import logging
 from PyQt6.QtWidgets import QApplication, QMessageBox, QDialog
 from qt_material import apply_stylesheet
-import database
+
+# Imports from package
+from .core import database
 from .ui.login import LoginDialog
+
+# Relative imports for the new structure
 from .main_window import GScapy
+
 
 def main():
     """Main function to launch the GScapy application."""
     try:
         database.initialize_database()
-        if 'scapy' not in sys.modules: raise ImportError
+        # This check is now less critical as imports would fail earlier, but good practice.
+        if 'scapy' not in sys.modules:
+            raise ImportError("Scapy is not available.")
 
         app = QApplication(sys.argv)
 
@@ -77,12 +84,14 @@ def main():
         window.show()
         sys.exit(app.exec())
 
-    except ImportError:
+    except ImportError as e:
+        # This part handles cases where critical modules like Scapy are missing.
         app = QApplication(sys.argv)
-        QMessageBox.critical(None, "Fatal Error", "Scapy is not installed.")
+        QMessageBox.critical(None, "Fatal Error", f"A required module is missing: {e}")
+        logging.critical(f"A required module is missing: {e}", exc_info=True)
         sys.exit(1)
     except Exception as e:
-        logging.critical(f"An unhandled exception occurred: {e}", exc_info=True)
+        logging.critical(f"An unhandled exception occurred in main: {e}", exc_info=True)
         app = QApplication(sys.argv)
         QMessageBox.critical(None, "Unhandled Exception", f"An unexpected error occurred:\n\n{e}")
         sys.exit(1)

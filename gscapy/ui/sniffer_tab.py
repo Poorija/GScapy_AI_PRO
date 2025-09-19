@@ -1,24 +1,51 @@
+import os
 import time
 import logging
+from threading import Lock
+
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QFrame, QHBoxLayout, QPushButton, QLabel, QLineEdit,
-    QComboBox, QSplitter, QTreeWidget, QTextBrowser, QHeaderView, QTreeWidgetItem
+    QWidget, QVBoxLayout, QTreeWidget, QHeaderView, QFrame, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QComboBox, QSplitter, QTextBrowser,
+    QTreeWidgetItem, QFileDialog, QMessageBox
 )
 from PyQt6.QtGui import QIcon, QFont
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QTimer
+
+# Scapy and other backend imports
+from scapy.all import hexdump, Ether, IP, ARP, rdpcap, wrpcap
+
+# Relative imports from our new structure
 from ..threads.sniffer import SnifferThread
-from ..utils.constants import COMMON_FILTERS
-from scapy.all import Ether, IP, ARP, hexdump
+
+# Constants will be moved later, for now, define it here
+COMMON_FILTERS = [
+    "", "tcp", "udp", "arp", "icmp",
+    "port 80", "port 443", "udp port 53", "tcp port 22",
+    "host 8.8.8.8", "net 192.168.1.0/24", "vlan"
+]
 
 class SnifferTab(QWidget):
+    """A widget that contains all the UI and logic for the packet sniffer tab."""
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
+        self.icons_dir = self.main_window.icons_dir
+
+        # --- Attributes moved from GScapy.__init__ ---
         self.packets_data = []
         self.sniffer_thread = None
         self.sniffer_packet_buffer = []
-        self.sniffer_buffer_lock = self.main_window.sniffer_buffer_lock
+        self.sniffer_buffer_lock = Lock()
 
+        self._init_ui()
+
+        # --- Timer setup moved from GScapy.__init__ ---
+        self.sniffer_ui_update_timer = QTimer(self)
+        self.sniffer_ui_update_timer.timeout.connect(self._update_sniffer_display)
+        self.sniffer_ui_update_timer.start(500) # Update every 500ms
+
+    def _init_ui(self):
+        """Initializes the user interface of the sniffer tab."""
         layout = QVBoxLayout(self)
 
         # Create the results widget first
@@ -37,8 +64,9 @@ class SnifferTab(QWidget):
         control_layout.setContentsMargins(10, 10, 10, 10)
         control_layout.setSpacing(10)
 
-        self.start_sniff_btn = QPushButton(QIcon("icons/search.svg"), " Start Sniffing")
-        self.stop_sniff_btn = QPushButton(QIcon("icons/square.svg"), " Stop Sniffing"); self.stop_sniff_btn.setEnabled(False)
+        self.start_sniff_btn = QPushButton(QIcon(os.path.join(self.icons_dir, "search.svg")), " Start Sniffing")
+        self.stop_sniff_btn = QPushButton(QIcon(os.path.join(self.icons_dir, "square.svg")), " Stop Sniffing")
+        self.stop_sniff_btn.setEnabled(False)
         self.clear_sniff_btn = QPushButton("Clear")
         export_btn = self.main_window._create_export_button(self.packet_list_widget)
 
@@ -60,10 +88,14 @@ class SnifferTab(QWidget):
         control_layout.addWidget(self.common_filter_combo)
         layout.addWidget(control_panel)
 
-        main_splitter = QSplitter(Qt.Orientation.Vertical)
+        # Main splitter for top (list) and bottom (details)
+        main_splitter = QSplitter(self)
+        main_splitter.setOrientation(QVBoxLayout.Direction.Up)
         main_splitter.addWidget(self.packet_list_widget)
 
-        bottom_splitter = QSplitter(Qt.Orientation.Vertical)
+        # Bottom splitter for details tree and hex view
+        bottom_splitter = QSplitter(main_splitter)
+        bottom_splitter.setOrientation(QVBoxLayout.Direction.Up)
 
         self.packet_details_tree = QTreeWidget()
         self.packet_details_tree.setHeaderLabels(["Field", "Value"])
@@ -78,20 +110,20 @@ class SnifferTab(QWidget):
         bottom_splitter.addWidget(self.packet_hex_view)
 
         bottom_splitter.setSizes([200, 100])
+
         main_splitter.addWidget(bottom_splitter)
         main_splitter.setSizes([400, 300])
         layout.addWidget(main_splitter)
 
+        # --- Connect Signals ---
         self.start_sniff_btn.clicked.connect(self.start_sniffing)
         self.stop_sniff_btn.clicked.connect(self.stop_sniffing)
         self.clear_sniff_btn.clicked.connect(self.clear_sniffer_display)
         self.packet_list_widget.currentItemChanged.connect(self.display_packet_details)
 
-        self.sniffer_ui_update_timer = QTimer(self)
-        self.sniffer_ui_update_timer.timeout.connect(self._update_sniffer_display)
-        self.sniffer_ui_update_timer.start(500)
-
+    # --- Methods moved from GScapy ---
     def start_sniffing(self):
+        """Starts the packet sniffer thread."""
         self.start_sniff_btn.setEnabled(False)
         self.stop_sniff_btn.setEnabled(True)
         self.clear_sniffer_display()
@@ -104,6 +136,7 @@ class SnifferTab(QWidget):
         self.main_window.status_bar.showMessage(f"Sniffing on interface: {iface or 'default'}...")
 
     def _handle_packet_bytes(self, pkt_bytes):
+        """Reconstructs a packet from bytes and adds it to a buffer for batch updating."""
         try:
             packet = Ether(pkt_bytes)
             with self.sniffer_buffer_lock:
@@ -112,18 +145,21 @@ class SnifferTab(QWidget):
             logging.error(f"Failed to reconstruct or buffer packet: {e}")
 
     def stop_sniffing(self):
+        """Signals the packet sniffer thread to stop."""
         if self.sniffer_thread and self.sniffer_thread.isRunning():
             self.stop_sniff_btn.setEnabled(False)
             self.main_window.status_bar.showMessage("Stopping sniffer...")
             self.sniffer_thread.stop()
 
     def _on_sniffer_finished(self):
+        """Handles cleanup after the sniffer thread has terminated."""
         self.start_sniff_btn.setEnabled(True)
         self.stop_sniff_btn.setEnabled(False)
         self.main_window.status_bar.showMessage("Sniffing stopped.")
         self.sniffer_thread = None
 
     def _update_sniffer_display(self):
+        """Periodically called by a timer to batch-update the sniffer GUI."""
         with self.sniffer_buffer_lock:
             if not self.sniffer_packet_buffer:
                 return
@@ -150,21 +186,17 @@ class SnifferTab(QWidget):
         self.packet_list_widget.scrollToBottom()
 
     def display_packet_details(self, current_item, previous_item):
+        """Displays the selected packet's details in the tree and hex views."""
         self.packet_details_tree.clear()
         self.packet_hex_view.clear()
-
         if not current_item:
             return
-
         try:
             packet_index = int(current_item.text(0)) - 1
             if not (0 <= packet_index < len(self.packets_data)):
                 return
-
             packet = self.packets_data[packet_index]
-            hex_dump = hexdump(packet, dump=True)
-            self.packet_hex_view.setText(hex_dump)
-
+            self.packet_hex_view.setText(hexdump(packet, dump=True))
             layer_counts = {}
             current_layer = packet
             while current_layer:
@@ -175,10 +207,8 @@ class SnifferTab(QWidget):
                 else:
                     layer_counts[layer_name_raw] = 1
                     layer_name = layer_name_raw
-
                 layer_item = QTreeWidgetItem([layer_name])
                 self.packet_details_tree.addTopLevelItem(layer_item)
-
                 for field in current_layer.fields_desc:
                     field_name = field.name
                     try:
@@ -187,13 +217,10 @@ class SnifferTab(QWidget):
                     except Exception as e:
                         logging.warning(f"Could not display field '{field_name}': {e}")
                         display_value = "Error reading value"
-
                     field_item = QTreeWidgetItem([field_name, display_value])
                     layer_item.addChild(field_item)
-
                 layer_item.setExpanded(True)
                 current_layer = current_layer.payload
-
             self.packet_details_tree.resizeColumnToContents(0)
         except (ValueError, IndexError):
             self.packet_details_tree.addTopLevelItem(QTreeWidgetItem(["Error displaying packet details."]))
@@ -207,3 +234,32 @@ class SnifferTab(QWidget):
         self.packet_hex_view.clear()
         self.packets_data.clear()
         logging.info("Sniffer display cleared.")
+
+    def save_packets(self):
+        """Saves captured packets to a pcap file."""
+        if not self.packets_data:
+            QMessageBox.information(self, "Info", "There are no packets to save.")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Packets", "", "Pcap Files (*.pcap *.pcapng);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            try:
+                wrpcap(file_path, self.packets_data)
+                self.main_window.status_bar.showMessage(f"Saved {len(self.packets_data)} packets to {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save packets: {e}")
+
+    def load_packets(self):
+        """Loads packets from a pcap file into the sniffer view."""
+        if self.packets_data and QMessageBox.question(self, "Confirm", "Clear captured packets?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.No:
+            return
+        self.clear_sniffer_display()
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Packets", "", "Pcap Files (*.pcap *.pcapng);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if file_path:
+            try:
+                loaded_packets = rdpcap(file_path)
+                # Use the batch update mechanism to add loaded packets
+                with self.sniffer_buffer_lock:
+                    self.sniffer_packet_buffer.extend(loaded_packets)
+                self.main_window.status_bar.showMessage(f"Loaded {len(loaded_packets)} packets from {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load packets: {e}")
