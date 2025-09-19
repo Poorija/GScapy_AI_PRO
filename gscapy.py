@@ -20,6 +20,7 @@ import tempfile
 import webbrowser
 import shutil
 import signal
+import uuid
 
 try:
     from lxml import etree
@@ -82,6 +83,8 @@ from PyQt6.QtWidgets import (
     QHeaderView, QInputDialog, QGraphicsOpacityEffect, QStackedWidget
 )
 from ai_tab import AIAssistantTab, AISettingsDialog, AIGuideDialog
+from login import LoginDialog
+from admin_panel import AdminPanelDialog
 from PyQt6.QtCore import QObject, pyqtSignal, Qt, QThread, QTimer, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup, QPoint, QSize
 from PyQt6.QtGui import QAction, QIcon, QFont, QTextCursor, QActionGroup
 
@@ -1174,10 +1177,11 @@ class GScapy(QMainWindow):
         self.setWindowTitle("GScapy + AI - The Modern Scapy Interface with AI")
         # Construct path to icon relative to the script's location for robustness
         script_dir = os.path.dirname(os.path.realpath(__file__))
-        icon_path = os.path.join(script_dir, "icons", "shield.svg")
+        icon_path = os.path.join(script_dir, "icons", "new_logo.png")
         self.setWindowIcon(QIcon(icon_path))
         self.setGeometry(100, 100, 1200, 800)
 
+        self.current_user = None
         self.packets_data = []; self.sniffer_thread = None; self.channel_hopper = None
         self.packet_layers = []; self.current_field_widgets = []; self.tcp_flag_vars = {}
         self.tool_results_queue = Queue()
@@ -1221,7 +1225,11 @@ class GScapy(QMainWindow):
         self.main_layout = QVBoxLayout(self.central_widget)
 
         self._create_resource_bar()
-        self._create_menu_bar(); self._create_status_bar(); self._create_header_bar()
+        self.menu_bar = QMenuBar(self)
+        self.setMenuBar(self.menu_bar)
+        # The menu bar will be populated after login by calling _update_menu_bar()
+        self._create_status_bar()
+        self._create_header_bar()
 
         # Config widgets are now created inside their respective tool tabs.
 
@@ -1250,18 +1258,35 @@ class GScapy(QMainWindow):
         logging.info("GScapy application initialized.")
 
 
-    def _create_menu_bar(self):
-        """Creates the main menu bar (File, Help)."""
-        self.menu_bar = QMenuBar(self); self.setMenuBar(self.menu_bar)
+    def _update_menu_bar(self):
+        """Creates or updates the main menu bar based on the current user's role."""
+        self.menu_bar.clear()
+
+        # --- File Menu ---
         file_menu = self.menu_bar.addMenu("&File")
         file_menu.addAction("&Save Captured Packets", self.save_packets)
         file_menu.addAction("&Load Packets from File", self.load_packets)
-        file_menu.addSeparator(); file_menu.addAction("&Exit", self.close)
+        file_menu.addSeparator()
+        file_menu.addAction("&Exit", self.close)
+
+        # --- Admin Menu (Conditional) ---
+        # Use .get() for safer dictionary access, in case current_user is None
+        logging.info(f"Updating menu bar for user: {self.current_user}")
+        if self.current_user and self.current_user.get('is_admin'):
+            admin_menu = self.menu_bar.addMenu("&Admin")
+            admin_menu.addAction(QIcon("icons/new_logo.png"), "Admin Panel...", self._show_admin_panel)
+
+        # --- Help Menu ---
         help_menu = self.menu_bar.addMenu("&Help")
         help_menu.addAction("&About GScapy", self._show_about_dialog)
         help_menu.addSeparator()
         help_menu.addAction("&AI Settings...", self._show_ai_settings_dialog)
         help_menu.addAction("AI Guide", self._show_ai_guide_dialog)
+
+    def _show_admin_panel(self):
+        """Shows the admin panel dialog."""
+        admin_dialog = AdminPanelDialog(self)
+        admin_dialog.exec()
 
     def _show_ai_settings_dialog(self):
         """Shows the AI settings dialog."""
@@ -1336,6 +1361,13 @@ class GScapy(QMainWindow):
 
 
     def _show_about_dialog(self):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("About GScapy + AI")
+
+        # Add the logo
+        pixmap = QIcon(os.path.join("icons", "new_logo.png")).pixmap(80, 80)
+        dialog.setIconPixmap(pixmap)
+
         about_text = """
         <b>GScapy + AI v3.0</b>
         <p>The Modern Scapy Interface with AI.</p>
@@ -1344,7 +1376,8 @@ class GScapy(QMainWindow):
         <p><b>Developer:</b><br>Mohammadmahdi Farhadianfard (ao ga nai 😁)<br>
         mohammadmahdi.farhadianfard@gmail.com</p>
         """
-        QMessageBox.about(self, "About GScapy + AI", about_text)
+        dialog.setText(about_text)
+        dialog.exec()
 
     def _create_status_bar(self):
         self.status_bar = QStatusBar(self); self.setStatusBar(self.status_bar); self.status_bar.showMessage("Ready")
@@ -1357,7 +1390,7 @@ class GScapy(QMainWindow):
 
         # Add Logo and Tooltip
         logo_label = QLabel()
-        logo_pixmap = QIcon(os.path.join("icons", "shield.svg")).pixmap(40, 40)
+        logo_pixmap = QIcon(os.path.join("icons", "new_logo.png")).pixmap(40, 40)
         logo_label.setPixmap(logo_pixmap)
         logo_label.setToolTip("GScapy made by Poorija, Email: mohammadmahdi.farhadianfard@gmail.com")
         resource_layout.addWidget(logo_label)
@@ -1474,7 +1507,50 @@ class GScapy(QMainWindow):
     def _handle_theme_change(self, theme_name):
         theme_file = f"{theme_name}.xml"
         invert_secondary = "light" in theme_name
-        apply_stylesheet(QApplication.instance(), theme=theme_file, invert_secondary=invert_secondary)
+
+        # This dictionary must be kept in sync with the one in login.py and main()
+        extra_qss = {
+            'QGroupBox': {
+                'border': '1px solid #444;',
+                'border-radius': '8px',
+                'margin-top': '10px',
+            },
+            'QGroupBox::title': {
+                'subcontrol-origin': 'margin',
+                'subcontrol-position': 'top left',
+                'padding': '0 10px',
+            },
+            'QTabWidget::pane': {
+                'border-top': '1px solid #444;',
+                'margin-top': '-1px',
+            },
+            'QFrame': {
+                'border-radius': '8px',
+            },
+            'QPushButton': {
+                'border-radius': '8px',
+            },
+            'QLineEdit': {
+                'border-radius': '8px',
+            },
+            'QComboBox': {
+                'border-radius': '8px',
+            },
+            'QTextEdit': {
+                'border-radius': '8px',
+            },
+            'QPlainTextEdit': {
+                'border-radius': '8px',
+            },
+            'QListWidget': {
+                'border-radius': '8px',
+            },
+            'QTreeWidget': {
+                'border-radius': '8px',
+            }
+        }
+
+        apply_stylesheet(QApplication.instance(), theme=theme_file, invert_secondary=invert_secondary, extra=extra_qss)
 
         # After applying the stylesheet, notify the AI tab to update its themed icons
         if hasattr(self, 'ai_assistant_tab'):
@@ -1507,8 +1583,325 @@ class GScapy(QMainWindow):
         self.ai_assistant_tab = AIAssistantTab(self)
         self.tab_widget.addTab(self.ai_assistant_tab, QIcon("icons/terminal.svg"), "AI Assistant")
 
+        self.tab_widget.addTab(self._create_threat_intelligence_tab(), QIcon("icons/database.svg"), "Threat Intelligence")
+
         self.tab_widget.addTab(self._create_community_tools_tab(), QIcon("icons/users.svg"), "Community Tools")
         self.tab_widget.addTab(self._create_system_info_tab(), QIcon("icons/info.svg"), "System Info")
+
+    def _create_threat_intelligence_tab(self):
+        """Creates the tab container for the Threat Intelligence tools."""
+        threat_tabs = QTabWidget()
+        threat_tabs.addTab(self._create_cve_search_tab(), "CVE Search")
+        threat_tabs.addTab(self._create_exploit_db_search_tab(), "Exploit-DB Search")
+        return threat_tabs
+
+    def _create_cve_search_tab(self):
+        """Creates the UI for the CVE Search tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # --- Search Controls ---
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(QLabel("Search CVEs:"))
+        self.cve_search_input = QLineEdit()
+        self.cve_search_input.setPlaceholderText("Enter keyword, CPE, or CVE-ID (e.g., 'apache http server 2.4.52', 'CVE-2021-44228')")
+        controls_layout.addWidget(self.cve_search_input)
+        self.cve_search_button = QPushButton("Search")
+        controls_layout.addWidget(self.cve_search_button)
+        layout.addLayout(controls_layout)
+
+        # Add a note about the API key
+        api_note = QLabel("<i>Note: Searches are rate-limited by the NIST NVD API. For faster results, get a free API key and place it in a file named 'nvd_api.key'.</i>")
+        api_note.setWordWrap(True)
+        layout.addWidget(api_note)
+
+        # --- Results Display ---
+        results_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.cve_results_table = QTreeWidget()
+        self.cve_results_table.setColumnCount(4)
+        self.cve_results_table.setHeaderLabels(["CVE ID", "Severity", "CVSS v3.1", "Description"])
+        self.cve_results_table.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.cve_results_table.header().setStretchLastSection(True)
+        results_splitter.addWidget(self.cve_results_table)
+
+        self.cve_details_view = QTextBrowser()
+        self.cve_details_view.setOpenExternalLinks(True)
+        results_splitter.addWidget(self.cve_details_view)
+
+        results_splitter.setSizes([300, 200])
+        layout.addWidget(results_splitter)
+
+        # --- Connections ---
+        self.cve_search_button.clicked.connect(self.start_cve_search)
+        self.cve_results_table.currentItemChanged.connect(self.display_cve_details)
+
+        return widget
+
+    def start_cve_search(self):
+        """Starts the CVE search worker thread."""
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+        query = self.cve_search_input.text()
+        if not query:
+            QMessageBox.critical(self, "Input Error", "Please provide a search query.")
+            return
+
+        self.is_tool_running = True
+        self.cve_search_button.setEnabled(False)
+        self.cve_results_table.clear()
+        self.cve_details_view.clear()
+        self.status_bar.showMessage(f"Searching for CVEs related to '{query}'...")
+
+        # Read API key from file if it exists
+        api_key = None
+        try:
+            with open("nvd_api.key", "r") as f:
+                api_key = f.read().strip()
+                logging.info("Found NVD API key.")
+        except FileNotFoundError:
+            logging.info("NVD API key file ('nvd_api.key') not found. Using public, rate-limited access.")
+
+        self.worker = WorkerThread(self._cve_search_thread, args=(query, api_key))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _cve_search_thread(self, query, api_key):
+        """Worker thread to search for CVEs using nvdlib."""
+        q = self.tool_results_queue
+        try:
+            import nvdlib
+            # nvdlib handles a cveId search automatically if the format matches
+            if re.match(r"CVE-\d{4}-\d{4,7}", query, re.IGNORECASE):
+                results = nvdlib.searchCVE(cveId=query, key=api_key, delay=6 if not api_key else 0)
+            else:
+                results = nvdlib.searchCVE(keywordSearch=query, key=api_key, delay=6 if not api_key else 0)
+
+            if not results:
+                q.put(('cve_search_status', "No CVEs found for your query."))
+            else:
+                q.put(('cve_search_status', f"Found {len(results)} CVEs."))
+
+            for r in results:
+                # Get the English description
+                description = "No description available."
+                for desc in r.descriptions:
+                    if desc.lang == 'en':
+                        description = desc.value
+                        break
+
+                # Get V3.1 score/severity, fall back to V2 if not available
+                severity = "N/A"
+                score = "N/A"
+                if hasattr(r, 'v31severity') and r.v31severity:
+                    severity = r.v31severity
+                    score = r.v31score
+                elif hasattr(r, 'v2severity') and r.v2severity:
+                    severity = r.v2severity
+                    score = r.v2score
+
+                # Send a tuple of the data and the full object
+                q.put(('cve_result', (r.id, severity, score, description[:100] + '...'), r))
+
+        except Exception as e:
+            logging.error(f"nvdlib search failed: {e}", exc_info=True)
+            q.put(('error', 'CVE Search Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'cve_search'))
+
+    def display_cve_details(self, current_item, previous_item):
+        """Displays full details for the selected CVE."""
+        if not current_item:
+            return
+
+        # Retrieve the full CVE object stored in the item's data role
+        cve_obj = current_item.data(0, Qt.ItemDataRole.UserRole)
+        if not cve_obj:
+            return
+
+        # Build an HTML string for display
+        html = f"<h3>{cve_obj.id}</h3>"
+
+        # Description
+        description = "No description available."
+        for desc in cve_obj.descriptions:
+            if desc.lang == 'en':
+                description = desc.value
+                break
+        html += f"<p><b>Description:</b><br>{description}</p>"
+
+        # Metrics
+        if hasattr(cve_obj, 'v31vector'):
+             html += f"<p><b>CVSS v3.1 Vector:</b> {cve_obj.v31vector} (<b>Score: {cve_obj.v31score}</b>)</p>"
+        elif hasattr(cve_obj, 'v2vector'):
+            html += f"<p><b>CVSS v2.0 Vector:</b> {cve_obj.v2vector} (<b>Score: {cve_obj.v2score}</b>)</p>"
+
+        # References
+        if hasattr(cve_obj, 'references') and cve_obj.references:
+            html += "<p><b>References:</b><ul>"
+            for ref in cve_obj.references:
+                html += f'<li><a href="{ref.url}">{ref.url}</a></li>'
+            html += "</ul></p>"
+
+        self.cve_details_view.setHtml(html)
+
+    def _create_exploit_db_search_tab(self):
+        """Creates the UI for the Exploit-DB Search tool."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # --- API Key Input ---
+        api_key_layout = QHBoxLayout()
+        api_key_layout.addWidget(QLabel("Vulners API Key:"))
+        self.exploitdb_api_key_input = QLineEdit()
+        self.exploitdb_api_key_input.setPlaceholderText("Get a free key from vulners.com")
+        self.exploitdb_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        api_key_layout.addWidget(self.exploitdb_api_key_input)
+        save_api_key_btn = QPushButton("Save Key")
+        api_key_layout.addWidget(save_api_key_btn)
+        layout.addLayout(api_key_layout)
+
+        # --- Search Controls ---
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(QLabel("Search Exploits:"))
+        self.exploitdb_search_input = QLineEdit()
+        self.exploitdb_search_input.setPlaceholderText("Enter software name, version, etc. (e.g., 'wordpress 4.7.0')")
+        controls_layout.addWidget(self.exploitdb_search_input)
+        self.exploitdb_search_button = QPushButton("Search")
+        controls_layout.addWidget(self.exploitdb_search_button)
+        layout.addLayout(controls_layout)
+
+        # --- Results Display ---
+        self.exploitdb_results_table = QTreeWidget()
+        self.exploitdb_results_table.setColumnCount(3)
+        self.exploitdb_results_table.setHeaderLabels(["ID", "Title", "URL"])
+        self.exploitdb_results_table.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.exploitdb_results_table.header().setStretchLastSection(True)
+        layout.addWidget(self.exploitdb_results_table)
+
+        # --- Connections ---
+        save_api_key_btn.clicked.connect(self.save_vulners_api_key)
+        self.exploitdb_search_button.clicked.connect(self.start_exploit_search)
+        self.exploitdb_results_table.itemDoubleClicked.connect(self.open_exploit_url)
+
+        # Load saved API key on startup
+        self.load_vulners_api_key()
+
+        return widget
+
+    def save_vulners_api_key(self):
+        """Saves the Vulners API key to a file."""
+        api_key = self.exploitdb_api_key_input.text()
+        if not api_key:
+            QMessageBox.warning(self, "Input Error", "Please enter an API key to save.")
+            return
+        try:
+            with open("vulners_api.key", "w") as f:
+                f.write(api_key)
+            QMessageBox.information(self, "Success", "Vulners API key saved successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not save API key: {e}")
+
+    def load_vulners_api_key(self):
+        """Loads the Vulners API key from a file."""
+        try:
+            with open("vulners_api.key", "r") as f:
+                api_key = f.read().strip()
+                self.exploitdb_api_key_input.setText(api_key)
+                logging.info("Loaded Vulners API key.")
+        except FileNotFoundError:
+            pass # It's okay if the file doesn't exist yet
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"Could not load API key: {e}")
+
+    def start_exploit_search(self):
+        """Starts the Exploit-DB search worker thread."""
+        if not shutil.which("getsploit"):
+            QMessageBox.critical(self, "GetSploit Error", "'getsploit' command not found. Please ensure it is installed and in your system's PATH.")
+            return
+
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        query = self.exploitdb_search_input.text()
+        api_key = self.exploitdb_api_key_input.text()
+
+        if not query:
+            QMessageBox.critical(self, "Input Error", "Please provide a search query.")
+            return
+        if not api_key:
+            QMessageBox.critical(self, "API Key Error", "Vulners API key is required for searching exploits.")
+            return
+
+        self.is_tool_running = True
+        self.exploitdb_search_button.setEnabled(False)
+        self.exploitdb_results_table.clear()
+        self.status_bar.showMessage(f"Searching for exploits related to '{query}'...")
+
+        self.worker = WorkerThread(self._exploit_search_thread, args=(query, api_key))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _exploit_search_thread(self, query, api_key):
+        """Worker thread to search for exploits using getsploit."""
+        q = self.tool_results_queue
+        command = ["getsploit", "--api", api_key, query]
+
+        try:
+            # Use CREATE_NO_WINDOW flag on Windows to hide the console
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, startupinfo=startupinfo, encoding='utf-8', errors='replace')
+
+            output, _ = process.communicate()
+
+            if process.returncode != 0:
+                raise Exception(output)
+
+            # Parse the table-formatted output
+            lines = output.strip().split('\n')
+            # Find the header line to start parsing from
+            header_index = -1
+            for i, line in enumerate(lines):
+                if 'ID' in line and 'Exploit Title' in line and 'URL' in line:
+                    header_index = i
+                    break
+
+            if header_index == -1:
+                q.put(('exploit_search_status', "No results found or could not parse output."))
+                return
+
+            results = []
+            # Start from 2 lines after the header to skip the header and the '======' line
+            for line in lines[header_index + 2:]:
+                if line.startswith('+--'): # End of table
+                    break
+                parts = [p.strip() for p in line.split('|') if p.strip()]
+                if len(parts) >= 3:
+                    results.append(parts)
+
+            q.put(('exploit_search_results', results))
+            q.put(('exploit_search_status', f"Found {len(results)} exploits."))
+
+        except FileNotFoundError:
+            q.put(('error', 'GetSploit Error', "'getsploit' command not found. Please ensure it is installed and in your system's PATH."))
+        except Exception as e:
+            logging.error(f"getsploit search failed: {e}", exc_info=True)
+            q.put(('error', 'Exploit Search Error', str(e)))
+        finally:
+            q.put(('tool_finished', 'exploit_search'))
+
+    def open_exploit_url(self, item, column):
+        """Opens the selected exploit URL in the default web browser."""
+        url = item.text(2) # URL is in the 3rd column
+        if url and url.startswith("http"):
+            webbrowser.open(url)
+        else:
+            QMessageBox.warning(self, "Invalid URL", f"The selected item does not have a valid URL: {url}")
 
     def _create_community_tools_tab(self):
         """Creates the UI for the Scapy Community Tools tab."""
@@ -8549,6 +8942,11 @@ class GScapy(QMainWindow):
         }
         # Handlers for dynamic message types that end with a specific suffix
         self.dynamic_handlers = {
+            'lab_status': self._handle_lab_status,
+            'cve_search_status': self._handle_cve_search_status,
+            'cve_result': self._handle_cve_result,
+            'exploit_search_status': self._handle_exploit_search_status,
+            'exploit_search_results': self._handle_exploit_search_results,
             '_status': self._handle_status_update,
             '_clear': self._handle_clear_update,
             '_result': self._handle_result_update,
@@ -9010,12 +9408,19 @@ class GScapy(QMainWindow):
                    'flooder': self.flood_button, 'fw_tester': self.fw_test_button, 'wifi_scan': self.wifi_scan_button,
                    'deauth': self.deauth_button, 'arp_spoof': self.arp_spoof_start_btn,
                    'beacon_flood': self.bf_start_button, 'ping_sweep': self.ps_start_button, 'nmap_scan': self.nmap_controls['start_btn'],
-                   'sublist3r_scan': self.subdomain_controls['start_btn'], 'subfinder_scan': self.subfinder_controls['start_btn'], 'httpx_scan': self.httpx_controls['start_btn'], 'trufflehog_scan': self.trufflehog_controls['start_btn'], 'rustscan_scan': self.rustscan_controls['start_btn'], 'dirsearch_scan': self.dirsearch_controls['start_btn'], 'ffuf_scan': self.ffuf_controls['start_btn'], 'jtr_scan': self.jtr_controls['start_btn'], 'hydra_scan': self.hydra_controls['start_btn'], 'enum4linux_ng_scan': self.enum4linux_ng_controls['start_btn'], 'dnsrecon_scan': self.dnsrecon_controls['start_btn'], 'fierce_scan': self.fierce_controls['start_btn'], 'sherlock_scan': self.sherlock_controls['start_btn'], 'spiderfoot_scan': self.spiderfoot_controls['start_btn'], 'arp_scan_cli_scan': self.arp_scan_cli_controls['start_btn'], 'wifite_scan': self.wifite_start_btn, 'nikto_scan': self.nikto_controls['start_btn'], 'gobuster_scan': self.gobuster_controls['start_btn'], 'sqlmap_scan': self.sqlmap_start_btn, 'whatweb_scan': self.whatweb_start_btn, 'hashcat_scan': self.hashcat_start_btn, 'masscan_scan': self.masscan_start_btn, 'nuclei_scan': self.nuclei_controls['start_btn']}
+                          'sublist3r_scan': self.subdomain_controls['start_btn'], 'subfinder_scan': self.subfinder_controls['start_btn'], 'httpx_scan': self.httpx_controls['start_btn'], 'trufflehog_scan': self.trufflehog_controls['start_btn'], 'rustscan_scan': self.rustscan_controls['start_btn'], 'dirsearch_scan': self.dirsearch_controls['start_btn'], 'ffuf_scan': self.ffuf_controls['start_btn'], 'jtr_scan': self.jtr_controls['start_btn'], 'hydra_scan': self.hydra_controls['start_btn'], 'enum4linux_ng_scan': self.enum4linux_ng_controls['start_btn'], 'dnsrecon_scan': self.dnsrecon_controls['start_btn'], 'fierce_scan': self.fierce_controls['start_btn'], 'sherlock_scan': self.sherlock_controls['start_btn'], 'spiderfoot_scan': self.spiderfoot_controls['start_btn'], 'arp_scan_cli_scan': self.arp_scan_cli_controls['start_btn'], 'wifite_scan': self.wifite_start_btn, 'nikto_scan': self.nikto_controls['start_btn'], 'gobuster_scan': self.gobuster_controls['start_btn'], 'sqlmap_scan': self.sqlmap_start_btn, 'whatweb_scan': self.whatweb_start_btn, 'hashcat_scan': self.hashcat_start_btn, 'masscan_scan': self.masscan_start_btn, 'nuclei_scan': self.nuclei_controls['start_btn'],
+                           'cve_search': self.cve_search_button,
+                           'exploit_search': self.exploitdb_search_button}
         cancel_buttons = {'scanner': self.scan_cancel_button, 'flooder': self.stop_flood_button,
                           'arp_spoof': self.arp_spoof_stop_btn, 'beacon_flood': self.bf_stop_button,
                           'ping_sweep': self.ps_cancel_button, 'fw_tester': self.fw_cancel_button,
                           'traceroute': self.trace_cancel_button, 'wifi_scan': self.wifi_scan_stop_button, 'nmap_scan': self.nmap_controls['cancel_btn'],
                           'sublist3r_scan': self.subdomain_controls['cancel_btn'], 'subfinder_scan': self.subfinder_controls['cancel_btn'], 'httpx_scan': self.httpx_controls['cancel_btn'], 'trufflehog_scan': self.trufflehog_controls['stop_btn'], 'rustscan_scan': self.rustscan_controls['cancel_btn'], 'dirsearch_scan': self.dirsearch_controls['stop_btn'], 'ffuf_scan': self.ffuf_controls['stop_btn'], 'jtr_scan': self.jtr_controls['stop_btn'], 'hydra_scan': self.hydra_controls['stop_btn'], 'enum4linux_ng_scan': self.enum4linux_ng_controls['stop_btn'], 'dnsrecon_scan': self.dnsrecon_controls['stop_btn'], 'fierce_scan': self.fierce_controls['stop_btn'], 'sherlock_scan': self.sherlock_controls['stop_btn'], 'spiderfoot_scan': self.spiderfoot_controls['stop_btn'], 'arp_scan_cli_scan': self.arp_scan_cli_controls['stop_btn'], 'wifite_scan': self.wifite_stop_btn, 'nikto_scan': self.nikto_controls['stop_btn'], 'gobuster_scan': self.gobuster_controls['stop_btn'], 'sqlmap_scan': self.sqlmap_stop_btn, 'whatweb_scan': self.whatweb_stop_btn, 'hashcat_scan': self.hashcat_stop_btn, 'masscan_scan': self.masscan_stop_btn, 'nuclei_scan': self.nuclei_controls['stop_btn']}
+
+        if tool == 'lab_chain':
+            self.lab_run_chain_btn.setEnabled(True)
+            self.status_bar.showMessage("LAB chain finished.", 5000)
+            return
 
         if tool == 'jtr_scan':
             self.jtr_controls['start_btn'].setEnabled(True)
@@ -9038,6 +9443,28 @@ class GScapy(QMainWindow):
             status_labels = {'scanner': self.scan_status, 'traceroute': self.trace_status}
             if tool in status_labels:
                 status_labels[tool].setText("Canceled by user.")
+
+    def _handle_cve_search_status(self, status_text):
+        self.status_bar.showMessage(status_text, 5000)
+
+    def _handle_cve_result(self, result_data, cve_object):
+        """Adds a CVE result to the table and stores the full object."""
+        item = QTreeWidgetItem(result_data)
+        item.setData(0, Qt.ItemDataRole.UserRole, cve_object) # Store the full object
+        self.cve_results_table.addTopLevelItem(item)
+
+    def _handle_exploit_search_status(self, status_text):
+        self.status_bar.showMessage(status_text, 5000)
+
+    def _handle_exploit_search_results(self, results):
+        """Adds exploit search results to the table."""
+        self.exploitdb_results_table.clear()
+        for result in results:
+            item = QTreeWidgetItem(result)
+            self.exploitdb_results_table.addTopLevelItem(item)
+
+    def _handle_lab_status(self, status_text):
+        self.status_bar.showMessage(status_text, 0) # 0 means it stays until changed
 
     def _handle_error(self, title, text):
         QMessageBox.critical(self, title, text)
@@ -9231,8 +9658,13 @@ class GScapy(QMainWindow):
         summary_box = QGroupBox("Executive Summary")
         summary_layout = QVBoxLayout(summary_box)
         self.report_summary_text = QTextEdit()
-        self.report_summary_text.setPlaceholderText("Write a high-level summary of the assessment's findings and recommendations for a non-technical audience...")
+        self.report_summary_text.setPlaceholderText("Write a high-level summary of the assessment's findings and recommendations for a non-technical audience, or generate one with AI.")
+
+        ai_summary_btn = QPushButton(QIcon("icons/terminal.svg"), " Generate Summary with AI")
+        ai_summary_btn.clicked.connect(self._handle_ai_summary_generation)
+
         summary_layout.addWidget(self.report_summary_text)
+        summary_layout.addWidget(ai_summary_btn)
         left_layout.addWidget(summary_box)
 
         left_panel.setLayout(left_layout)
@@ -9289,6 +9721,37 @@ class GScapy(QMainWindow):
 
         return widget
 
+    def _handle_ai_summary_generation(self):
+        """Gathers findings, sends them to the AI, and sets a callback to populate the summary."""
+        if self.report_findings_tree.topLevelItemCount() == 0:
+            QMessageBox.warning(self, "No Data", "There are no findings to summarize. Please run the 'Aggregate & Enrich Results' tool first.")
+            return
+
+        findings_text = ""
+        for i in range(self.report_findings_tree.topLevelItemCount()):
+            item = self.report_findings_tree.topLevelItem(i)
+            host = item.text(0)
+            service = item.text(1)
+            finding = item.text(2)
+            details = item.text(3)
+            findings_text += f"- Host: {host}, Service: {service}, Finding: {finding}\n  Details: {details}\n\n"
+
+        prompt = (
+            "Based on the following list of penetration testing findings, please write a concise executive summary "
+            "suitable for a non-technical audience. Focus on the overall risk posture, key areas of weakness, "
+            "and high-level recommendations. The summary should be a few paragraphs long.\n\n"
+            f"--- FINDINGS ---\n{findings_text}--- END FINDINGS ---"
+        )
+
+        def _populate_summary(generated_text):
+            self.report_summary_text.setPlainText(generated_text)
+            QMessageBox.information(self, "Success", "AI-generated summary has been populated.")
+
+        self.ai_assistant_tab.set_completion_callback(_populate_summary)
+        self.ai_assistant_tab.send_message(prompt)
+        self.tab_widget.setCurrentWidget(self.ai_assistant_tab)
+        QMessageBox.information(self, "AI Task Started", "The AI is generating the summary. You will be notified upon completion. You can watch the progress in the 'AI Assistant' tab.")
+
     def _create_lab_tab(self):
         """Creates the UI for the LAB / Test Chaining tab."""
         widget = QWidget()
@@ -9299,6 +9762,9 @@ class GScapy(QMainWindow):
         self.lab_run_chain_btn = QPushButton(QIcon("icons/play-circle.svg"), " Run Test Chain")
         self.lab_save_chain_btn = QPushButton(QIcon("icons/save.svg"), " Save Chain")
         self.lab_load_chain_btn = QPushButton(QIcon("icons/folder.svg"), " Load Chain")
+        self.lab_run_chain_btn.clicked.connect(self.start_lab_chain)
+        self.lab_save_chain_btn.clicked.connect(self._lab_save_chain)
+        self.lab_load_chain_btn.clicked.connect(self._lab_load_chain)
         controls_bar.addWidget(self.lab_run_chain_btn)
         controls_bar.addWidget(self.lab_save_chain_btn)
         controls_bar.addWidget(self.lab_load_chain_btn)
@@ -9379,6 +9845,44 @@ class GScapy(QMainWindow):
 
         return widget
 
+    def _get_config_from_ui(self, tool_name):
+        """Reads the current values from a tool's config UI and returns a dict."""
+        config = {}
+        if tool_name not in self.lab_tool_configs:
+            return config
+
+        controls = self.lab_tool_configs[tool_name]['controls']
+
+        if tool_name == "Nmap Scan":
+            for key, widget in controls.items():
+                if isinstance(widget, QLineEdit):
+                    config[key] = widget.text()
+                elif isinstance(widget, QCheckBox):
+                    config[key] = widget.isChecked()
+                elif isinstance(widget, QComboBox):
+                    config[key] = widget.currentText()
+        # Add other tools here as they are implemented
+
+        return config
+
+    def _set_config_to_ui(self, tool_name, config):
+        """Populates a tool's config UI from a config dict."""
+        if tool_name not in self.lab_tool_configs:
+            return
+
+        controls = self.lab_tool_configs[tool_name]['controls']
+
+        if tool_name == "Nmap Scan":
+            for key, widget in controls.items():
+                if key in config:
+                    if isinstance(widget, QLineEdit):
+                        widget.setText(config[key])
+                    elif isinstance(widget, QCheckBox):
+                        widget.setChecked(config[key])
+                    elif isinstance(widget, QComboBox):
+                        widget.setCurrentText(config[key])
+        # Add other tools here as they are implemented
+
     def _lab_add_step(self):
         """Adds a selected tool from the available list to the test chain."""
         selected_item = self.lab_tools_list.currentItem()
@@ -9387,9 +9891,23 @@ class GScapy(QMainWindow):
             return
 
         tool_name = selected_item.text()
-        # For now, just add the name. Later, this will involve creating a config object.
-        self.lab_chain_list.addItem(f"Step {self.lab_chain_list.count() + 1}: {tool_name}")
-        # self.lab_test_chain.append({'tool_name': tool_name, 'config': {}}) # This will be used later
+
+        # Get the default configuration from the current state of the tool's UI
+        default_config = self._get_config_from_ui(tool_name)
+
+        step_data = {
+            'tool_name': tool_name,
+            'id': str(uuid.uuid4()),
+            'config': default_config
+        }
+        self.lab_test_chain.append(step_data)
+
+        # The list widget item stores the unique ID to link it back to the config
+        list_item = QListWidgetItem(f"Step {len(self.lab_test_chain)}: {tool_name}")
+        list_item.setData(Qt.ItemDataRole.UserRole, step_data['id'])
+        self.lab_chain_list.addItem(list_item)
+        self.lab_chain_list.setCurrentItem(list_item)
+
 
     def _lab_remove_step(self):
         """Removes the selected step from the test chain."""
@@ -9398,8 +9916,18 @@ class GScapy(QMainWindow):
             QMessageBox.warning(self, "No Step Selected", "Please select a step from the chain to remove.")
             return
 
-        self.lab_chain_list.takeItem(selected_row)
-        # del self.lab_test_chain[selected_row] # This will be used later
+        # Remove from UI
+        item = self.lab_chain_list.takeItem(selected_row)
+        item_id = item.data(Qt.ItemDataRole.UserRole)
+
+        # Remove from backend data model
+        self.lab_test_chain = [step for step in self.lab_test_chain if step['id'] != item_id]
+
+        # Renumber the remaining steps in the UI for clarity
+        for i in range(self.lab_chain_list.count()):
+            list_item = self.lab_chain_list.item(i)
+            tool_name = list_item.text().split(": ")[1]
+            list_item.setText(f"Step {i + 1}: {tool_name}")
 
     def _lab_move_step_up(self):
         """Moves the selected step up in the test chain."""
@@ -9409,7 +9937,8 @@ class GScapy(QMainWindow):
             self.lab_chain_list.insertItem(current_row - 1, item)
             self.lab_chain_list.setCurrentRow(current_row - 1)
             # Reorder the backend list as well
-            # self.lab_test_chain.insert(current_row - 1, self.lab_test_chain.pop(current_row))
+            self.lab_test_chain.insert(current_row - 1, self.lab_test_chain.pop(current_row))
+            self._renumber_lab_steps()
 
     def _lab_move_step_down(self):
         """Moves the selected step down in the test chain."""
@@ -9419,36 +9948,179 @@ class GScapy(QMainWindow):
             self.lab_chain_list.insertItem(current_row + 1, item)
             self.lab_chain_list.setCurrentRow(current_row + 1)
             # Reorder the backend list as well
-            # self.lab_test_chain.insert(current_row + 1, self.lab_test_chain.pop(current_row))
+            self.lab_test_chain.insert(current_row + 1, self.lab_test_chain.pop(current_row))
+            self._renumber_lab_steps()
+
+    def _renumber_lab_steps(self):
+        """Updates the text of the items in the lab chain list to reflect their new order."""
+        for i in range(self.lab_chain_list.count()):
+            item = self.lab_chain_list.item(i)
+            # The tool name doesn't change, just the step number
+            tool_name = self.lab_test_chain[i]['tool_name']
+            item.setText(f"Step {i + 1}: {tool_name}")
 
     def _lab_on_chain_selection_changed(self, current, previous):
         """Shows the correct configuration widget when a step in the chain is selected."""
+        # 1. Save the configuration of the previously selected item
+        if previous:
+            prev_id = previous.data(Qt.ItemDataRole.UserRole)
+            # Find the corresponding step in the backend list
+            for step in self.lab_test_chain:
+                if step['id'] == prev_id:
+                    tool_name = step['tool_name']
+                    # Get the current UI state and save it to the step's config
+                    step['config'] = self._get_config_from_ui(tool_name)
+                    logging.info(f"Saved config for step {step['tool_name']} (ID: {prev_id})")
+                    break
+
+        # 2. Load the configuration of the currently selected item
         if not current:
             self.lab_config_stack.setCurrentIndex(0) # Show placeholder
             return
 
-        # Extract tool name, e.g., from "Step 1: Nmap Scan"
-        item_text = current.text()
-        tool_name = item_text.split(": ")[1]
+        current_id = current.data(Qt.ItemDataRole.UserRole)
+        # Find the corresponding step in the backend list
+        for step in self.lab_test_chain:
+            if step['id'] == current_id:
+                tool_name = step['tool_name']
+                config = step['config']
 
-        # Use the dedicated lab widgets
-        if tool_name in self.lab_tool_configs:
-            # The dictionary now holds another dictionary: {'widget': ..., 'controls': ...}
-            widget_to_show = self.lab_tool_configs[tool_name]['widget']
-            self.lab_config_stack.setCurrentWidget(widget_to_show)
-        else:
-            self.lab_config_stack.setCurrentIndex(0) # Fallback to placeholder
+                # Use the dedicated lab widgets
+                if tool_name in self.lab_tool_configs:
+                    # Populate the UI with the stored config
+                    self._set_config_to_ui(tool_name, config)
 
+                    # Show the correct widget from the stack
+                    widget_to_show = self.lab_tool_configs[tool_name]['widget']
+                    self.lab_config_stack.setCurrentWidget(widget_to_show)
+                    logging.info(f"Loaded config for step {tool_name} (ID: {current_id})")
+                else:
+                    self.lab_config_stack.setCurrentIndex(0) # Fallback to placeholder
+                return
+
+    def _lab_save_chain(self):
+        """Saves the current test chain to a JSON file."""
+        if not self.lab_test_chain:
+            QMessageBox.information(self, "Empty Chain", "There is nothing to save.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Test Chain", "", "GScapy LAB Files (*.gscapy-lab)", options=QFileDialog.Option.DontUseNativeDialog)
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w') as f:
+                json.dump(self.lab_test_chain, f, indent=4)
+            self.status_bar.showMessage(f"Test chain saved to {file_path}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save test chain: {e}")
+            logging.error(f"Failed to save LAB chain: {e}", exc_info=True)
+
+    def _lab_load_chain(self):
+        """Loads a test chain from a JSON file."""
+        if self.lab_test_chain:
+            reply = QMessageBox.question(self, "Confirm Load", "This will overwrite your current test chain. Are you sure?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                return
+
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Test Chain", "", "GScapy LAB Files (*.gscapy-lab);;All Files (*)", options=QFileDialog.Option.DontUseNativeDialog)
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r') as f:
+                loaded_chain = json.load(f)
+
+            # Basic validation
+            if not isinstance(loaded_chain, list) or not all('tool_name' in d and 'config' in d for d in loaded_chain):
+                raise ValueError("Invalid file format.")
+
+            self.lab_test_chain = loaded_chain
+            self.lab_chain_list.clear()
+
+            # Repopulate the UI list
+            for i, step in enumerate(self.lab_test_chain):
+                # Ensure each step has a unique ID if loading older formats
+                if 'id' not in step:
+                    step['id'] = str(uuid.uuid4())
+
+                list_item = QListWidgetItem(f"Step {i + 1}: {step['tool_name']}")
+                list_item.setData(Qt.ItemDataRole.UserRole, step['id'])
+                self.lab_chain_list.addItem(list_item)
+
+            self.status_bar.showMessage(f"Test chain loaded from {file_path}", 5000)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load test chain: {e}")
+            logging.error(f"Failed to load LAB chain: {e}", exc_info=True)
+
+    def start_lab_chain(self):
+        """Starts the LAB chain execution worker thread."""
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+        if not self.lab_test_chain:
+            QMessageBox.information(self, "Empty Chain", "There are no steps in the test chain to run.")
+            return
+
+        self.is_tool_running = True
+        self.lab_run_chain_btn.setEnabled(False)
+        # In the future, a cancel button will be added
+        # self.lab_cancel_chain_btn.setEnabled(True)
+        self.tool_stop_event.clear()
+
+        # Deepcopy the chain to avoid race conditions if the user edits it while running
+        chain_to_run = copy.deepcopy(self.lab_test_chain)
+
+        self.worker = WorkerThread(self._lab_chain_thread, args=(chain_to_run,))
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _lab_chain_thread(self, chain):
+        """Worker thread that executes each step of the LAB chain."""
+        q = self.tool_results_queue
+        logging.info(f"LAB chain execution started with {len(chain)} steps.")
+        lab_context = {} # This dictionary will hold results passed between steps
+
+        for i, step in enumerate(chain):
+            if self.tool_stop_event.is_set():
+                logging.info("LAB chain execution cancelled by user.")
+                break
+
+            tool_name = step['tool_name']
+            config = step['config']
+            q.put(('lab_status', f"Executing Step {i+1}/{len(chain)}: {tool_name}"))
+
+            # This is where the magic happens.
+            # For now, just log the config.
+            logging.info(f"--- Running LAB Step {i+1}: {tool_name} ---")
+            logging.info(f"Config: {json.dumps(config, indent=2)}")
+
+            # Placeholder for actual execution
+            time.sleep(2) # Simulate work
+
+
+        q.put(('tool_finished', 'lab_chain'))
+        logging.info("LAB chain execution finished.")
+
+
+import database
 
 def main():
     """Main function to launch the GScapy application."""
     try:
+        database.initialize_database()
         if 'scapy' not in sys.modules: raise ImportError
+
         app = QApplication(sys.argv)
+
+        login_dialog = LoginDialog()
+
+        # Define the custom stylesheet additions
         extra_qss = {
             'QGroupBox': {
                 'border': '1px solid #444;',
-                'border-radius': '15px',
+                'border-radius': '8px',
                 'margin-top': '10px',
             },
             'QGroupBox::title': {
@@ -9461,21 +10133,58 @@ def main():
                 'margin-top': '-1px',
             },
             'QFrame': {
-                'border-radius': '15px',
+                'border-radius': '8px',
             },
             'QPushButton': {
-                'border-radius': '15px',
+                'border-radius': '8px',
+            },
+            'QLineEdit': {
+                'border-radius': '8px',
+            },
+            'QComboBox': {
+                'border-radius': '8px',
+            },
+            'QTextEdit': {
+                'border-radius': '8px',
+            },
+            'QPlainTextEdit': {
+                'border-radius': '8px',
+            },
+            'QListWidget': {
+                'border-radius': '8px',
+            },
+            'QTreeWidget': {
+                'border-radius': '8px',
             }
         }
-        apply_stylesheet(app, theme='dark_blue.xml', extra=extra_qss)
+
+        # Apply the default theme before showing the login dialog
+        apply_stylesheet(app, theme=login_dialog.selected_theme, extra=extra_qss)
+
+        if login_dialog.exec() != QDialog.DialogCode.Accepted:
+            sys.exit(0)
+
+        # Re-apply the theme in case the user changed it in the dialog.
+        # This ensures the main window gets the final selected theme.
+        apply_stylesheet(app, theme=login_dialog.selected_theme, extra=extra_qss)
+
         window = GScapy()
+        window.current_user = login_dialog.current_user
+        # Set window title with username
+        if window.current_user and 'username' in window.current_user:
+            window.setWindowTitle(f"Welcome, {window.current_user['username']} - GScapy + AI - The Modern Scapy Interface with AI")
+        window._update_menu_bar() # Populate the menu now that we have a user
         window.show()
         sys.exit(app.exec())
+
     except ImportError:
-        app = QApplication(sys.argv); QMessageBox.critical(None, "Fatal Error", "Scapy is not installed."); sys.exit(1)
+        app = QApplication(sys.argv)
+        QMessageBox.critical(None, "Fatal Error", "Scapy is not installed.")
+        sys.exit(1)
     except Exception as e:
         logging.critical(f"An unhandled exception occurred: {e}", exc_info=True)
-        app = QApplication(sys.argv); QMessageBox.critical(None, "Unhandled Exception", f"An unexpected error occurred:\n\n{e}")
+        app = QApplication(sys.argv)
+        QMessageBox.critical(None, "Unhandled Exception", f"An unexpected error occurred:\n\n{e}")
         sys.exit(1)
 
 if __name__ == "__main__":
