@@ -21,7 +21,6 @@ import webbrowser
 import shutil
 import signal
 import uuid
-import gzip
 
 try:
     from lxml import etree
@@ -86,7 +85,6 @@ from PyQt6.QtWidgets import (
 from ai_tab import AIAssistantTab, AISettingsDialog, AIGuideDialog
 from login import LoginDialog
 from admin_panel import AdminPanelDialog
-from user_profile import UserProfileDialog
 from PyQt6.QtCore import QObject, pyqtSignal, Qt, QThread, QTimer, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup, QPoint, QSize
 from PyQt6.QtGui import QAction, QIcon, QFont, QTextCursor, QActionGroup
 
@@ -192,7 +190,7 @@ class AircrackThread(QThread):
             return_code = self.process.wait()
             self.finished_signal.emit(return_code)
         except FileNotFoundError:
-            self.output_received.emit("ERROR: 'aircrack-ng' command not found. Please ensure it is installed and in your system's PATH.\n\nDownload from: https://www.aircrack-ng.org/")
+            self.output_received.emit("ERROR: 'aircrack-ng' command not found. Please ensure it is installed and in your system's PATH.")
             self.finished_signal.emit(-1)
         except Exception as e:
             self.output_received.emit(f"An unexpected error occurred: {e}")
@@ -1208,9 +1206,6 @@ class GScapy(QMainWindow):
         self.sniffer_buffer_lock = Lock()
         self.super_scan_active = False
         self.lab_test_chain = []
-        self.recent_threats_data = []
-        self.recent_threats_current_page = 1
-        self.recent_threats_per_page = 10
         # self.tool_config_widgets is no longer used.
 
         self.nmap_script_presets = {
@@ -1302,23 +1297,6 @@ class GScapy(QMainWindow):
         """Shows the AI features user guide."""
         dialog = AIGuideDialog(self)
         dialog.exec()
-
-    def _show_user_profile(self):
-        """Shows the user profile dialog."""
-        if not self.current_user:
-            QMessageBox.warning(self, "Error", "No user is currently logged in.")
-            return
-        profile_dialog = UserProfileDialog(user_id=self.current_user['id'], parent=self)
-        profile_dialog.exec()
-
-    def _handle_logout(self):
-        """Logs the user out by closing the application."""
-        reply = QMessageBox.question(self, 'Logout',
-                                     "Are you sure you want to logout? This will close the application.",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                     QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.close()
 
     def get_ai_settings(self):
         """
@@ -1461,22 +1439,6 @@ class GScapy(QMainWindow):
         self.refresh_combo = QComboBox()
         self.refresh_combo.addItems(["1s", "2s", "5s", "Off"])
         resource_layout.addWidget(self.refresh_combo)
-
-        separator2 = QFrame()
-        separator2.setFrameShape(QFrame.Shape.VLine)
-        separator2.setFrameShadow(QFrame.Shadow.Sunken)
-        resource_layout.addWidget(separator2)
-
-        self.user_profile_button = QPushButton(QIcon("icons/users.svg"), "")
-        self.user_profile_button.setToolTip("User Profile and Settings")
-        self.user_profile_button.setFlat(True)
-        resource_layout.addWidget(self.user_profile_button)
-
-        self.user_menu = QMenu(self)
-        self.user_menu.addAction("Profile...", self._show_user_profile)
-        self.user_menu.addSeparator()
-        self.user_menu.addAction("Logout", self._handle_logout)
-        self.user_profile_button.setMenu(self.user_menu)
 
         self.main_layout.addWidget(resource_frame)
         self.refresh_combo.textActivated.connect(self._handle_refresh_interval_change)
@@ -1622,265 +1584,84 @@ class GScapy(QMainWindow):
         self.tab_widget.addTab(self.ai_assistant_tab, QIcon("icons/terminal.svg"), "AI Assistant")
 
         self.tab_widget.addTab(self._create_threat_intelligence_tab(), QIcon("icons/database.svg"), "Threat Intelligence")
+        self.tab_widget.addTab(self._create_history_tab(), QIcon("icons/layers.svg"), "History")
 
         self.tab_widget.addTab(self._create_community_tools_tab(), QIcon("icons/users.svg"), "Community Tools")
         self.tab_widget.addTab(self._create_system_info_tab(), QIcon("icons/info.svg"), "System Info")
 
-    def _create_threat_intelligence_tab(self):
-        """Creates the tab container for the Threat Intelligence tools."""
-        threat_tabs = QTabWidget()
-        threat_tabs.addTab(self._create_recent_threats_tab(), "Recent Threats")
-        threat_tabs.addTab(self._create_cve_search_tab(), "CVE Search")
-        threat_tabs.addTab(self._create_exploit_db_search_tab(), "Exploit-DB Search")
-        threat_tabs.addTab(self._create_offline_db_settings_tab(), "Offline DB Settings")
-        return threat_tabs
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
-    def _create_offline_db_settings_tab(self):
-        """Creates the UI for managing the offline CVE database."""
+    def _on_tab_changed(self, index):
+        """Handle actions when a tab is selected."""
+        # Check if the selected tab is the History tab
+        if self.tab_widget.tabText(index) == "History":
+            self._populate_history_tab()
+
+    def _create_history_tab(self):
+        """Creates the UI for the user's activity history tab."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        instructions = QLabel("Here you can download the NVD data feeds for offline CVE lookups in the Reporting tab. This may take a long time and consume significant disk space (several GB).")
-        instructions.setWordWrap(True)
-        layout.addWidget(instructions)
-
-        self.download_offline_db_btn = QPushButton(QIcon("icons/download-cloud.svg"), " Download/Update Offline Database")
-        self.download_offline_db_btn.clicked.connect(self._start_offline_db_download)
-        layout.addWidget(self.download_offline_db_btn)
-
-        self.offline_db_status_label = QLabel("Status: Not downloaded.")
-        layout.addWidget(self.offline_db_status_label)
-
-        layout.addStretch()
-        return widget
-
-    def _start_offline_db_download(self):
-        """Starts the worker thread to download the offline CVE database."""
-        if self.is_tool_running:
-            QMessageBox.warning(self, "Busy", "Another tool is already running. Please wait for it to finish.")
-            return
-
-        reply = QMessageBox.question(self, "Confirm Download",
-                                     "This will download several large files from the National Vulnerability Database, which may take a long time and consume several gigabytes of disk space. Continue?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.No:
-            return
-
-        self.is_tool_running = True
-        self.download_offline_db_btn.setEnabled(False)
-        self.offline_db_status_label.setText("Status: Starting download...")
-
-        self.worker = WorkerThread(self._offline_db_download_thread)
-        self.active_threads.append(self.worker)
-        self.worker.start()
-
-    def _offline_db_download_thread(self):
-        """Worker thread to download and process NVD data feeds."""
-        q = self.tool_results_queue
-        db_dir = "cve_db"
-        base_url = "https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-{}.json.gz"
-        # Download from 2017 to the current year
-        current_year = int(time.strftime("%Y"))
-        years_to_download = range(2017, current_year + 1)
-
-        try:
-            os.makedirs(db_dir, exist_ok=True)
-
-            for i, year in enumerate(years_to_download):
-                if self.tool_stop_event.is_set():
-                    q.put(('offline_db_status', "Download canceled by user."))
-                    break
-
-                url = base_url.format(year)
-                gz_path = os.path.join(db_dir, f"nvdcve-{year}.json.gz")
-                json_path = os.path.join(db_dir, f"nvdcve-{year}.json")
-
-                q.put(('offline_db_status', f"Downloading {year} feed ({i+1}/{len(years_to_download)})..."))
-
-                # Download the file
-                urllib.request.urlretrieve(url, gz_path)
-
-                q.put(('offline_db_status', f"Decompressing {year} feed..."))
-
-                # Decompress the file
-                with gzip.open(gz_path, 'rb') as f_in:
-                    with open(json_path, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-
-                # Clean up the compressed file
-                os.remove(gz_path)
-
-            if not self.tool_stop_event.is_set():
-                 q.put(('offline_db_status', "Offline database download complete."))
-
-        except Exception as e:
-            logging.error(f"Offline DB download failed: {e}", exc_info=True)
-            q.put(('error', 'Offline DB Error', str(e)))
-            q.put(('offline_db_status', f"Error: {e}"))
-        finally:
-            q.put(('tool_finished', 'offline_db_download'))
-
-    def _create_recent_threats_tab(self):
-        """Creates the UI for the Recent Threats tab, which fetches and displays the latest CVEs."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-
-        # --- Top Controls ---
         controls_layout = QHBoxLayout()
-        refresh_btn = QPushButton(QIcon("icons/refresh-cw.svg"), " Refresh")
-        refresh_btn.clicked.connect(self._fetch_recent_threats)
+        refresh_btn = QPushButton(QIcon("icons/refresh-cw.svg"), " Refresh History")
+        refresh_btn.clicked.connect(self._populate_history_tab)
         controls_layout.addWidget(refresh_btn)
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
 
-        # --- Results Display ---
-        results_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.recent_threats_table = QTreeWidget()
-        self.recent_threats_table.setColumnCount(4)
-        self.recent_threats_table.setHeaderLabels(["CVE ID", "Published", "CVSS", "Summary"])
-        self.recent_threats_table.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.recent_threats_table.header().setStretchLastSection(True)
-        self.recent_threats_table.setSortingEnabled(True)
-        results_splitter.addWidget(self.recent_threats_table)
-
-        self.recent_threats_details_view = QTextBrowser()
-        self.recent_threats_details_view.setOpenExternalLinks(True)
-        results_splitter.addWidget(self.recent_threats_details_view)
-
-        results_splitter.setSizes([300, 200])
-        layout.addWidget(results_splitter)
-
-        # --- Pagination Controls ---
-        pagination_layout = QHBoxLayout()
-        self.threats_prev_btn = QPushButton("<< Previous")
-        self.threats_prev_btn.clicked.connect(lambda: self._change_threats_page(-1))
-        pagination_layout.addWidget(self.threats_prev_btn)
-
-        self.threats_page_label = QLabel("Page 1 / 1")
-        pagination_layout.addWidget(self.threats_page_label)
-
-        self.threats_next_btn = QPushButton("Next >>")
-        self.threats_next_btn.clicked.connect(lambda: self._change_threats_page(1))
-        pagination_layout.addWidget(self.threats_next_btn)
-
-        pagination_layout.addStretch()
-        pagination_layout.addWidget(QLabel("Items per page:"))
-        self.threats_per_page_combo = QComboBox()
-        self.threats_per_page_combo.addItems(["10", "20", "30", "40"])
-        self.threats_per_page_combo.currentTextChanged.connect(self._change_threats_per_page)
-        pagination_layout.addWidget(self.threats_per_page_combo)
-        layout.addLayout(pagination_layout)
-
-        # --- Connections & Initial Load ---
-        self.recent_threats_table.currentItemChanged.connect(self._display_recent_threat_details)
-        self._fetch_recent_threats() # Load data when the tab is created
+        self.history_tree = QTreeWidget()
+        self.history_tree.setColumnCount(3)
+        self.history_tree.setHeaderLabels(["Date/Time", "Action", "Summary"])
+        self.history_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.history_tree.header().setStretchLastSection(True)
+        self.history_tree.header().resizeSection(0, 180) # Timestamp
+        self.history_tree.header().resizeSection(1, 200) # Action
+        layout.addWidget(self.history_tree)
 
         return widget
 
-    def _fetch_recent_threats(self):
-        """Starts the worker thread to fetch the latest CVEs from the CIRCL API."""
-        if self.is_tool_running:
-            # Don't show a popup for this as it's an automatic refresh
-            logging.warning("Cannot refresh recent threats, a tool is already running.")
+    def _populate_history_tab(self):
+        """Fetches and displays the current user's history."""
+        if not self.current_user:
             return
 
-        self.is_tool_running = True
-        self.status_bar.showMessage("Fetching latest threats from cve.circl.lu...")
-        self.recent_threats_table.clear()
-        self.recent_threats_details_view.clear()
-
-        self.worker = WorkerThread(self._recent_threats_thread)
-        self.active_threads.append(self.worker)
-        self.worker.start()
-
-    def _recent_threats_thread(self):
-        """Worker thread that fetches data from the API."""
-        q = self.tool_results_queue
+        self.history_tree.clear()
         try:
-            url = "https://cve.circl.lu/api/last"
-            with urllib.request.urlopen(url, timeout=15) as response:
-                if response.status == 200:
-                    data = json.load(response)
-                    q.put(('recent_threats_result', data))
-                else:
-                    raise Exception(f"API returned status code {response.status}")
+            user_id = self.current_user.get('id')
+            history_records = database.get_history_for_user(user_id)
+
+            for record in history_records:
+                # record is a tuple: (id, user_id, timestamp, action, details, full_data)
+                timestamp = record[2]
+                action = record[3]
+                details = record[4]
+
+                main_item = QTreeWidgetItem([timestamp, action, details])
+                self.history_tree.addTopLevelItem(main_item)
+
+                # Add full data as a collapsible child item
+                full_data = record[5]
+                if full_data:
+                    try:
+                        # Pretty-print the JSON for readability
+                        pretty_json = json.dumps(json.loads(full_data), indent=2)
+                        child_item = QTreeWidgetItem(["Full Data:", pretty_json])
+                        main_item.addChild(child_item)
+                    except json.JSONDecodeError:
+                        child_item = QTreeWidgetItem(["Raw Data:", full_data])
+                        main_item.addChild(child_item)
+
+
         except Exception as e:
-            logging.error(f"Failed to fetch recent threats: {e}", exc_info=True)
-            q.put(('error', 'Threat Intelligence Error', str(e)))
-        finally:
-            q.put(('tool_finished', 'recent_threats'))
+            logging.error(f"Failed to populate history tab: {e}", exc_info=True)
+            QMessageBox.critical(self, "Database Error", f"Could not load history: {e}")
 
-    def _update_recent_threats_display(self):
-        """Populates the recent threats table based on the current page and items per page."""
-        self.recent_threats_table.clear()
-        if not self.recent_threats_data:
-            return
-
-        total_items = len(self.recent_threats_data)
-        total_pages = (total_items + self.recent_threats_per_page - 1) // self.recent_threats_per_page
-
-        self.threats_page_label.setText(f"Page {self.recent_threats_current_page} / {total_pages}")
-        self.threats_prev_btn.setEnabled(self.recent_threats_current_page > 1)
-        self.threats_next_btn.setEnabled(self.recent_threats_current_page < total_pages)
-
-        start_index = (self.recent_threats_current_page - 1) * self.recent_threats_per_page
-        end_index = start_index + self.recent_threats_per_page
-
-        page_items = self.recent_threats_data[start_index:end_index]
-
-        for cve in page_items:
-            cve_id = cve.get('id', 'N/A')
-            published = cve.get('Published', 'N/A').split('T')[0] # Just the date
-            cvss = str(cve.get('cvss', 'N/A'))
-            summary = cve.get('summary', 'No summary available.')
-
-            item = QTreeWidgetItem([cve_id, published, cvss, summary])
-            item.setData(0, Qt.ItemDataRole.UserRole, cve) # Store the full data object
-            self.recent_threats_table.addTopLevelItem(item)
-
-        self.recent_threats_table.resizeColumnToContents(0)
-        self.recent_threats_table.resizeColumnToContents(1)
-        self.recent_threats_table.resizeColumnToContents(2)
-
-    def _change_threats_page(self, direction):
-        """Changes the current page for the recent threats view."""
-        total_items = len(self.recent_threats_data)
-        total_pages = (total_items + self.recent_threats_per_page - 1) // self.recent_threats_per_page
-
-        new_page = self.recent_threats_current_page + direction
-        if 1 <= new_page <= total_pages:
-            self.recent_threats_current_page = new_page
-            self._update_recent_threats_display()
-
-    def _change_threats_per_page(self, text):
-        """Handles the change in the number of items to display per page."""
-        self.recent_threats_per_page = int(text)
-        self.recent_threats_current_page = 1 # Reset to first page
-        self._update_recent_threats_display()
-
-    def _display_recent_threat_details(self, current_item, previous_item):
-        """Displays full details for the selected recent threat."""
-        if not current_item:
-            return
-
-        cve_data = current_item.data(0, Qt.ItemDataRole.UserRole)
-        if not cve_data:
-            return
-
-        html = f"<h3>{cve_data.get('id', 'N/A')}</h3>"
-        html += f"<p><b>Published:</b> {cve_data.get('Published', 'N/A')}<br>"
-        html += f"<b>Last Modified:</b> {cve_data.get('last-modified', 'N/A')}</p>"
-        html += f"<p><b>CVSS Score:</b> {cve_data.get('cvss', 'N/A')}<br>"
-        html += f"<b>CVSS Vector:</b> {cve_data.get('cvss-vector', 'N/A')}</p>"
-        html += f"<p><b>Summary:</b><br>{cve_data.get('summary', 'N/A')}</p>"
-
-        if refs := cve_data.get('references'):
-            html += "<p><b>References:</b><ul>"
-            for ref in refs:
-                html += f'<li><a href="{ref}">{ref}</a></li>'
-            html += "</ul></p>"
-
-        self.recent_threats_details_view.setHtml(html)
+    def _create_threat_intelligence_tab(self):
+        """Creates the tab container for the Threat Intelligence tools."""
+        threat_tabs = QTabWidget()
+        threat_tabs.addTab(self._create_cve_search_tab(), "CVE Search")
+        threat_tabs.addTab(self._create_exploit_db_search_tab(), "Exploit-DB Search")
+        return threat_tabs
 
     def _create_cve_search_tab(self):
         """Creates the UI for the CVE Search tool."""
@@ -2104,7 +1885,7 @@ class GScapy(QMainWindow):
     def start_exploit_search(self):
         """Starts the Exploit-DB search worker thread."""
         if not shutil.which("getsploit"):
-            QMessageBox.critical(self, "GetSploit Error", "'getsploit' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/vulnersCom/getsploit")
+            QMessageBox.critical(self, "GetSploit Error", "'getsploit' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -2592,7 +2373,7 @@ class GScapy(QMainWindow):
         """Starts the Nmap scan worker thread by building a command from the UI."""
         controls = self.nmap_controls
         if not shutil.which("nmap"):
-            QMessageBox.critical(self, "Nmap Error", "'nmap' command not found. Please ensure it is installed and in your system's PATH.\n\nDownload from: https://nmap.org/download.html")
+            QMessageBox.critical(self, "Nmap Error", "'nmap' command not found. Please ensure it is installed and in your system's PATH.")
             return
         if self.is_tool_running:
             QMessageBox.warning(self, "Busy", "Another tool is already running.")
@@ -2633,6 +2414,12 @@ class GScapy(QMainWindow):
             return
 
         command.append(target)
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {target}, Ports: {controls['ports_edit'].text() or 'default'}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Nmap Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -2880,7 +2667,7 @@ class GScapy(QMainWindow):
         """Starts the Subfinder scan worker thread."""
         controls = self.subfinder_controls
         if not shutil.which("subfinder"):
-            QMessageBox.critical(self, "Subfinder Error", "'subfinder' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/projectdiscovery/subfinder")
+            QMessageBox.critical(self, "Subfinder Error", "'subfinder' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -2902,6 +2689,12 @@ class GScapy(QMainWindow):
 
         if output_file := controls['output_edit'].text().strip():
             command.extend(["-o", output_file])
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Domain: {domain}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Subfinder Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3052,7 +2845,7 @@ class GScapy(QMainWindow):
         """Starts the httpx scan worker thread."""
         controls = self.httpx_controls
         if not shutil.which("httpx"):
-            QMessageBox.critical(self, "httpx Error", "'httpx' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/projectdiscovery/httpx")
+            QMessageBox.critical(self, "httpx Error", "'httpx' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -3083,6 +2876,12 @@ class GScapy(QMainWindow):
 
         if controls['json_output_check'].isChecked():
             command.append("-json")
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target List: {target_list}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'httpx Probe', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3210,7 +3009,7 @@ class GScapy(QMainWindow):
         """Starts the RustScan worker thread."""
         controls = self.rustscan_controls
         if not shutil.which("rustscan"):
-            QMessageBox.critical(self, "RustScan Error", "'rustscan' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/RustScan/RustScan")
+            QMessageBox.critical(self, "RustScan Error", "'rustscan' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -3239,6 +3038,12 @@ class GScapy(QMainWindow):
             if nmap_args := controls['nmap_args_edit'].text().strip():
                 command.append("--")
                 command.extend(nmap_args.split())
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Targets: {targets}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'RustScan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3367,7 +3172,7 @@ class GScapy(QMainWindow):
         """Starts the dirsearch scan worker thread."""
         controls = self.dirsearch_controls
         if not shutil.which("dirsearch"):
-            QMessageBox.critical(self, "dirsearch Error", "'dirsearch' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/maurosoria/dirsearch")
+            QMessageBox.critical(self, "dirsearch Error", "'dirsearch' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -3399,6 +3204,12 @@ class GScapy(QMainWindow):
             return
 
         command.append("--no-color")
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"URL: {url}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'dirsearch Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3538,7 +3349,7 @@ class GScapy(QMainWindow):
         """Starts the ffuf scan worker thread."""
         controls = self.ffuf_controls
         if not shutil.which("ffuf"):
-            QMessageBox.critical(self, "ffuf Error", "'ffuf' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/ffuf/ffuf")
+            QMessageBox.critical(self, "ffuf Error", "'ffuf' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -3576,6 +3387,12 @@ class GScapy(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "File Error", f"Could not create temporary file for ffuf report: {e}")
             return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"URL: {url}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'ffuf Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3722,7 +3539,7 @@ class GScapy(QMainWindow):
         """Starts the enum4linux-ng scan worker thread."""
         controls = self.enum4linux_ng_controls
         if not shutil.which("enum4linux-ng"):
-            QMessageBox.critical(self, "enum4linux-ng Error", "'enum4linux-ng' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/cddmp/enum4linux-ng")
+            QMessageBox.critical(self, "enum4linux-ng Error", "'enum4linux-ng' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -3759,6 +3576,12 @@ class GScapy(QMainWindow):
             return
 
         command.append(target)
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {target}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'enum4linux-ng Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3898,7 +3721,7 @@ class GScapy(QMainWindow):
         """Starts the dnsrecon scan worker thread."""
         controls = self.dnsrecon_controls
         if not shutil.which("dnsrecon"):
-            QMessageBox.critical(self, "dnsrecon Error", "'dnsrecon' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/darkoperator/dnsrecon")
+            QMessageBox.critical(self, "dnsrecon Error", "'dnsrecon' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -3928,6 +3751,12 @@ class GScapy(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "File Error", f"Could not create temporary file for dnsrecon report: {e}")
             return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Domain: {domain}, Type: {scan_type}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'dnsrecon Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -4053,7 +3882,7 @@ class GScapy(QMainWindow):
         """Starts the fierce scan worker thread."""
         controls = self.fierce_controls
         if not shutil.which("fierce"):
-            QMessageBox.critical(self, "fierce Error", "'fierce' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/mschwager/fierce")
+            QMessageBox.critical(self, "fierce Error", "'fierce' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -4075,6 +3904,12 @@ class GScapy(QMainWindow):
             command.extend(["--traverse", traverse])
         if delay := controls['delay_edit'].text().strip():
             command.extend(["--delay", delay])
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Domain: {domain}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Fierce Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -4207,6 +4042,11 @@ class GScapy(QMainWindow):
         if not domain:
             QMessageBox.critical(self, "Input Error", "Please provide a domain to scan.")
             return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Domain: {domain}"
+            database.log_activity(self.current_user['id'], 'Sublist3r Scan', log_details, f"Domain: {domain}")
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -4347,7 +4187,7 @@ class GScapy(QMainWindow):
         """Starts the Nikto scan worker thread by building a command from the extensive UI options."""
         controls = self.nikto_controls
         if not shutil.which("nikto"):
-            QMessageBox.critical(self, "Nikto Error", "'nikto' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://cirt.net/Nikto2")
+            QMessageBox.critical(self, "Nikto Error", "'nikto' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -4395,6 +4235,12 @@ class GScapy(QMainWindow):
             command.extend(["-Save", save_dir])
         if extra_opts := controls['extra_opts_edit'].text().strip():
             command.extend(extra_opts.split())
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Host: {target}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Nikto Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -4539,7 +4385,7 @@ class GScapy(QMainWindow):
         """Starts the Gobuster scan worker thread."""
         controls = self.gobuster_controls
         if not shutil.which("gobuster"):
-            QMessageBox.critical(self, "Gobuster Error", "'gobuster' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/OJ/gobuster")
+            QMessageBox.critical(self, "Gobuster Error", "'gobuster' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -4589,6 +4435,12 @@ class GScapy(QMainWindow):
             command.append("-q")
         if controls['expanded_check'].isChecked():
             command.append("-e")
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"URL: {url}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Gobuster Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -4660,7 +4512,7 @@ class GScapy(QMainWindow):
     def start_whatweb_scan(self):
         """Starts the WhatWeb scan worker thread."""
         if not shutil.which("whatweb"):
-            QMessageBox.critical(self, "WhatWeb Error", "'whatweb' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/urbanadventurer/WhatWeb")
+            QMessageBox.critical(self, "WhatWeb Error", "'whatweb' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -4688,6 +4540,12 @@ class GScapy(QMainWindow):
 
         # Target(s) must be last
         command.extend(target.split())
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target(s): {target}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'WhatWeb Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         self.whatweb_start_btn.setEnabled(False)
@@ -4871,7 +4729,7 @@ class GScapy(QMainWindow):
     def start_sqlmap_scan(self):
         """Starts the SQLMap scan worker thread."""
         if not shutil.which("sqlmap"):
-            QMessageBox.critical(self, "SQLMap Error", "'sqlmap' command not found. Please ensure it is installed and in your system's PATH.\n\nDownload from: http://sqlmap.org/")
+            QMessageBox.critical(self, "SQLMap Error", "'sqlmap' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -4946,6 +4804,12 @@ class GScapy(QMainWindow):
         # --- Additional Options ---
         if extra_opts := self.sqlmap_extra_opts_edit.text().strip():
             command.extend(extra_opts.split())
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {url or reqfile}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'SQLMap Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         self.sqlmap_start_btn.setEnabled(False)
@@ -5143,7 +5007,7 @@ class GScapy(QMainWindow):
     def start_hashcat_scan(self):
         """Starts the Hashcat worker thread."""
         if not shutil.which("hashcat"):
-            QMessageBox.critical(self, "Hashcat Error", "'hashcat' command not found. Please ensure it is installed and in your system's PATH.\n\nDownload from: https://hashcat.net/hashcat/")
+            QMessageBox.critical(self, "Hashcat Error", "'hashcat' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -5191,6 +5055,12 @@ class GScapy(QMainWindow):
             command.append("--force")
         if extra_opts := self.hashcat_extra_opts_edit.text().strip():
             command.extend(extra_opts.split())
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Hash File: {hashfile}, Mode: {attack_mode}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Hashcat', log_details, log_full_data)
 
         self.is_tool_running = True
         self.hashcat_start_btn.setEnabled(False)
@@ -5366,7 +5236,7 @@ class GScapy(QMainWindow):
         """Starts the Nuclei scan worker thread."""
         controls = self.nuclei_controls
         if not shutil.which("nuclei"):
-            QMessageBox.critical(self, "Nuclei Error", "'nuclei' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/projectdiscovery/nuclei")
+            QMessageBox.critical(self, "Nuclei Error", "'nuclei' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -5407,6 +5277,12 @@ class GScapy(QMainWindow):
             command.append("-v")
 
         command.extend(["-nC", "-json"]) # Always disable color and enable JSON for parsing
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {target}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Nuclei Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -5568,7 +5444,7 @@ class GScapy(QMainWindow):
         """Starts the TruffleHog scan worker thread."""
         controls = self.trufflehog_controls
         if not shutil.which("trufflehog"):
-            QMessageBox.critical(self, "TruffleHog Error", "'trufflehog' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/trufflesecurity/truffleHog")
+            QMessageBox.critical(self, "TruffleHog Error", "'trufflehog' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -5592,6 +5468,12 @@ class GScapy(QMainWindow):
 
         # Always add --json for parsing, but hide the checkbox from the user to avoid confusion
         command.append("--json")
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Source: {source_type}, Target: {target}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'TruffleHog Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -5734,7 +5616,7 @@ class GScapy(QMainWindow):
     def _start_jtr_generic(self, crack_mode):
         controls = self.jtr_controls
         if not shutil.which("john"):
-            QMessageBox.critical(self, "JTR Error", "'john' command not found. Please ensure it is installed and in your system's PATH.\n\nDownload from: https://www.openwall.com/john/")
+            QMessageBox.critical(self, "JTR Error", "'john' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -5763,6 +5645,13 @@ class GScapy(QMainWindow):
             command.extend([f"--format={format_type}"])
 
         command.append(hash_file)
+
+        # Log the activity
+        if self.current_user:
+            mode = "Show" if not crack_mode else "Crack"
+            log_details = f"Mode: {mode}, Hash File: {hash_file}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'John the Ripper', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -5895,7 +5784,7 @@ class GScapy(QMainWindow):
         """Starts the Hydra attack worker thread."""
         controls = self.hydra_controls
         if not shutil.which("hydra"):
-            QMessageBox.critical(self, "Hydra Error", "'hydra' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/vanhauser-thc/thc-hydra")
+            QMessageBox.critical(self, "Hydra Error", "'hydra' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -5930,6 +5819,12 @@ class GScapy(QMainWindow):
             command.extend(["-t", tasks])
 
         command.append(f"{service}://{target}")
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {target}, Service: {service}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Hydra Attack', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -6044,7 +5939,7 @@ class GScapy(QMainWindow):
         """Starts the Sherlock scan worker thread."""
         controls = self.sherlock_controls
         if not shutil.which("sherlock"):
-            QMessageBox.critical(self, "Sherlock Error", "'sherlock' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/sherlock-project/sherlock")
+            QMessageBox.critical(self, "Sherlock Error", "'sherlock' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -6072,6 +5967,12 @@ class GScapy(QMainWindow):
             return
 
         command.extend(usernames.split())
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Usernames: {usernames}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Sherlock Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -6200,7 +6101,7 @@ class GScapy(QMainWindow):
         """Starts the Spiderfoot scan worker thread."""
         controls = self.spiderfoot_controls
         if not shutil.which("spiderfoot-cli"):
-            QMessageBox.critical(self, "Spiderfoot Error", "'spiderfoot-cli' command not found. Please ensure it is installed and in your system's PATH.\n\nDownload from: https://www.spiderfoot.net/download/")
+            QMessageBox.critical(self, "Spiderfoot Error", "'spiderfoot-cli' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -6222,6 +6123,12 @@ class GScapy(QMainWindow):
             command.append("-q")
 
         command.append("-n") # Disable history logging for non-interactive use
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {target}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Spiderfoot Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -6354,7 +6261,7 @@ class GScapy(QMainWindow):
     def start_masscan_scan(self):
         """Starts the Masscan worker thread."""
         if not shutil.which("masscan"):
-            QMessageBox.critical(self, "Masscan Error", "'masscan' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/robertdavidgraham/masscan")
+            QMessageBox.critical(self, "Masscan Error", "'masscan' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -6388,6 +6295,12 @@ class GScapy(QMainWindow):
 
         if extra_opts := self.masscan_extra_opts_edit.text().strip():
             command.extend(extra_opts.split())
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target(s): {target}, Rate: {rate}pps"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Masscan', log_details, log_full_data)
 
         self.is_tool_running = True
         self.masscan_start_btn.setEnabled(False)
@@ -7232,7 +7145,7 @@ class GScapy(QMainWindow):
     def start_wifite_scan(self):
         """Starts the Wifite scan worker thread."""
         if not shutil.which("wifite"):
-            QMessageBox.critical(self, "Wifite Error", "'wifite' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/derv82/wifite2")
+            QMessageBox.critical(self, "Wifite Error", "'wifite' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -7268,6 +7181,12 @@ class GScapy(QMainWindow):
             command.append("--pmkid")
         if self.wifite_kill_check.isChecked():
             command.append("--kill")
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target ESSID: {essid or 'All'}"
+            log_full_data = json.dumps({"command": " ".join(command)})
+            database.log_activity(self.current_user['id'], 'Wifite Audit', log_details, log_full_data)
 
         self.is_tool_running = True
         self.wifite_start_btn.setEnabled(False)
@@ -7506,6 +7425,11 @@ class GScapy(QMainWindow):
             QMessageBox.warning(self, "File Error", f"Wordlist file not found:\n{wordlist}")
             return
 
+        # Log the activity
+        if self.current_user:
+            log_details = f"Handshake File: {os.path.basename(pcap_file)}"
+            database.log_activity(self.current_user['id'], 'WPA Crack', log_details, log_details)
+
         self.wpa_crack_output.clear()
         self.wpa_crack_btn.setText("Stop Cracking")
         self.aircrack_thread = AircrackThread(pcap_file, wordlist, self, threads)
@@ -7552,7 +7476,7 @@ class GScapy(QMainWindow):
                         process.wait()
                         self.tool_results_queue.put(('crunch_finished', outfile, process.returncode))
                     except FileNotFoundError:
-                        self.tool_results_queue.put(('error', 'Crunch Error', "'crunch' command not found. Please ensure it is installed and in your system's PATH.\n\nDownload from: https://sourceforge.net/projects/crunch-wordlist/"))
+                        self.tool_results_queue.put(('error', 'Crunch Error', "'crunch' command not found. Please ensure it is installed and in your system's PATH."))
                     except Exception as e:
                         self.tool_results_queue.put(('error', 'Crunch Error', str(e)))
 
@@ -7576,6 +7500,11 @@ class GScapy(QMainWindow):
         if not bssid:
             QMessageBox.warning(self, "Target Error", "Please select a target network.")
             return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target BSSID: {bssid}"
+            database.log_activity(self.current_user['id'], 'WPA Handshake Capture', log_details, log_details)
 
         self.is_tool_running = True
         self.wpa_capture_btn.setText("Stop Capture")
@@ -8060,6 +7989,12 @@ class GScapy(QMainWindow):
         if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
         t = self.trace_target.text()
         if not t: QMessageBox.critical(self, "Error", "Please enter a target."); return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {t}"
+            database.log_activity(self.current_user['id'], 'Traceroute', log_details, log_details)
+
         self.trace_button.setEnabled(False)
         self.trace_cancel_button.setEnabled(True)
         self.is_tool_running = True
@@ -8105,6 +8040,11 @@ class GScapy(QMainWindow):
         if not t or not ps: QMessageBox.critical(self, "Error", "Target and ports required."); return
         try: ports=sorted(list(set(self._parse_ports(ps))))
         except ValueError: QMessageBox.critical(self, "Error","Invalid port format. Use '22, 80, 100-200'."); return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {t}, Ports: {ps}, Mode: {tcp_scan_type}"
+            database.log_activity(self.current_user['id'], 'Port Scan (Scapy)', log_details, log_details)
 
         self.scan_button.setEnabled(False)
         self.scan_cancel_button.setEnabled(True)
@@ -8196,6 +8136,12 @@ class GScapy(QMainWindow):
         if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
         t=self.arp_target.text()
         if not t: QMessageBox.critical(self, "Error", "Please enter a target network."); return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {t}"
+            database.log_activity(self.current_user['id'], 'ARP Scan (Scapy)', log_details, log_details)
+
         self.arp_scan_button.setEnabled(False); self.is_tool_running=True
         self.worker = WorkerThread(self._arp_scan_thread, args=(t,)); self.worker.start()
 
@@ -8287,7 +8233,7 @@ class GScapy(QMainWindow):
         """Starts the arp-scan CLI worker thread."""
         controls = self.arp_scan_cli_controls
         if not shutil.which("arp-scan"):
-            QMessageBox.critical(self, "arp-scan Error", "'arp-scan' command not found. Please ensure it is installed and in your system's PATH.\n\nInstallation instructions can be found at:\nhttps://github.com/royhills/arp-scan")
+            QMessageBox.critical(self, "arp-scan Error", "'arp-scan' command not found. Please ensure it is installed and in your system's PATH.")
             return
 
         if self.is_tool_running:
@@ -8386,6 +8332,11 @@ class GScapy(QMainWindow):
         if ("TCP" in probe_type or "UDP" in probe_type) and not ports:
             QMessageBox.critical(self, "Input Error", "Please specify at least one port for TCP/UDP probes.")
             return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {target_network}, Probe: {probe_type}"
+            database.log_activity(self.current_user['id'], 'Ping Sweep', log_details, log_details)
 
         self.is_tool_running = True
         self.ps_start_button.setEnabled(False)
@@ -8496,6 +8447,11 @@ class GScapy(QMainWindow):
             QMessageBox.critical(self, "Error", "Invalid count, interval, or thread number.")
             return
 
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {target_ip}, Type: {template}"
+            database.log_activity(self.current_user['id'], 'Packet Flood', log_details, log_details)
+
         self.flood_button.setEnabled(False)
         self.stop_flood_button.setEnabled(True)
         self.is_tool_running = True
@@ -8574,6 +8530,11 @@ class GScapy(QMainWindow):
         self.krack_stop_btn.setEnabled(True)
         self.krack_results_tree.clear()
 
+        # Log the activity
+        if self.current_user:
+            log_details = f"Interface: {iface}"
+            database.log_activity(self.current_user['id'], 'KRACK Scan', log_details, log_details)
+
         self.krack_thread = KrackScanThread(iface, self)
         self.krack_thread.vulnerability_detected.connect(self.add_krack_result)
         self.krack_thread.start()
@@ -8601,6 +8562,12 @@ class GScapy(QMainWindow):
         if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
         t=self.fw_target.text(); ps_name=self.fw_probe_set.currentText()
         if not t: QMessageBox.critical(self, "Error", "Please enter a target."); return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Target: {t}, Probe Set: {ps_name}"
+            database.log_activity(self.current_user['id'], 'Firewall Test', log_details, log_details)
+
         self.fw_test_button.setEnabled(False); self.is_tool_running=True
         self.worker = WorkerThread(self._firewall_test_thread, args=(t,ps_name)); self.worker.start()
 
@@ -8641,6 +8608,12 @@ class GScapy(QMainWindow):
 
         self.wifi_scan_button.setEnabled(False)
         self.wifi_scan_stop_button.setEnabled(True)
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Interface: {iface}"
+            database.log_activity(self.current_user['id'], 'Wi-Fi Scan', log_details, log_details)
+
         self.is_tool_running = True
         self.found_networks = {}
         self.wifi_tree.clear()
@@ -8698,6 +8671,12 @@ class GScapy(QMainWindow):
         except ValueError: QMessageBox.critical(self, "Error", "Count must be an integer."); return
         warning_msg="This will send deauthentication packets which can disrupt a network. Are you sure you want to continue?"
         if QMessageBox.question(self, "Confirm Deauth", warning_msg) == QMessageBox.StandardButton.No: return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"BSSID: {bssid}, Client: {client}, Count: {count}"
+            database.log_activity(self.current_user['id'], 'Deauthentication Attack', log_details, log_details)
+
         self.deauth_button.setEnabled(False); self.is_tool_running = True
         args = (bssid, client, count)
         self.worker = WorkerThread(self._deauth_thread, args=args); self.worker.start()
@@ -8746,6 +8725,11 @@ class GScapy(QMainWindow):
         except ValueError as e:
             QMessageBox.critical(self, "Input Error", f"Invalid input for Count, Interval, or Channel: {e}")
             return
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"SSIDs: {len(ssids)}, Encryption: {enc_type}, Count: {count}"
+            database.log_activity(self.current_user['id'], 'Beacon Flood', log_details, log_details)
 
         self.is_tool_running = True
         self.bf_start_button.setEnabled(False)
@@ -8894,6 +8878,11 @@ class GScapy(QMainWindow):
 
         self.arp_spoof_current_victim = victim_ip
         self.arp_spoof_current_target = target_ip
+
+        # Log the activity
+        if self.current_user:
+            log_details = f"Victim: {victim_ip}, Target: {target_ip}"
+            database.log_activity(self.current_user['id'], 'ARP Spoof', log_details, log_details)
 
         self.is_tool_running = True
         self.arp_spoof_start_btn.setEnabled(False)
@@ -9275,8 +9264,6 @@ class GScapy(QMainWindow):
         self.result_handlers['nuclei_results'] = self._show_nuclei_results_popup
         self.result_handlers['masscan_output'] = self._handle_masscan_output
         self.result_handlers['report_finding'] = self._handle_report_finding
-        self.result_handlers['recent_threats_result'] = self._handle_recent_threats_result
-        self.result_handlers['offline_db_status'] = self._handle_offline_db_status
 
     def _handle_report_finished(self, success, message):
         """Handles the result of the report generation thread."""
@@ -9293,16 +9280,6 @@ class GScapy(QMainWindow):
         # The data should be (host, port_service, finding, details)
         item = QTreeWidgetItem([str(col) for col in finding_data])
         self.report_findings_tree.addTopLevelItem(item)
-
-    def _handle_offline_db_status(self, status_text):
-        self.offline_db_status_label.setText(f"Status: {status_text}")
-
-    def _handle_recent_threats_result(self, data):
-        """Handles the list of recent threats fetched from the API."""
-        self.recent_threats_data = data
-        self.status_bar.showMessage(f"Successfully fetched {len(self.recent_threats_data)} recent threats.", 5000)
-        self.recent_threats_current_page = 1 # Reset to page 1
-        self._update_recent_threats_display()
 
     def _handle_aggregation(self):
         """Starts the background thread for aggregating and enriching tool results."""
@@ -9360,11 +9337,7 @@ class GScapy(QMainWindow):
                         full_service_str = f"{service_name} ({search_term})"
 
                         # Enrich data with CVEs and Exploits
-                        if self.report_offline_cve_check.isChecked():
-                            cve_details = self._query_local_cve_db(search_term)
-                        else:
-                            cve_details = self._query_cve_api(search_term)
-
+                        cve_details = self._query_cve_api(search_term)
                         exploit_details = self._query_searchsploit(search_term)
 
                         q.put(('report_finding', (address, port_service_str, full_service_str, f"{cve_details}\n{exploit_details}")))
@@ -9375,20 +9348,15 @@ class GScapy(QMainWindow):
         finally:
             q.put(('tool_finished', 'aggregation'))
 
-    def _handle_generate_html_report(self):
-        """Handles the HTML report generation process by gathering data and starting a worker."""
+    def _handle_generate_report(self):
+        """Handles the report generation process by gathering data and starting a worker."""
         # 1. Gather all data from the UI
-        if not self.report_auth_check.isChecked():
-            QMessageBox.critical(self, "Authorization Required", "You must confirm that you have authorization from the client before generating a report.")
-            return
-
         report_data = {
             "client": self.report_client_name.text(),
             "dates": self.report_assessment_dates.text(),
             "objectives": self.report_objectives.toPlainText(),
             "in_scope": self.report_in_scope.toPlainText(),
             "out_of_scope": self.report_out_of_scope.toPlainText(),
-            "pocs": self.report_pocs.toPlainText(),
             "summary": self.report_summary_text.toPlainText(),
             "findings": []
         }
@@ -9459,70 +9427,6 @@ class GScapy(QMainWindow):
             logging.error(f"Error during report generation: {e}", exc_info=True)
             q.put(('report_finished', False, str(e)))
 
-    def _query_local_cve_db(self, keyword):
-        """Queries the local NVD JSON files for a given keyword."""
-        db_dir = "cve_db"
-        if not os.path.exists(db_dir):
-            return "Offline database not found. Please download it from the Threat Intelligence tab."
-
-        parts = keyword.lower().split()
-        if not parts:
-            return "No keyword provided for offline search."
-
-        matches = []
-
-        json_files = sorted([f for f in os.listdir(db_dir) if f.endswith('.json')], reverse=True)
-
-        for filename in json_files:
-            if len(matches) >= 5: # Limit results to avoid long searches
-                break
-
-            filepath = os.path.join(db_dir, filename)
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-
-                    for item in data.get('CVE_Items', []):
-                        if len(matches) >= 5:
-                            break
-                        # Check description
-                        description_found = False
-                        description_text = ""
-                        for desc_data in item.get('cve', {}).get('description', {}).get('description_data', []):
-                            if desc_data.get('lang') == 'en':
-                                description_text = desc_data.get('value', '')
-                                if keyword.lower() in description_text.lower():
-                                    cve_id = item.get('cve', {}).get('CVE_data_meta', {}).get('ID', 'N/A')
-                                    matches.append(f"{cve_id}: {description_text[:100]}...")
-                                    description_found = True
-                                    break # Found in description, no need to check CPEs for this item
-
-                        if description_found:
-                            continue
-
-                        # Check CPEs if not found in description
-                        nodes = item.get('configurations', {}).get('nodes', [])
-                        cpe_match_found = False
-                        for node in nodes:
-                            if cpe_match_found: break
-                            cpe_matches = node.get('cpe_match', [])
-                            for cpe_match in cpe_matches:
-                                cpe_uri = cpe_match.get('cpe23Uri', '')
-                                if all(p in cpe_uri.lower() for p in parts):
-                                    cve_id = item.get('cve', {}).get('CVE_data_meta', {}).get('ID', 'N/A')
-                                    matches.append(f"{cve_id} (Matched CPE: {cpe_uri})")
-                                    cpe_match_found = True
-                                    break
-
-            except (json.JSONDecodeError, IOError) as e:
-                logging.warning(f"Could not read or parse offline DB file {filename}: {e}")
-                continue
-
-        if not matches:
-            return "No CVEs found in offline database for the given keyword."
-
-        return "\n".join(["--- Offline CVEs ---"] + matches)
-
     def _query_cve_api(self, keyword):
         """Queries the NVD CVE API for a given keyword and returns a formatted string."""
         if not keyword:
@@ -9574,7 +9478,7 @@ class GScapy(QMainWindow):
             return "No service info to query exploits."
 
         if not shutil.which("searchsploit"):
-            return "searchsploit command not found. Please install Exploit-DB (https://www.exploit-db.com/searchsploit)."
+            return "searchsploit command not found. Please install Exploit-DB."
 
         try:
             command = ["searchsploit", "--json", keyword]
@@ -9782,9 +9686,7 @@ class GScapy(QMainWindow):
                    'beacon_flood': self.bf_start_button, 'ping_sweep': self.ps_start_button, 'nmap_scan': self.nmap_controls['start_btn'],
                           'sublist3r_scan': self.subdomain_controls['start_btn'], 'subfinder_scan': self.subfinder_controls['start_btn'], 'httpx_scan': self.httpx_controls['start_btn'], 'trufflehog_scan': self.trufflehog_controls['start_btn'], 'rustscan_scan': self.rustscan_controls['start_btn'], 'dirsearch_scan': self.dirsearch_controls['start_btn'], 'ffuf_scan': self.ffuf_controls['start_btn'], 'jtr_scan': self.jtr_controls['start_btn'], 'hydra_scan': self.hydra_controls['start_btn'], 'enum4linux_ng_scan': self.enum4linux_ng_controls['start_btn'], 'dnsrecon_scan': self.dnsrecon_controls['start_btn'], 'fierce_scan': self.fierce_controls['start_btn'], 'sherlock_scan': self.sherlock_controls['start_btn'], 'spiderfoot_scan': self.spiderfoot_controls['start_btn'], 'arp_scan_cli_scan': self.arp_scan_cli_controls['start_btn'], 'wifite_scan': self.wifite_start_btn, 'nikto_scan': self.nikto_controls['start_btn'], 'gobuster_scan': self.gobuster_controls['start_btn'], 'sqlmap_scan': self.sqlmap_start_btn, 'whatweb_scan': self.whatweb_start_btn, 'hashcat_scan': self.hashcat_start_btn, 'masscan_scan': self.masscan_start_btn, 'nuclei_scan': self.nuclei_controls['start_btn'],
                            'cve_search': self.cve_search_button,
-                           'exploit_search': self.exploitdb_search_button,
-                           'offline_db_download': self.download_offline_db_btn,
-                           'docx_report': self.report_generate_doc_btn}
+                           'exploit_search': self.exploitdb_search_button}
         cancel_buttons = {'scanner': self.scan_cancel_button, 'flooder': self.stop_flood_button,
                           'arp_spoof': self.arp_spoof_stop_btn, 'beacon_flood': self.bf_stop_button,
                           'ping_sweep': self.ps_cancel_button, 'fw_tester': self.fw_cancel_button,
@@ -10013,59 +9915,37 @@ class GScapy(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0,0,0,0)
 
-        # --- Rules of Engagement (ROE) Section ---
+        # Rules of Engagement Box
         roe_box = QGroupBox("Rules of Engagement (ROE)")
-        roe_main_layout = QVBoxLayout(roe_box)
-
-        roe_tabs = QTabWidget()
-        roe_main_layout.addWidget(roe_tabs)
-
-        # General Tab
-        roe_general_tab = QWidget()
-        roe_general_layout = QFormLayout(roe_general_tab)
+        roe_layout = QFormLayout(roe_box)
         self.report_client_name = QLineEdit()
         self.report_assessment_dates = QLineEdit()
         self.report_objectives = QTextEdit()
-        self.report_objectives.setPlaceholderText("Describe the high-level goals of the engagement. E.g., 'Assess the external network for vulnerabilities', 'Test the security of the new web application'.")
-        roe_general_layout.addRow("Client Name:", self.report_client_name)
-        roe_general_layout.addRow("Assessment Dates:", self.report_assessment_dates)
-        roe_general_layout.addRow("Primary Objectives:", self.report_objectives)
-        roe_tabs.addTab(roe_general_tab, "General")
-
-        # Scope Tab
-        roe_scope_tab = QWidget()
-        roe_scope_layout = QFormLayout(roe_scope_tab)
         self.report_in_scope = QTextEdit()
-        self.report_in_scope.setPlaceholderText("List all IP addresses, ranges, domains, and applications that are explicitly in scope.\nE.g., 192.168.1.0/24, *.example.com, api.example.com")
         self.report_out_of_scope = QTextEdit()
-        self.report_out_of_scope.setPlaceholderText("List anything that is explicitly out of scope. This is critical to avoid testing production or sensitive systems.\nE.g., Do not perform Denial of Service attacks, Avoid testing during business hours (9am-5pm).")
-        roe_scope_layout.addRow("In-Scope Targets:", self.report_in_scope)
-        roe_scope_layout.addRow("Out-of-Scope & Restrictions:", self.report_out_of_scope)
-        roe_tabs.addTab(roe_scope_tab, "Scope")
-
-        # Authorization Tab
-        roe_auth_tab = QWidget()
-        roe_auth_layout = QFormLayout(roe_auth_tab)
-        self.report_pocs = QTextEdit()
-        self.report_pocs.setPlaceholderText("List the primary points of contact for the engagement, including names, roles, and contact information (email/phone).\n- Technical POC: Jane Doe, Security Engineer, jane.doe@example.com\n- Emergency Contact: John Smith, IT Manager, john.smith@example.com")
-        self.report_auth_check = QCheckBox("I confirm that I have received written authorization from the client to perform this penetration test.")
-        roe_auth_layout.addRow("Points of Contact (POCs):", self.report_pocs)
-        roe_auth_layout.addRow(self.report_auth_check)
-        roe_tabs.addTab(roe_auth_tab, "Authorization & POCs")
-
+        roe_layout.addRow("Client Name:", self.report_client_name)
+        roe_layout.addRow("Assessment Dates:", self.report_assessment_dates)
+        roe_layout.addRow("Objectives:", self.report_objectives)
+        roe_layout.addRow("In-Scope Targets:", self.report_in_scope)
+        roe_layout.addRow("Out-of-Scope & Restrictions:", self.report_out_of_scope)
         left_layout.addWidget(roe_box)
 
         # Executive Summary Box
         summary_box = QGroupBox("Executive Summary")
         summary_layout = QVBoxLayout(summary_box)
         self.report_summary_text = QTextEdit()
-        self.report_summary_text.setPlaceholderText("Write a high-level summary of the assessment's findings and recommendations for a non-technical audience. You can use the 'AI-Assisted Reporting' section to help generate this content.")
+        self.report_summary_text.setPlaceholderText("Write a high-level summary of the assessment's findings and recommendations for a non-technical audience, or generate one with AI.")
+
+        ai_summary_btn = QPushButton(QIcon("icons/terminal.svg"), " Generate Summary with AI")
+        ai_summary_btn.clicked.connect(self._handle_ai_summary_generation)
+
         summary_layout.addWidget(self.report_summary_text)
+        summary_layout.addWidget(ai_summary_btn)
         left_layout.addWidget(summary_box)
 
         left_panel.setLayout(left_layout)
 
-        # --- Right Panel: Findings, AI, & Generation ---
+        # --- Right Panel: Findings & Generation ---
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0,0,0,0)
@@ -10074,16 +9954,10 @@ class GScapy(QMainWindow):
         findings_box = QGroupBox("Aggregated Findings")
         findings_layout = QVBoxLayout(findings_box)
 
-        aggregation_controls = QHBoxLayout()
         self.report_aggregate_btn = QPushButton(QIcon("icons/search.svg"), " Aggregate & Enrich Results")
         self.report_aggregate_btn.setToolTip("Scan the results from all tool outputs in the current session and enrich them with CVE and Exploit-DB information.")
         self.report_aggregate_btn.clicked.connect(self._handle_aggregation)
-        aggregation_controls.addWidget(self.report_aggregate_btn)
-        aggregation_controls.addStretch()
-        self.report_offline_cve_check = QCheckBox("Use offline CVE_DB")
-        self.report_offline_cve_check.setToolTip("Use a local copy of the CVE database for enrichment. Requires initial setup/download.")
-        aggregation_controls.addWidget(self.report_offline_cve_check)
-        findings_layout.addLayout(aggregation_controls)
+        findings_layout.addWidget(self.report_aggregate_btn)
 
         self.report_findings_tree = QTreeWidget()
         self.report_findings_tree.setColumnCount(4)
@@ -10093,34 +9967,8 @@ class GScapy(QMainWindow):
         findings_layout.addWidget(self.report_findings_tree)
         right_layout.addWidget(findings_box)
 
-        # AI-Assisted Reporting Box
-        ai_box = QGroupBox("AI-Assisted Reporting")
-        ai_layout = QFormLayout(ai_box)
-
-        self.ai_persona_combo = QComboBox()
-        self.ai_persona_combo.addItems([
-            "Executive (High-Level, Business Impact)",
-            "Technical Manager (Balanced, Tactical)",
-            "Security Analyst (Deeply Technical, Actionable)"
-        ])
-        ai_layout.addRow("AI Persona:", self.ai_persona_combo)
-
-        self.ai_custom_instructions_edit = QLineEdit()
-        self.ai_custom_instructions_edit.setPlaceholderText("Optional: e.g., 'Focus on the financial impact of the SQL injection vulnerability'")
-        ai_layout.addRow("AI Instructions:", self.ai_custom_instructions_edit)
-
-        self.generate_ai_content_btn = QPushButton(QIcon("icons/terminal.svg"), "Generate AI Content")
-        self.generate_ai_content_btn.clicked.connect(self._handle_ai_content_generation)
-        ai_layout.addRow(self.generate_ai_content_btn)
-
-        self.ai_generated_text = QTextEdit()
-        self.ai_generated_text.setPlaceholderText("AI-generated content will appear here. You can copy this into the Executive Summary or other report sections.")
-        ai_layout.addRow(self.ai_generated_text)
-
-        right_layout.addWidget(ai_box)
-
         # Generation Box
-        generation_box = QGroupBox("Generate Final Report")
+        generation_box = QGroupBox("Generate Report")
         generation_layout = QFormLayout(generation_box)
 
         self.report_template_combo = QComboBox()
@@ -10133,18 +9981,10 @@ class GScapy(QMainWindow):
 
         generation_layout.addRow("Template:", self.report_template_combo)
 
-        generation_buttons_layout = QHBoxLayout()
-        self.report_generate_html_btn = QPushButton(QIcon("icons/file-text.svg"), "Generate HTML Report")
-        self.report_generate_html_btn.setToolTip("Compile all the information above into a final HTML report.")
-        self.report_generate_html_btn.clicked.connect(self._handle_generate_html_report)
-        generation_buttons_layout.addWidget(self.report_generate_html_btn)
-
-        self.report_generate_doc_btn = QPushButton(QIcon("icons/file-text.svg"), "Generate DOCX Report")
-        self.report_generate_doc_btn.setToolTip("Compile all the information above into a final DOCX report.")
-        self.report_generate_doc_btn.clicked.connect(self._handle_generate_docx_report)
-        generation_buttons_layout.addWidget(self.report_generate_doc_btn)
-
-        generation_layout.addRow(generation_buttons_layout)
+        self.report_generate_btn = QPushButton(QIcon("icons/file-text.svg"), "Generate Report")
+        self.report_generate_btn.setToolTip("Compile all the information above into a final report document.")
+        self.report_generate_btn.clicked.connect(self._handle_generate_report)
+        generation_layout.addRow(self.report_generate_btn)
         right_layout.addWidget(generation_box)
 
         right_panel.setLayout(right_layout)
@@ -10157,123 +9997,10 @@ class GScapy(QMainWindow):
 
         return widget
 
-    def _handle_ai_content_generation(self):
-        """Gathers findings and AI settings to generate report content."""
-        QMessageBox.information(self, "Not Implemented", "AI content generation is not yet implemented.")
-
-    def _handle_generate_docx_report(self):
-        """Handles the DOCX report generation process by gathering data and starting a worker."""
-        try:
-            import docx
-        except ImportError:
-            QMessageBox.critical(self, "Dependency Error", "The 'python-docx' library is required for DOCX report generation.\nPlease run: pip install python-docx")
-            return
-
-        if not self.report_auth_check.isChecked():
-            QMessageBox.critical(self, "Authorization Required", "You must confirm that you have authorization from the client before generating a report.")
-            return
-
-        report_data = {
-            "client": self.report_client_name.text(),
-            "dates": self.report_assessment_dates.text(),
-            "objectives": self.report_objectives.toPlainText(),
-            "in_scope": self.report_in_scope.toPlainText(),
-            "out_of_scope": self.report_out_of_scope.toPlainText(),
-            "pocs": self.report_pocs.toPlainText(),
-            "summary": self.report_summary_text.toPlainText(),
-            "ai_content": self.ai_generated_text.toPlainText(),
-            "findings": []
-        }
-
-        # Allow generating a report with only ROE and summary, but warn if findings are empty
+    def _handle_ai_summary_generation(self):
+        """Gathers findings, sends them to the AI, and sets a callback to populate the summary."""
         if self.report_findings_tree.topLevelItemCount() == 0:
-            QMessageBox.warning(self, "No Findings", "No findings were aggregated. The technical findings section of the report will be empty.")
-
-        for i in range(self.report_findings_tree.topLevelItemCount()):
-            item = self.report_findings_tree.topLevelItem(i)
-            report_data["findings"].append({
-                "host": item.text(0),
-                "service": item.text(1),
-                "finding": item.text(2),
-                "details": item.text(3)
-            })
-
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save DOCX Report", "GScapy_Report.docx", "Word Documents (*.docx)", options=QFileDialog.Option.DontUseNativeDialog)
-        if not file_path:
-            return
-
-        self.status_bar.showMessage("Generating DOCX report...")
-        self.report_generate_doc_btn.setEnabled(False)
-
-        self.worker = WorkerThread(self._docx_report_generation_thread, args=(report_data, file_path))
-        self.active_threads.append(self.worker)
-        self.worker.start()
-
-    def _docx_report_generation_thread(self, report_data, file_path):
-        """Worker thread to generate the final DOCX report."""
-        q = self.tool_results_queue
-        try:
-            from docx import Document
-            from docx.shared import Inches
-
-            document = Document()
-            document.add_heading('Penetration Test Report', 0)
-
-            # --- ROE Section ---
-            document.add_heading('Rules of Engagement', level=1)
-            document.add_paragraph(f"Client: {report_data['client']}")
-            document.add_paragraph(f"Assessment Dates: {report_data['dates']}")
-            document.add_heading('Primary Objectives', level=2)
-            document.add_paragraph(report_data['objectives'])
-            document.add_heading('In-Scope Targets', level=2)
-            document.add_paragraph(report_data['in_scope'])
-            document.add_heading('Out-of-Scope & Restrictions', level=2)
-            document.add_paragraph(report_data['out_of_scope'])
-            document.add_heading('Points of Contact', level=2)
-            document.add_paragraph(report_data['pocs'])
-
-            # --- Summary Section ---
-            document.add_heading('Executive Summary', level=1)
-            document.add_paragraph(report_data['summary'])
-
-            # --- AI Content Section ---
-            if report_data['ai_content']:
-                document.add_heading('AI-Generated Analysis', level=1)
-                document.add_paragraph(report_data['ai_content'])
-
-            # --- Findings Section ---
-            document.add_heading('Technical Findings', level=1)
-            if not report_data['findings']:
-                document.add_paragraph("No technical findings were aggregated.")
-            else:
-                table = document.add_table(rows=1, cols=4)
-                table.style = 'Table Grid'
-                hdr_cells = table.rows[0].cells
-                hdr_cells[0].text = 'Host'
-                hdr_cells[1].text = 'Port/Service'
-                hdr_cells[2].text = 'Vulnerability/Finding'
-                hdr_cells[3].text = 'Details (CVE/Exploit)'
-
-                for finding in report_data['findings']:
-                    row_cells = table.add_row().cells
-                    row_cells[0].text = finding['host']
-                    row_cells[1].text = finding['service']
-                    row_cells[2].text = finding['finding']
-                    row_cells[3].text = finding['details']
-
-            document.save(file_path)
-            q.put(('report_finished', True, file_path))
-
-        except Exception as e:
-            logging.error(f"Error during DOCX report generation: {e}", exc_info=True)
-            q.put(('report_finished', False, str(e)))
-        finally:
-            q.put(('tool_finished', 'docx_report')) # Custom tool name
-
-    def _handle_ai_content_generation(self):
-        """Gathers findings and AI settings to generate report content."""
-        if self.report_findings_tree.topLevelItemCount() == 0:
-            QMessageBox.warning(self, "No Data", "There are no findings to analyze. Please run the 'Aggregate & Enrich Results' tool first.")
+            QMessageBox.warning(self, "No Data", "There are no findings to summarize. Please run the 'Aggregate & Enrich Results' tool first.")
             return
 
         findings_text = ""
@@ -10285,31 +10012,21 @@ class GScapy(QMainWindow):
             details = item.text(3)
             findings_text += f"- Host: {host}, Service: {service}, Finding: {finding}\n  Details: {details}\n\n"
 
-        persona = self.ai_persona_combo.currentText()
-        custom_instructions = self.ai_custom_instructions_edit.text()
-
         prompt = (
-            f"You are a cybersecurity expert writing a penetration test report. Your target audience is: **{persona}**. "
-            "Please analyze the following penetration testing findings and write a relevant report section. "
-        )
-        if custom_instructions:
-            prompt += f"Follow these specific instructions: **{custom_instructions}**. "
-
-        prompt += (
-            "Do not just list the findings; synthesize them into a coherent narrative appropriate for the audience. "
-            "For an executive, focus on business risk and impact. For a technical manager, focus on root causes and remediation strategy. "
-            "For an analyst, provide deep technical detail and actionable steps.\n\n"
+            "Based on the following list of penetration testing findings, please write a concise executive summary "
+            "suitable for a non-technical audience. Focus on the overall risk posture, key areas of weakness, "
+            "and high-level recommendations. The summary should be a few paragraphs long.\n\n"
             f"--- FINDINGS ---\n{findings_text}--- END FINDINGS ---"
         )
 
-        def _populate_ai_content(generated_text):
-            self.ai_generated_text.setPlainText(generated_text)
-            QMessageBox.information(self, "Success", "AI-generated content is ready.")
+        def _populate_summary(generated_text):
+            self.report_summary_text.setPlainText(generated_text)
+            QMessageBox.information(self, "Success", "AI-generated summary has been populated.")
 
-        self.ai_assistant_tab.set_completion_callback(_populate_ai_content)
+        self.ai_assistant_tab.set_completion_callback(_populate_summary)
         self.ai_assistant_tab.send_message(prompt)
         self.tab_widget.setCurrentWidget(self.ai_assistant_tab)
-        QMessageBox.information(self, "AI Task Started", "The AI is generating content. You will be notified upon completion. You can watch the progress in the 'AI Assistant' tab.")
+        QMessageBox.information(self, "AI Task Started", "The AI is generating the summary. You will be notified upon completion. You can watch the progress in the 'AI Assistant' tab.")
 
     def _create_lab_tab(self):
         """Creates the UI for the LAB / Test Chaining tab."""

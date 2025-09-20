@@ -63,6 +63,30 @@ class AdminPanelDialog(QDialog):
         main_splitter.setSizes([400, 200])
         self.main_layout.addWidget(main_splitter)
 
+        # --- History Section ---
+        history_box = QGroupBox("User Activity Log")
+        history_layout = QVBoxLayout(history_box)
+
+        history_controls_layout = QHBoxLayout()
+        history_controls_layout.addWidget(QLabel("View history for:"))
+        self.history_user_combo = QComboBox()
+        history_controls_layout.addWidget(self.history_user_combo)
+        self.delete_log_btn = QPushButton("Delete Selected Log Entry")
+        history_controls_layout.addWidget(self.delete_log_btn)
+        history_controls_layout.addStretch()
+        history_layout.addLayout(history_controls_layout)
+
+        self.history_tree = QTreeWidget()
+        self.history_tree.setColumnCount(3)
+        self.history_tree.setHeaderLabels(["Date/Time", "Action", "Summary"])
+        self.history_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.history_tree.header().setStretchLastSection(True)
+        history_layout.addWidget(self.history_tree)
+
+        self.main_layout.addWidget(history_box)
+        # --- End History Section ---
+
+
         self.refresh_btn = QPushButton("Refresh User List")
         self.main_layout.addWidget(self.refresh_btn)
 
@@ -70,6 +94,8 @@ class AdminPanelDialog(QDialog):
         self.reset_password_btn.clicked.connect(self._reset_user_password)
         self.save_profile_btn.clicked.connect(self._save_profile)
         self.refresh_btn.clicked.connect(self._populate_users)
+        self.history_user_combo.currentIndexChanged.connect(self._on_history_user_changed)
+        self.delete_log_btn.clicked.connect(self._delete_selected_log)
 
         self._set_editing_widgets_enabled(False)
 
@@ -100,11 +126,15 @@ class AdminPanelDialog(QDialog):
 
     def _populate_users(self):
         self.user_tree.clear()
+        self.history_user_combo.clear()
+        self.history_tree.clear()
         self._clear_profile_fields()
         self._set_editing_widgets_enabled(False)
         try:
             users = database.get_all_users()
+            self.history_user_combo.addItem("Select a user...", -1)
             for user in users:
+                self.history_user_combo.addItem(user['username'], user['id'])
                 item = QTreeWidgetItem([
                     str(user['id']),
                     user['username'],
@@ -222,3 +252,64 @@ class AdminPanelDialog(QDialog):
                  QMessageBox.critical(self, "Database Error", f"Failed to reset password: {e}")
         else:
             QMessageBox.information(self, "Cancelled", "Password reset was cancelled.")
+
+    def _on_history_user_changed(self, index):
+        """Loads and displays the activity log for the selected user."""
+        self.history_tree.clear()
+        user_id = self.history_user_combo.itemData(index)
+
+        if user_id is None or user_id == -1:
+            return
+
+        try:
+            history_records = database.get_history_for_user(user_id)
+            for record in history_records:
+                timestamp = record['timestamp']
+                action = record['activity_type']
+                details = record['details']
+                full_data = record['full_data']
+                log_id = record['id']
+
+                main_item = QTreeWidgetItem([timestamp, action, details])
+                main_item.setData(0, Qt.ItemDataRole.UserRole, log_id) # Store log ID
+                self.history_tree.addTopLevelItem(main_item)
+
+                if full_data:
+                    try:
+                        pretty_json = json.dumps(json.loads(full_data), indent=2)
+                        child_item = QTreeWidgetItem(["Full Data:", pretty_json])
+                        main_item.addChild(child_item)
+                    except (json.JSONDecodeError, TypeError):
+                        child_item = QTreeWidgetItem(["Raw Data:", full_data])
+                        main_item.addChild(child_item)
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Could not load history for selected user: {e}")
+
+    def _delete_selected_log(self):
+        """Deletes the selected log entry from the database."""
+        selected_items = self.history_tree.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select a log entry to delete.")
+            return
+
+        log_item = selected_items[0]
+        # Traverse up to the top-level item if a child is selected
+        while log_item.parent():
+            log_item = log_item.parent()
+
+        log_id = log_item.data(0, Qt.ItemDataRole.UserRole)
+        if log_id is None:
+            QMessageBox.critical(self, "Error", "Could not identify the selected log entry.")
+            return
+
+        reply = QMessageBox.question(self, "Confirm Deletion", "Are you sure you want to permanently delete this log entry?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                database.delete_history_record(log_id)
+                QMessageBox.information(self, "Success", "Log entry deleted.")
+                # Refresh the view
+                self._on_history_user_changed(self.history_user_combo.currentIndex())
+            except Exception as e:
+                QMessageBox.critical(self, "Database Error", f"Failed to delete log entry: {e}")
