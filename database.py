@@ -284,6 +284,33 @@ def update_user_profile(user_id, full_name, age, job_title):
     conn.commit()
     conn.close()
 
+def update_user_username(user_id, new_username):
+    """Updates the username for a given user, checking for uniqueness."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # This will raise sqlite3.IntegrityError if the username already exists,
+    # which can be caught by the calling UI function.
+    cursor.execute("UPDATE users SET username = ? WHERE id = ?", (new_username, user_id))
+    conn.commit()
+    conn.close()
+
+def update_user_email(user_id, new_email):
+    """Updates the email for a given user, checking for uniqueness."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # This will raise sqlite3.IntegrityError if the email already exists.
+    cursor.execute("UPDATE users SET email = ? WHERE id = ?", (new_email, user_id))
+    conn.commit()
+    conn.close()
+
+def update_user_avatar(user_id, avatar_data):
+    """Updates the avatar for a given user."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET avatar = ? WHERE id = ?", (avatar_data, user_id))
+    conn.commit()
+    conn.close()
+
 def set_user_active_status(user_id, is_active):
     """Updates the is_active status for a given user."""
     conn = get_db_connection()
@@ -343,6 +370,48 @@ def verify_security_answers(user_id, answers_dict):
 
     conn.close()
     return True # All answers were correct
+
+def log_test_to_history(user_id, test_type, target, results):
+    """Logs a completed test or action to the history table."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO test_history (user_id, test_type, target, results)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, test_type, target, results))
+    conn.commit()
+    conn.close()
+
+def get_test_history(user_id=None):
+    """
+    Retrieves test history.
+    If user_id is provided, fetches for a specific user.
+    Otherwise, fetches all history for all users (admin view).
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if user_id:
+        # For a specific user, we don't need to join with the users table
+        cursor.execute("SELECT id, timestamp, 'N/A' as username, test_type, target, results FROM test_history WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
+    else:
+        # For the admin view, we want to join to get the username
+        cursor.execute("""
+            SELECT h.id, h.timestamp, u.username, h.test_type, h.target, h.results
+            FROM test_history h
+            JOIN users u ON h.user_id = u.id
+            ORDER BY h.timestamp DESC
+        """)
+    history = cursor.fetchall()
+    conn.close()
+    return history
+
+def delete_history_entry(entry_id):
+    """Deletes a specific entry from the test history table."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM test_history WHERE id = ?", (entry_id,))
+    conn.commit()
+    conn.close()
 
 def initialize_database():
     """

@@ -83,7 +83,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QSplitter, QFileDialog, QMessageBox, QComboBox,
     QListWidget, QListWidgetItem, QScrollArea, QLineEdit, QCheckBox, QFrame, QMenu, QTextEdit, QGroupBox,
     QProgressBar, QTextBrowser, QRadioButton, QButtonGroup, QFormLayout, QGridLayout, QDialog,
-    QHeaderView, QInputDialog, QGraphicsOpacityEffect, QStackedWidget
+    QHeaderView, QInputDialog, QGraphicsOpacityEffect, QStackedWidget, QToolButton
 )
 from ai_tab import AIAssistantTab, AISettingsDialog, AIGuideDialog
 from login import LoginDialog
@@ -1210,6 +1210,8 @@ class GScapy(QMainWindow):
         self.sniffer_buffer_lock = Lock()
         self.super_scan_active = False
         self.lab_test_chain = []
+        self.threat_intel_loaded = False
+        self.history_loaded = False
         # self.tool_config_widgets is no longer used.
 
         self.nmap_script_presets = {
@@ -1238,6 +1240,7 @@ class GScapy(QMainWindow):
         # Config widgets are now created inside their respective tool tabs.
 
         self._create_main_tabs(); self._create_log_panel(); self._setup_logging()
+        self.tab_widget.currentChanged.connect(self._on_main_tab_changed)
 
         self._setup_result_handlers()
         self.results_processor = QTimer(self); self.results_processor.timeout.connect(self._process_tool_results); self.results_processor.start(100)
@@ -1645,6 +1648,7 @@ class GScapy(QMainWindow):
         self.tab_widget.addTab(self.ai_assistant_tab, QIcon("icons/terminal.svg"), "AI Assistant")
 
         self.tab_widget.addTab(self._create_threat_intelligence_tab(), QIcon("icons/database.svg"), "Threat Intelligence")
+        self.tab_widget.addTab(self._create_history_tab(), QIcon("icons/file-text.svg"), "History")
 
         self.tab_widget.addTab(self._create_community_tools_tab(), QIcon("icons/users.svg"), "Community Tools")
         self.tab_widget.addTab(self._create_system_info_tab(), QIcon("icons/info.svg"), "System Info")
@@ -1656,6 +1660,71 @@ class GScapy(QMainWindow):
         threat_tabs.addTab(self._create_exploit_db_search_tab(), "Exploit-DB Search")
         return threat_tabs
 
+    def _create_history_tab(self):
+        """Creates the UI for the user's personal test history."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        controls_layout = QHBoxLayout()
+        self.refresh_history_btn = QPushButton(QIcon("icons/refresh-cw.svg"), " Refresh History")
+        self.refresh_history_btn.clicked.connect(self._populate_history_tab)
+        controls_layout.addWidget(self.refresh_history_btn)
+        controls_layout.addStretch()
+        layout.addLayout(controls_layout)
+
+        self.history_tree = QTreeWidget()
+        self.history_tree.setColumnCount(4)
+        self.history_tree.setHeaderLabels(["Timestamp", "Test Type", "Target", "Result Summary"])
+        self.history_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.history_tree.header().setStretchLastSection(True)
+        self.history_tree.header().resizeSection(0, 180)
+        self.history_tree.header().resizeSection(1, 150)
+        self.history_tree.header().resizeSection(2, 200)
+        layout.addWidget(self.history_tree)
+
+        return widget
+
+    def _populate_history_tab(self):
+        """Fetches and displays the current user's test history."""
+        if not self.current_user:
+            return
+        self.history_tree.clear()
+        try:
+            # The user_id is passed to get history for the current user only
+            history_records = database.get_test_history(self.current_user['id'])
+            for record in history_records:
+                # The 'results' column can be long, so we'll show a summary.
+                summary = (record['results'] or "").split('\n')[0]
+                summary = (summary[:100] + '...') if len(summary) > 100 else summary
+
+                item = QTreeWidgetItem([
+                    record['timestamp'],
+                    record['test_type'],
+                    record['target'],
+                    summary
+                ])
+                # Store the full result in the item for potential future detail view
+                item.setData(0, Qt.ItemDataRole.UserRole, record['results'])
+                self.history_tree.addTopLevelItem(item)
+        except Exception as e:
+            logging.error(f"Failed to populate history tab: {e}", exc_info=True)
+            QMessageBox.critical(self, "History Error", f"Could not load test history: {e}")
+
+    def _on_main_tab_changed(self, index):
+        """Handler for when the main tab is changed, to auto-load data."""
+        try:
+            tab_text = self.tab_widget.tabText(index)
+            if tab_text == "Threat Intelligence" and not self.threat_intel_loaded:
+                logging.info("Threat Intelligence tab opened for the first time. Auto-fetching CVEs.")
+                self.threat_intel_loaded = True
+                self._start_fetch_threats()
+            elif tab_text == "History" and not self.history_loaded:
+                logging.info("History tab opened for the first time. Auto-populating.")
+                self.history_loaded = True
+                self._populate_history_tab()
+        except Exception as e:
+            logging.error(f"Error in _on_main_tab_changed: {e}")
+
     def _create_recent_threats_tab(self):
         """Creates the UI for displaying recent CVEs with pagination."""
         widget = QWidget()
@@ -1663,7 +1732,8 @@ class GScapy(QMainWindow):
 
         # --- Controls ---
         controls_layout = QHBoxLayout()
-        self.fetch_threats_btn = QPushButton("Fetch Latest 30 CVEs")
+        self.fetch_threats_btn = QPushButton(QIcon("icons/refresh-cw.svg"), " Refresh")
+        self.fetch_threats_btn.setToolTip("Fetch the latest CVEs. This is done automatically on first view.")
         controls_layout.addWidget(self.fetch_threats_btn)
         controls_layout.addStretch()
         controls_layout.addWidget(QLabel("Items per page:"))
@@ -2419,7 +2489,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.nmap_output_console.clear()
 
-        self.worker = WorkerThread(self._nmap_scan_thread, args=(command,))
+        self.worker = WorkerThread(self._nmap_scan_thread, args=(command, target))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -2472,10 +2542,11 @@ class GScapy(QMainWindow):
             logging.error(f"Failed to generate or save Nmap report: {e}", exc_info=True)
             QMessageBox.critical(self, "Report Generation Error", f"An unexpected error occurred:\n{e}")
 
-    def _nmap_scan_thread(self, command):
+    def _nmap_scan_thread(self, command, target):
         q = self.tool_results_queue
         logging.info(f"Starting Nmap scan with command: {' '.join(command)}")
         q.put(('nmap_output', f"$ {' '.join(command)}\n\n"))
+        xml_content = ""
 
         try:
             startupinfo = None
@@ -2516,7 +2587,7 @@ class GScapy(QMainWindow):
                     os.remove(self.nmap_xml_temp_file)
                     self.nmap_xml_temp_file = None
 
-            q.put(('tool_finished', 'nmap_scan'))
+            q.put(('tool_finished', 'nmap_scan', target, xml_content))
             with self.thread_finish_lock:
                 self.nmap_process = None
             logging.info("Nmap scan thread finished.")
@@ -2587,7 +2658,8 @@ class GScapy(QMainWindow):
         except Exception as e:
             q.put(('error', 'Sublist3r Error', str(e)))
         finally:
-            q.put(('tool_finished', 'sublist3r_scan'))
+            results_str = "\n".join(results) if 'results' in locals() else ""
+            q.put(('tool_finished', 'sublist3r_scan', domain, results_str))
             with self.thread_finish_lock:
                 self.sublist3r_process = None
             logging.info("Sublist3r scan thread finished.")
@@ -2687,15 +2759,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.subfinder_output.clear()
 
-        self.worker = WorkerThread(self._subfinder_thread, args=(command,))
+        self.worker = WorkerThread(self._subfinder_thread, args=(command, domain))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _subfinder_thread(self, command):
+    def _subfinder_thread(self, command, domain):
         """Worker thread for running the subfinder command."""
         q = self.tool_results_queue
         logging.info(f"Starting Subfinder with command: {' '.join(command)}")
         q.put(('subfinder_output', f"$ {' '.join(command)}\n\n"))
+        results = []
 
         try:
             startupinfo = None
@@ -2721,11 +2794,6 @@ class GScapy(QMainWindow):
             process.wait()
 
             if not self.tool_stop_event.is_set():
-                domain = ""
-                for i, arg in enumerate(command):
-                    if arg == '-d' and i + 1 < len(command):
-                        domain = command[i+1]
-                        break
                 results = [line for line in full_output if domain in line and ' ' not in line and not line.startswith('$')]
                 q.put(('subdomain_results', domain, results))
 
@@ -2735,7 +2803,7 @@ class GScapy(QMainWindow):
             logging.error(f"Subfinder thread error: {e}", exc_info=True)
             q.put(('error', 'Subfinder Error', str(e)))
         finally:
-            q.put(('tool_finished', 'subfinder_scan'))
+            q.put(('tool_finished', 'subfinder_scan', domain, "\n".join(results)))
             with self.thread_finish_lock:
                 self.subfinder_process = None
             logging.info("Subfinder scan thread finished.")
@@ -2868,15 +2936,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.httpx_output.clear()
 
-        self.worker = WorkerThread(self._httpx_thread, args=(command,))
+        self.worker = WorkerThread(self._httpx_thread, args=(command, target_list))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _httpx_thread(self, command):
+    def _httpx_thread(self, command, target_list):
         """Worker thread for running the httpx command."""
         q = self.tool_results_queue
         logging.info(f"Starting httpx with command: {' '.join(command)}")
         q.put(('httpx_output', f"$ {' '.join(command)}\n\n"))
+        json_data = ""
 
         try:
             startupinfo = None
@@ -2911,7 +2980,7 @@ class GScapy(QMainWindow):
             logging.error(f"httpx thread error: {e}", exc_info=True)
             q.put(('error', 'httpx Error', str(e)))
         finally:
-            q.put(('tool_finished', 'httpx_scan'))
+            q.put(('tool_finished', 'httpx_scan', target_list, json_data))
             with self.thread_finish_lock:
                 self.httpx_process = None
             logging.info("httpx scan thread finished.")
@@ -3024,15 +3093,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.rustscan_output.clear()
 
-        self.worker = WorkerThread(self._rustscan_thread, args=(command,))
+        self.worker = WorkerThread(self._rustscan_thread, args=(command, targets))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _rustscan_thread(self, command):
+    def _rustscan_thread(self, command, targets):
         """Worker thread for running the rustscan command."""
         q = self.tool_results_queue
         logging.info(f"Starting RustScan with command: {' '.join(command)}")
         q.put(('rustscan_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -3051,6 +3121,7 @@ class GScapy(QMainWindow):
                     q.put(('rustscan_output', "\n\n--- Scan Canceled By User ---\n"))
                     break
                 q.put(('rustscan_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -3061,7 +3132,7 @@ class GScapy(QMainWindow):
             logging.error(f"RustScan thread error: {e}", exc_info=True)
             q.put(('error', 'RustScan Error', str(e)))
         finally:
-            q.put(('tool_finished', 'rustscan_scan'))
+            q.put(('tool_finished', 'rustscan_scan', targets, "".join(full_output)))
             with self.thread_finish_lock:
                 self.rustscan_process = None
             logging.info("RustScan scan thread finished.")
@@ -3193,6 +3264,7 @@ class GScapy(QMainWindow):
         q = self.tool_results_queue
         logging.info(f"Starting dirsearch with command: {' '.join(command)}")
         q.put(('dirsearch_output', f"$ {' '.join(command)}\n\n"))
+        json_data = ""
 
         try:
             startupinfo = None
@@ -3233,7 +3305,7 @@ class GScapy(QMainWindow):
             logging.error(f"dirsearch thread error: {e}", exc_info=True)
             q.put(('error', 'dirsearch Error', str(e)))
         finally:
-            q.put(('tool_finished', 'dirsearch_scan'))
+            q.put(('tool_finished', 'dirsearch_scan', url, json_data))
             with self.thread_finish_lock:
                 self.dirsearch_process = None
             logging.info("dirsearch scan thread finished.")
@@ -3361,15 +3433,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.ffuf_output_console.clear()
 
-        self.worker = WorkerThread(self._ffuf_thread, args=(command,))
+        self.worker = WorkerThread(self._ffuf_thread, args=(command, url))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _ffuf_thread(self, command):
+    def _ffuf_thread(self, command, url):
         """Worker thread for running the ffuf command."""
         q = self.tool_results_queue
         logging.info(f"Starting ffuf with command: {' '.join(command)}")
         q.put(('ffuf_output', f"$ {' '.join(command)}\n\n"))
+        json_data = ""
 
         try:
             startupinfo = None
@@ -3415,7 +3488,7 @@ class GScapy(QMainWindow):
             logging.error(f"ffuf thread error: {e}", exc_info=True)
             q.put(('error', 'ffuf Error', str(e)))
         finally:
-            q.put(('tool_finished', 'ffuf_scan'))
+            q.put(('tool_finished', 'ffuf_scan', url, json_data))
             with self.thread_finish_lock:
                 self.ffuf_process = None
             logging.info("ffuf scan thread finished.")
@@ -3553,12 +3626,13 @@ class GScapy(QMainWindow):
         q = self.tool_results_queue
         logging.info(f"Starting enum4linux-ng with command: {' '.join(command)}")
         q.put(('enum4linux_ng_output', f"$ {' '.join(command)}\n\n"))
+        json_data = ""
 
         try:
             startupinfo = None
             if sys.platform == "win32":
                 q.put(('error', 'Platform Error', 'enum4linux-ng is not supported on Windows.'))
-                q.put(('tool_finished', 'enum4linux_ng_scan'))
+                q.put(('tool_finished', 'enum4linux_ng_scan', target, "Platform not supported"))
                 return
 
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, startupinfo=startupinfo, encoding='utf-8', errors='replace')
@@ -3590,11 +3664,13 @@ class GScapy(QMainWindow):
 
         except FileNotFoundError:
             q.put(('error', 'enum4linux-ng Error', "'enum4linux-ng' command not found. Please ensure it is installed and in your system's PATH."))
+            json_data = "Tool not found"
         except Exception as e:
             logging.error(f"enum4linux-ng thread error: {e}", exc_info=True)
             q.put(('error', 'enum4linux-ng Error', str(e)))
+            json_data = f"Error: {e}"
         finally:
-            q.put(('tool_finished', 'enum4linux_ng_scan'))
+            q.put(('tool_finished', 'enum4linux_ng_scan', target, json_data))
             with self.thread_finish_lock:
                 self.enum4linux_ng_process = None
             logging.info("enum4linux-ng scan thread finished.")
@@ -3722,6 +3798,7 @@ class GScapy(QMainWindow):
         q = self.tool_results_queue
         logging.info(f"Starting dnsrecon with command: {' '.join(command)}")
         q.put(('dnsrecon_output', f"$ {' '.join(command)}\n\n"))
+        json_data = ""
 
         try:
             startupinfo = None
@@ -3758,11 +3835,13 @@ class GScapy(QMainWindow):
 
         except FileNotFoundError:
             q.put(('error', 'dnsrecon Error', "'dnsrecon' command not found. Please ensure it is installed and in your system's PATH."))
+            json_data = "Tool not found"
         except Exception as e:
             logging.error(f"dnsrecon thread error: {e}", exc_info=True)
             q.put(('error', 'dnsrecon Error', str(e)))
+            json_data = f"Error: {e}"
         finally:
-            q.put(('tool_finished', 'dnsrecon_scan'))
+            q.put(('tool_finished', 'dnsrecon_scan', domain, json_data))
             with self.thread_finish_lock:
                 self.dnsrecon_process = None
             logging.info("dnsrecon scan thread finished.")
@@ -3860,15 +3939,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.fierce_output_console.clear()
 
-        self.worker = WorkerThread(self._fierce_thread, args=(command,))
+        self.worker = WorkerThread(self._fierce_thread, args=(command, domain))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _fierce_thread(self, command):
+    def _fierce_thread(self, command, domain):
         """Worker thread for running the fierce command."""
         q = self.tool_results_queue
         logging.info(f"Starting fierce with command: {' '.join(command)}")
         q.put(('fierce_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -3887,6 +3967,7 @@ class GScapy(QMainWindow):
                     q.put(('fierce_output', "\n\n--- Scan Canceled By User ---\n"))
                     break
                 q.put(('fierce_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -3897,7 +3978,7 @@ class GScapy(QMainWindow):
             logging.error(f"fierce thread error: {e}", exc_info=True)
             q.put(('error', 'fierce Error', str(e)))
         finally:
-            q.put(('tool_finished', 'fierce_scan'))
+            q.put(('tool_finished', 'fierce_scan', domain, "".join(full_output)))
             with self.thread_finish_lock:
                 self.fierce_process = None
             logging.info("fierce scan thread finished.")
@@ -4180,7 +4261,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.nikto_output_console.clear()
 
-        self.worker = WorkerThread(self._nikto_thread, args=(command,))
+        self.worker = WorkerThread(self._nikto_thread, args=(command, target))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -4374,7 +4455,7 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.gobuster_output_console.clear()
 
-        self.worker = WorkerThread(self._gobuster_thread, args=(command,))
+        self.worker = WorkerThread(self._gobuster_thread, args=(command, url))
         self.active_threads.append(self.worker)
         self.worker.start()
 
@@ -4731,15 +4812,17 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.sqlmap_output_console.clear()
 
-        self.worker = WorkerThread(self._sqlmap_thread, args=(command,))
+        target_for_log = url if url else reqfile
+        self.worker = WorkerThread(self._sqlmap_thread, args=(command, target_for_log))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _sqlmap_thread(self, command):
+    def _sqlmap_thread(self, command, target):
         """Worker thread for running the sqlmap command."""
         q = self.tool_results_queue
         logging.info(f"Starting SQLMap with command: {' '.join(command)}")
         q.put(('sqlmap_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -4758,6 +4841,7 @@ class GScapy(QMainWindow):
                     q.put(('sqlmap_output', "\n\n--- Scan Canceled By User ---\n"))
                     break
                 q.put(('sqlmap_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -4768,7 +4852,7 @@ class GScapy(QMainWindow):
             logging.error(f"SQLMap thread error: {e}", exc_info=True)
             q.put(('error', 'SQLMap Error', str(e)))
         finally:
-            q.put(('tool_finished', 'sqlmap_scan'))
+            q.put(('tool_finished', 'sqlmap_scan', target, "".join(full_output)))
             with self.thread_finish_lock:
                 self.sqlmap_process = None
             logging.info("SQLMap scan thread finished.")
@@ -4976,15 +5060,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.hashcat_output_console.clear()
 
-        self.worker = WorkerThread(self._hashcat_thread, args=(command,))
+        self.worker = WorkerThread(self._hashcat_thread, args=(command, hashfile))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _hashcat_thread(self, command):
+    def _hashcat_thread(self, command, hashfile):
         """Worker thread for running the hashcat command."""
         q = self.tool_results_queue
         logging.info(f"Starting Hashcat with command: {' '.join(command)}")
         q.put(('hashcat_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -5003,6 +5088,7 @@ class GScapy(QMainWindow):
                     q.put(('hashcat_output', "\n\n--- Scan Canceled By User ---\n"))
                     break
                 q.put(('hashcat_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -5013,7 +5099,7 @@ class GScapy(QMainWindow):
             logging.error(f"Hashcat thread error: {e}", exc_info=True)
             q.put(('error', 'Hashcat Error', str(e)))
         finally:
-            q.put(('tool_finished', 'hashcat_scan'))
+            q.put(('tool_finished', 'hashcat_scan', hashfile, "".join(full_output)))
             with self.thread_finish_lock:
                 self.hashcat_process = None
             logging.info("Hashcat scan thread finished.")
@@ -5192,15 +5278,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.nuclei_output_console.clear()
 
-        self.worker = WorkerThread(self._nuclei_thread, args=(command,))
+        self.worker = WorkerThread(self._nuclei_thread, args=(command, target))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _nuclei_thread(self, command):
+    def _nuclei_thread(self, command, target):
         """Worker thread for running the nuclei command."""
         q = self.tool_results_queue
         logging.info(f"Starting Nuclei with command: {' '.join(command)}")
         q.put(('nuclei_output', f"$ {' '.join(command)}\n\n"))
+        json_data = ""
 
         try:
             startupinfo = None
@@ -5237,7 +5324,7 @@ class GScapy(QMainWindow):
             logging.error(f"Nuclei thread error: {e}", exc_info=True)
             q.put(('error', 'Nuclei Error', str(e)))
         finally:
-            q.put(('tool_finished', 'nuclei_scan'))
+            q.put(('tool_finished', 'nuclei_scan', target, json_data))
             with self.thread_finish_lock:
                 self.nuclei_process = None
             logging.info("Nuclei scan thread finished.")
@@ -5377,15 +5464,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.trufflehog_output_console.clear()
 
-        self.worker = WorkerThread(self._trufflehog_thread, args=(command,))
+        self.worker = WorkerThread(self._trufflehog_thread, args=(command, target))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _trufflehog_thread(self, command):
+    def _trufflehog_thread(self, command, target):
         """Worker thread for running the trufflehog command."""
         q = self.tool_results_queue
         logging.info(f"Starting TruffleHog with command: {' '.join(command)}")
         q.put(('trufflehog_output', f"$ {' '.join(command)}\n\n"))
+        json_data = ""
 
         try:
             startupinfo = None
@@ -5421,7 +5509,7 @@ class GScapy(QMainWindow):
             logging.error(f"TruffleHog thread error: {e}", exc_info=True)
             q.put(('error', 'TruffleHog Error', str(e)))
         finally:
-            q.put(('tool_finished', 'trufflehog_scan'))
+            q.put(('tool_finished', 'trufflehog_scan', target, json_data))
             with self.thread_finish_lock:
                 self.trufflehog_process = None
             logging.info("TruffleHog scan thread finished.")
@@ -5549,15 +5637,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.jtr_output_console.clear()
 
-        self.worker = WorkerThread(self._jtr_thread, args=(command,))
+        self.worker = WorkerThread(self._jtr_thread, args=(command, hash_file))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _jtr_thread(self, command):
+    def _jtr_thread(self, command, hash_file):
         """Worker thread for running the john command."""
         q = self.tool_results_queue
         logging.info(f"Starting JTR with command: {' '.join(command)}")
         q.put(('jtr_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -5576,6 +5665,7 @@ class GScapy(QMainWindow):
                     q.put(('jtr_output', "\n\n--- Canceled By User ---\n"))
                     break
                 q.put(('jtr_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -5586,7 +5676,7 @@ class GScapy(QMainWindow):
             logging.error(f"JTR thread error: {e}", exc_info=True)
             q.put(('error', 'JTR Error', str(e)))
         finally:
-            q.put(('tool_finished', 'jtr_scan'))
+            q.put(('tool_finished', 'jtr_scan', hash_file, "".join(full_output)))
             with self.thread_finish_lock:
                 self.jtr_process = None
             logging.info("JTR scan thread finished.")
@@ -5715,15 +5805,17 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.hydra_output_console.clear()
 
-        self.worker = WorkerThread(self._hydra_thread, args=(command,))
+        target_str = f"{service}://{target}"
+        self.worker = WorkerThread(self._hydra_thread, args=(command, target_str))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _hydra_thread(self, command):
+    def _hydra_thread(self, command, target):
         """Worker thread for running the hydra command."""
         q = self.tool_results_queue
         logging.info(f"Starting Hydra with command: {' '.join(command)}")
         q.put(('hydra_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -5742,6 +5834,7 @@ class GScapy(QMainWindow):
                     q.put(('hydra_output', "\n\n--- Canceled By User ---\n"))
                     break
                 q.put(('hydra_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -5752,7 +5845,7 @@ class GScapy(QMainWindow):
             logging.error(f"Hydra thread error: {e}", exc_info=True)
             q.put(('error', 'Hydra Error', str(e)))
         finally:
-            q.put(('tool_finished', 'hydra_scan'))
+            q.put(('tool_finished', 'hydra_scan', target, "".join(full_output)))
             with self.thread_finish_lock:
                 self.hydra_process = None
             logging.info("Hydra scan thread finished.")
@@ -5866,6 +5959,7 @@ class GScapy(QMainWindow):
         q = self.tool_results_queue
         logging.info(f"Starting Sherlock with command: {' '.join(command)}")
         q.put(('sherlock_output', f"$ {' '.join(command)}\n\n"))
+        csv_data = ""
 
         try:
             startupinfo = None
@@ -5891,7 +5985,6 @@ class GScapy(QMainWindow):
             if not self.tool_stop_event.is_set():
                 try:
                     # Find the first CSV file in the temp directory
-                    csv_data = ""
                     for filename in os.listdir(self.sherlock_temp_dir):
                         if filename.endswith(".csv"):
                             with open(os.path.join(self.sherlock_temp_dir, filename), 'r', encoding='utf-8') as f:
@@ -5912,7 +6005,7 @@ class GScapy(QMainWindow):
             logging.error(f"Sherlock thread error: {e}", exc_info=True)
             q.put(('error', 'Sherlock Error', str(e)))
         finally:
-            q.put(('tool_finished', 'sherlock_scan'))
+            q.put(('tool_finished', 'sherlock_scan', usernames, csv_data))
             with self.thread_finish_lock:
                 self.sherlock_process = None
             logging.info("Sherlock scan thread finished.")
@@ -6007,15 +6100,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.spiderfoot_output_console.clear()
 
-        self.worker = WorkerThread(self._spiderfoot_thread, args=(command,))
+        self.worker = WorkerThread(self._spiderfoot_thread, args=(command, target))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _spiderfoot_thread(self, command):
+    def _spiderfoot_thread(self, command, target):
         """Worker thread for running the spiderfoot-cli command."""
         q = self.tool_results_queue
         logging.info(f"Starting Spiderfoot with command: {' '.join(command)}")
         q.put(('spiderfoot_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -6034,6 +6128,7 @@ class GScapy(QMainWindow):
                     q.put(('spiderfoot_output', "\n\n--- Scan Canceled By User ---\n"))
                     break
                 q.put(('spiderfoot_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -6044,7 +6139,7 @@ class GScapy(QMainWindow):
             logging.error(f"Spiderfoot thread error: {e}", exc_info=True)
             q.put(('error', 'Spiderfoot Error', str(e)))
         finally:
-            q.put(('tool_finished', 'spiderfoot_scan'))
+            q.put(('tool_finished', 'spiderfoot_scan', target, "".join(full_output)))
             with self.thread_finish_lock:
                 self.spiderfoot_process = None
             logging.info("Spiderfoot scan thread finished.")
@@ -6173,15 +6268,16 @@ class GScapy(QMainWindow):
         self.tool_stop_event.clear()
         self.masscan_output_console.clear()
 
-        self.worker = WorkerThread(self._masscan_thread, args=(command,))
+        self.worker = WorkerThread(self._masscan_thread, args=(command, target))
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _masscan_thread(self, command):
+    def _masscan_thread(self, command, target):
         """Worker thread for running the masscan command."""
         q = self.tool_results_queue
         logging.info(f"Starting Masscan with command: {' '.join(command)}")
         q.put(('masscan_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -6201,6 +6297,7 @@ class GScapy(QMainWindow):
                     q.put(('masscan_output', "\n\n--- Scan Canceled By User ---\n"))
                     break
                 q.put(('masscan_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -6211,7 +6308,7 @@ class GScapy(QMainWindow):
             logging.error(f"Masscan thread error: {e}", exc_info=True)
             q.put(('error', 'Masscan Error', str(e)))
         finally:
-            q.put(('tool_finished', 'masscan_scan'))
+            q.put(('tool_finished', 'masscan_scan', target, "".join(full_output)))
             with self.thread_finish_lock:
                 self.masscan_process = None
             logging.info("Masscan scan thread finished.")
@@ -6254,11 +6351,12 @@ class GScapy(QMainWindow):
                 self.whatweb_process = None
             logging.info("WhatWeb scan thread finished.")
 
-    def _gobuster_thread(self, command):
+    def _gobuster_thread(self, command, url):
         """Worker thread for running the gobuster command."""
         q = self.tool_results_queue
         logging.info(f"Starting Gobuster with command: {' '.join(command)}")
         q.put(('gobuster_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -6277,6 +6375,7 @@ class GScapy(QMainWindow):
                     q.put(('gobuster_output', "\n\n--- Scan Canceled By User ---\n"))
                     break
                 q.put(('gobuster_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -6287,16 +6386,17 @@ class GScapy(QMainWindow):
             logging.error(f"Gobuster thread error: {e}", exc_info=True)
             q.put(('error', 'Gobuster Error', str(e)))
         finally:
-            q.put(('tool_finished', 'gobuster_scan'))
+            q.put(('tool_finished', 'gobuster_scan', url, "".join(full_output)))
             with self.thread_finish_lock:
                 self.gobuster_process = None
             logging.info("Gobuster scan thread finished.")
 
-    def _nikto_thread(self, command):
+    def _nikto_thread(self, command, target):
         """Worker thread for running the nikto command."""
         q = self.tool_results_queue
         logging.info(f"Starting Nikto with command: {' '.join(command)}")
         q.put(('nikto_output', f"$ {' '.join(command)}\n\n"))
+        full_output = []
 
         try:
             startupinfo = None
@@ -6315,6 +6415,7 @@ class GScapy(QMainWindow):
                     q.put(('nikto_output', "\n\n--- Scan Canceled By User ---\n"))
                     break
                 q.put(('nikto_output', line))
+                full_output.append(line)
 
             process.stdout.close()
             process.wait()
@@ -6325,7 +6426,7 @@ class GScapy(QMainWindow):
             logging.error(f"Nikto thread error: {e}", exc_info=True)
             q.put(('error', 'Nikto Error', str(e)))
         finally:
-            q.put(('tool_finished', 'nikto_scan'))
+            q.put(('tool_finished', 'nikto_scan', target, "".join(full_output)))
             with self.thread_finish_lock:
                 self.nikto_process = None
             logging.info("Nikto scan thread finished.")
@@ -7847,9 +7948,14 @@ class GScapy(QMainWindow):
     def _traceroute_thread(self,t):
         q=self.tool_results_queue; iface=self.get_selected_iface()
         logging.info(f"Traceroute thread started for target: {t} on iface: {iface}")
+        results = []
         try:
             q.put(('trace_status',f"Resolving {t}...")); dest_ip=socket.gethostbyname(t)
-            q.put(('trace_clear',)); q.put(('trace_result',("",f"Traceroute to {t} ({dest_ip})","","")))
+            q.put(('trace_clear',));
+            initial_msg = ("",f"Traceroute to {t} ({dest_ip})","","")
+            q.put(('trace_result', initial_msg))
+            results.append(initial_msg)
+
             for i in range(1,30):
                 if self.tool_stop_event.is_set():
                     q.put(('trace_status', "Traceroute Canceled."))
@@ -7857,16 +7963,26 @@ class GScapy(QMainWindow):
                 q.put(('trace_status',f"Sending probe to TTL {i}"))
                 pkt=IP(dst=dest_ip,ttl=i)/UDP(dport=33434)
                 st=time.time(); reply=sr1(pkt,timeout=2,iface=iface); rtt=(time.time()-st)*1000
-                if reply is None: q.put(('trace_result',(i,"* * *","Timeout","")))
+
+                if reply is None:
+                    result_tuple = (i,"* * *","Timeout","")
                 else:
                     h_ip=reply.src
                     try: h_name,_,_=socket.gethostbyaddr(h_ip)
                     except socket.herror: h_name="Unknown"
-                    q.put(('trace_result',(i,h_ip,h_name,f"{rtt:.2f}")))
-                    if reply.type==3 or h_ip==dest_ip: q.put(('trace_status',"Trace Complete.")); break
+                    result_tuple = (i,h_ip,h_name,f"{rtt:.2f}")
+
+                q.put(('trace_result', result_tuple))
+                results.append(result_tuple)
+                if reply and (reply.type==3 or h_ip==dest_ip):
+                    q.put(('trace_status',"Trace Complete."))
+                    break
             else: q.put(('trace_status',"Trace Finished (Max hops reached)."))
         except Exception as e: logging.error("Exception in traceroute thread",exc_info=True); q.put(('error',"Traceroute Error",str(e)))
-        finally: q.put(('tool_finished','traceroute')); logging.info("Traceroute thread finished.")
+        finally:
+            results_str = "\n".join([f"{hop} - {ip} - {name} - {rtt}ms" for hop, ip, name, rtt in results])
+            q.put(('tool_finished','traceroute', t, results_str))
+            logging.info("Traceroute thread finished.")
 
     def start_port_scan(self):
         """Starts the port scanner worker thread."""
@@ -7967,7 +8083,10 @@ class GScapy(QMainWindow):
                 q.put(('scan_status',"Scan Complete."))
                 q.put(('show_port_scan_popup', scan_results, t)) # New message for popup
         except Exception as e: logging.error("Exception in port scan thread",exc_info=True); q.put(('error',"Scan Error",str(e)))
-        finally: q.put(('tool_finished','scanner')); logging.info("Port scan thread finished.")
+        finally:
+            results_str = "\n".join([f"{p} - {s} - {svc}" for p, s, svc in scan_results])
+            q.put(('tool_finished','scanner', t, results_str));
+            logging.info("Port scan thread finished.")
 
     def start_arp_scan(self):
         """Starts the ARP scan worker thread."""
@@ -8003,7 +8122,10 @@ class GScapy(QMainWindow):
             q.put(('show_arp_scan_popup', popup_results, t)) # New message for popup
 
         except Exception as e: logging.error("Exception in ARP scan thread",exc_info=True); q.put(('error',"ARP Scan Error",str(e)))
-        finally: q.put(('tool_finished','arp_scan')); logging.info("ARP scan thread finished.")
+        finally:
+            results_str = "\n".join([f"{res['ip']} - {res['mac']} - {res['vendor']}" for res in popup_results])
+            q.put(('tool_finished','arp_scan', t, results_str))
+            logging.info("ARP scan thread finished.")
 
     def _create_arp_scan_cli_tool(self):
         """Creates the UI for the arp-scan CLI tool."""
@@ -8385,6 +8507,7 @@ class GScapy(QMainWindow):
     def _firewall_test_thread(self,t,ps_name):
         q=self.tool_results_queue; iface=self.get_selected_iface()
         logging.info(f"Firewall test thread started for target {t}, probe set {ps_name}")
+        results = []
         try:
             q.put(('fw_clear',)); q.put(('fw_status',f"Testing {ps_name}..."))
             probe_set = FIREWALL_PROBES[ps_name]
@@ -8403,10 +8526,15 @@ class GScapy(QMainWindow):
                     resp = sr1(pkt, timeout=2, iface=iface, verbose=0)
 
                 result = "Responded" if resp is not None else "No Response / Blocked"
-                q.put(('fw_result',(desc, pkt_summary, result)))
+                result_tuple = (desc, pkt_summary, result)
+                q.put(('fw_result', result_tuple))
+                results.append(result_tuple)
             q.put(('fw_status',"Firewall Test Complete."))
         except Exception as e: logging.error("Exception in firewall test thread",exc_info=True); q.put(('error',"Firewall Test Error",str(e)))
-        finally: q.put(('tool_finished','fw_tester')); logging.info("Firewall test thread finished.")
+        finally:
+            results_str = "\n".join([f"{desc} - {summary} - {res}" for desc, summary, res in results])
+            q.put(('tool_finished','fw_tester', t, results_str))
+            logging.info("Firewall test thread finished.")
 
     def start_wifi_scan(self):
         """Starts the Wi-Fi scanner and channel hopper threads."""
@@ -9359,6 +9487,167 @@ class GScapy(QMainWindow):
             logging.error(f"Error during report generation: {e}", exc_info=True)
             q.put(('report_finished', False, str(e)))
 
+    def _gather_report_data(self):
+        """Gathers all data from the reporting UI fields into a dictionary."""
+        if self.report_findings_tree.topLevelItemCount() == 0:
+            QMessageBox.warning(self, "No Data", "There are no findings to report. Please run the 'Aggregate & Enrich Results' tool first.")
+            return None
+
+        report_data = {
+            "client_name": self.report_client_name.text(),
+            "assessment_dates": self.report_assessment_dates.text(),
+            "objectives": self.report_objectives.toPlainText(),
+            "in_scope": self.report_in_scope.toPlainText(),
+            "out_of_scope": self.report_out_of_scope.toPlainText(),
+            "summary": self.report_summary_text.toPlainText(),
+            "findings": []
+        }
+
+        for i in range(self.report_findings_tree.topLevelItemCount()):
+            item = self.report_findings_tree.topLevelItem(i)
+            report_data["findings"].append({
+                "host": item.text(0),
+                "service": item.text(1),
+                "finding": item.text(2),
+                "details": item.text(3)
+            })
+        return report_data
+
+    def _handle_generate_doc_report(self, file_format):
+        """Handles the generation of reports in different document formats."""
+        report_data = self._gather_report_data()
+        if not report_data:
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, f"Save Report as {file_format.upper()}", f"GScapy_Report.{file_format}", f"{file_format.upper()} Files (*.{file_format})", options=QFileDialog.Option.DontUseNativeDialog)
+        if not file_path:
+            return
+
+        self.status_bar.showMessage(f"Generating {file_format.upper()} report...")
+
+        try:
+            if file_format == 'docx':
+                self._export_report_to_docx(report_data, file_path)
+            elif file_format == 'pdf':
+                self._export_report_to_pdf(report_data, file_path)
+
+            QMessageBox.information(self, "Success", f"Report successfully saved to:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to generate {file_format.upper()} report: {e}")
+        finally:
+            self.status_bar.showMessage("Report generation finished.", 5000)
+
+    def _export_report_to_docx(self, data, file_path):
+        """Exports the structured report data to a DOCX file."""
+        document = docx.Document()
+        document.add_heading(f"Penetration Test Report: {data['client_name']}", 0)
+
+        document.add_heading("Executive Summary", level=1)
+        document.add_paragraph(data['summary'])
+
+        document.add_heading("Scope", level=1)
+        document.add_paragraph(f"Assessment Dates: {data['assessment_dates']}")
+        document.add_heading("Objectives", level=2)
+        document.add_paragraph(data['objectives'])
+        document.add_heading("In-Scope Targets", level=2)
+        document.add_paragraph(data['in_scope'])
+        document.add_heading("Out-of-Scope Targets", level=2)
+        document.add_paragraph(data['out_of_scope'])
+
+        document.add_heading("Detailed Findings", level=1)
+        table = document.add_table(rows=1, cols=4)
+        table.style = 'Table Grid'
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = 'Host'
+        hdr_cells[1].text = 'Service'
+        hdr_cells[2].text = 'Finding'
+        hdr_cells[3].text = 'Details'
+
+        for finding in data['findings']:
+            row_cells = table.add_row().cells
+            row_cells[0].text = finding['host']
+            row_cells[1].text = finding['service']
+            row_cells[2].text = finding['finding']
+            row_cells[3].text = finding['details']
+
+        document.save(file_path)
+
+    def _export_report_to_pdf(self, data, file_path):
+        """Exports the structured report data to a PDF file."""
+        doc = SimpleDocTemplate(file_path)
+        styles = getSampleStyleSheet()
+        elements = [Paragraph(f"Penetration Test Report: {data['client_name']}", styles['h1'])]
+
+        elements.append(Paragraph("Executive Summary", styles['h2']))
+        elements.append(Paragraph(data['summary'].replace('\n', '<br/>'), styles['BodyText']))
+
+        elements.append(Paragraph("Scope", styles['h2']))
+        elements.append(Paragraph(f"<b>Assessment Dates:</b> {data['assessment_dates']}", styles['BodyText']))
+        elements.append(Paragraph("Objectives", styles['h3']))
+        elements.append(Paragraph(data['objectives'].replace('\n', '<br/>'), styles['BodyText']))
+        elements.append(Paragraph("In-Scope Targets", styles['h3']))
+        elements.append(Paragraph(data['in_scope'].replace('\n', '<br/>'), styles['BodyText']))
+        elements.append(Paragraph("Out-of-Scope Targets", styles['h3']))
+        elements.append(Paragraph(data['out_of_scope'].replace('\n', '<br/>'), styles['BodyText']))
+
+        elements.append(Paragraph("Detailed Findings", styles['h2']))
+
+        table_data = [['Host', 'Service', 'Finding', 'Details']]
+        for f in data['findings']:
+            details_p = Paragraph(f['details'], styles['BodyText'])
+            table_data.append([f['host'], f['service'], f['finding'], details_p])
+
+        table = Table(table_data, colWidths=[1.5*inch, 1.5*inch, 2*inch, 2.5*inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0,0), (-1,0), 12),
+            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+            ('GRID', (0,0), (-1,-1), 1, colors.black)
+        ]))
+        elements.append(table)
+
+        doc.build(elements)
+
+    def _handle_ai_report_generation(self):
+        """Gathers findings and instructions, and sends them to the AI for analysis."""
+        report_data = self._gather_report_data()
+        if not report_data:
+            return
+
+        persona = self.ai_persona_combo.currentText()
+        custom_instructions = self.ai_instructions_edit.toPlainText()
+
+        findings_text = ""
+        for i, finding in enumerate(report_data['findings']):
+            findings_text += f"Finding {i+1}:\n"
+            findings_text += f"  Host: {finding['host']}\n"
+            findings_text += f"  Service: {finding['service']}\n"
+            findings_text += f"  Vulnerability: {finding['finding']}\n"
+            findings_text += f"  Details: {finding['details']}\n\n"
+
+        prompt = (
+            f"You are an AI assistant. Please analyze the following penetration testing findings from the perspective of a **{persona}**. "
+            "Your goal is to provide a detailed analysis and recommendations based on these findings.\n\n"
+        )
+
+        if custom_instructions:
+            prompt += f"Please follow these custom instructions: '{custom_instructions}'\n\n"
+
+        prompt += (
+            "--- FINDINGS ---\n"
+            f"{findings_text}"
+            "--- END FINDINGS ---\n\n"
+            "Please provide your analysis."
+        )
+
+        self.ai_assistant_tab.send_message(prompt)
+        self.tab_widget.setCurrentWidget(self.ai_assistant_tab)
+        QMessageBox.information(self, "AI Task Started", "The AI is analyzing the findings. You can see the results in the 'AI Assistant' tab.")
+
     def _query_cve_api(self, keyword):
         """Queries the NVD CVE API for a given keyword and returns a formatted string."""
         if not keyword:
@@ -9605,7 +9894,23 @@ class GScapy(QMainWindow):
                 else:
                     self.flood_status.setText("Flood complete.")
 
-    def _handle_tool_finished(self, tool):
+    def _handle_tool_finished(self, tool, target=None, results=""):
+        """
+        Handles the 'tool_finished' signal from any worker thread.
+        Resets UI state and logs the test to history if applicable.
+        """
+        # Log the action to the history database
+        if self.current_user and target is not None:
+            # Ensure results are a string and not too long for the DB
+            if not isinstance(results, str):
+                results = json.dumps(results, indent=2) # Pretty print JSON results
+
+            # Truncate long results to avoid massive DB entries
+            if len(results) > 10000: # 10KB limit
+                results = results[:10000] + "\n... (truncated)"
+
+            database.log_test_to_history(self.current_user['id'], tool, target, results)
+
         if tool == 'aggregation':
             self.report_aggregate_btn.setEnabled(True)
             self.status_bar.showMessage("Result aggregation and enrichment complete.", 5000)
@@ -9968,7 +10273,7 @@ class GScapy(QMainWindow):
 
         self.report_generate_ai_btn = QPushButton(QIcon("icons/terminal.svg"), "Generate with AI")
         self.report_generate_ai_btn.setToolTip("Use the AI Assistant to generate sections of the report based on findings.")
-        # self.report_generate_ai_btn.clicked.connect(self._handle_ai_report_generation) # Handler to be created
+        self.report_generate_ai_btn.clicked.connect(self._handle_ai_report_generation)
         ai_layout.addRow(self.report_generate_ai_btn)
         generation_layout.addWidget(ai_box)
 
@@ -9990,9 +10295,16 @@ class GScapy(QMainWindow):
         self.report_generate_html_btn.setToolTip("Compile all the information above into a final HTML report document.")
         self.report_generate_html_btn.clicked.connect(self._handle_generate_report) # Connect to existing handler for now
 
-        self.report_generate_doc_btn = QPushButton(QIcon("icons/file.svg"), "Generate Report as Doc")
-        self.report_generate_doc_btn.setToolTip("Generate the report in various document formats (DOCX, PDF, etc.).")
-        # self.report_generate_doc_btn.clicked.connect(self._handle_generate_doc_report) # Need to create this handler
+        self.report_generate_doc_btn = QToolButton()
+        self.report_generate_doc_btn.setText("Generate Document")
+        self.report_generate_doc_btn.setIcon(QIcon("icons/file.svg"))
+        self.report_generate_doc_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.report_generate_doc_btn.setToolTip("Generate the report in various document formats (e.g., DOCX, PDF).")
+
+        doc_menu = QMenu(self)
+        doc_menu.addAction("Export as DOCX", lambda: self._handle_generate_doc_report('docx'))
+        doc_menu.addAction("Export as PDF", lambda: self._handle_generate_doc_report('pdf'))
+        self.report_generate_doc_btn.setMenu(doc_menu)
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.report_generate_html_btn)

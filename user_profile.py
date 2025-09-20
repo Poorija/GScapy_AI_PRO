@@ -2,10 +2,10 @@ import os
 import logging
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QPushButton, QFileDialog,
-    QLabel, QMessageBox, QGroupBox
+    QLabel, QMessageBox, QGroupBox, QComboBox
 )
-from PyQt6.QtGui import QPixmap, QImage
-from PyQt6.QtCore import Qt, QSize, QBuffer, QIODevice
+from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QBuffer, QIODevice
 import database
 
 class UserProfileDialog(QDialog):
@@ -40,12 +40,14 @@ class UserProfileDialog(QDialog):
         self.email_edit = QLineEdit()
         self.full_name_edit = QLineEdit()
         self.age_edit = QLineEdit()
-        self.job_title_label = QLabel()
+        self.job_title_combo = QComboBox()
+        self.job_title_combo.addItems(["Red Team", "Blue Team", "Purple Team", "IT Team", "Network Team", "Manager", "Other"])
+        self.job_title_combo.setEditable(True)
         details_layout.addRow("Username:", self.username_label)
         details_layout.addRow("Email:", self.email_edit)
         details_layout.addRow("Full Name:", self.full_name_edit)
         details_layout.addRow("Age:", self.age_edit)
-        details_layout.addRow("Job Title:", self.job_title_label)
+        details_layout.addRow("Job Title:", self.job_title_combo)
         self.main_layout.addWidget(details_box)
 
         # --- Password Change Section ---
@@ -74,7 +76,7 @@ class UserProfileDialog(QDialog):
         self.full_name_edit.setText(self.user.get('full_name') or "")
         age = self.user.get('age')
         self.age_edit.setText(str(age) if age is not None else "")
-        self.job_title_label.setText(self.user.get('job_title') or "Not set")
+        self.job_title_combo.setCurrentText(self.user.get('job_title') or "")
 
         # Load avatar
         avatar_data = self.user.get('avatar')
@@ -97,25 +99,23 @@ class UserProfileDialog(QDialog):
         try:
             # --- Save Profile Info ---
             new_email = self.email_edit.text().strip()
-            if new_email != self.user.get('email'):
+            if new_email and new_email != self.user.get('email'):
                 database.update_user_email(self.user['id'], new_email)
 
             database.update_user_profile(
                 self.user['id'],
                 self.full_name_edit.text(),
                 self.age_edit.text(),
-                self.job_title_label.text() # This is a label, not editable by user directly
+                self.job_title_combo.currentText()
             )
 
             # --- Save Avatar ---
-            # The pixmap is already on the label from _change_avatar
             pixmap = self.avatar_label.pixmap()
             if pixmap and not pixmap.isNull():
-                # Convert QPixmap to bytes
-                image = pixmap.toImage()
-                buffer = QtCore.QBuffer()
-                buffer.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
-                image.save(buffer, "PNG")
+                buffer = QBuffer()
+                buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                # Save the pixmap directly to the buffer
+                pixmap.save(buffer, "PNG")
                 avatar_data = buffer.data()
                 database.update_user_avatar(self.user['id'], avatar_data)
 
@@ -124,20 +124,22 @@ class UserProfileDialog(QDialog):
             new_pass = self.new_password_edit.text()
             confirm_pass = self.confirm_password_edit.text()
 
-            if current_pass or new_pass or confirm_pass: # Only if user is trying to change password
-                # Verify current password
+            if current_pass or new_pass or confirm_pass:
+                if not all([current_pass, new_pass, confirm_pass]):
+                    raise ValueError("To change your password, you must fill in the current, new, and confirmation password fields.")
+
                 verified_user = database.verify_user(self.user['username'], current_pass)
                 if not verified_user:
                     raise ValueError("Current password is not correct.")
-                if not new_pass:
-                    raise ValueError("New password cannot be empty.")
+                if len(new_pass) < 8:
+                    raise ValueError("New password must be at least 8 characters long.")
                 if new_pass != confirm_pass:
                     raise ValueError("New passwords do not match.")
 
                 database.update_user_password(self.user['id'], new_pass)
 
             QMessageBox.information(self, "Success", "Your profile has been updated successfully.")
-            self.accept() # Close the dialog on success
+            self.accept()
 
         except ValueError as ve:
             QMessageBox.warning(self, "Input Error", str(ve))
