@@ -21,6 +21,9 @@ import webbrowser
 import shutil
 import signal
 import uuid
+import sqlite3
+import gzip
+from datetime import datetime
 
 try:
     from lxml import etree
@@ -85,6 +88,7 @@ from PyQt6.QtWidgets import (
 from ai_tab import AIAssistantTab, AISettingsDialog, AIGuideDialog
 from login import LoginDialog
 from admin_panel import AdminPanelDialog
+from user_profile import UserProfileDialog
 from PyQt6.QtCore import QObject, pyqtSignal, Qt, QThread, QTimer, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QSequentialAnimationGroup, QPoint, QSize
 from PyQt6.QtGui import QAction, QIcon, QFont, QTextCursor, QActionGroup
 
@@ -1255,8 +1259,56 @@ class GScapy(QMainWindow):
         self.resource_monitor_thread.start()
 
         self._update_tool_targets() # Initial population after all widgets are created
+        self._set_user_avatar()
         logging.info("GScapy application initialized.")
 
+    def _set_user_avatar(self):
+        """Sets the user profile button icon based on the user's avatar."""
+        if not self.current_user:
+            return
+
+        avatar_data = self.current_user.get('avatar')
+        if avatar_data:
+            pixmap = QPixmap()
+            pixmap.loadFromData(avatar_data)
+            self.user_profile_button.setIcon(QIcon(pixmap))
+        else:
+            # Fallback to a default icon if no avatar is set
+            self.user_profile_button.setIcon(QIcon("icons/users.svg"))
+
+    def _show_user_menu(self):
+        """Shows a context menu for the user profile button."""
+        menu = QMenu(self)
+        profile_action = menu.addAction("Profile...")
+        logout_action = menu.addAction("Logout")
+
+        action = menu.exec(self.user_profile_button.mapToGlobal(QPoint(0, self.user_profile_button.height())))
+
+        if action == profile_action:
+            self._show_user_profile()
+        elif action == logout_action:
+            self._logout()
+
+    def _show_user_profile(self):
+        """Opens the user profile dialog."""
+        if not self.current_user:
+            return
+
+        # Re-fetch user data to ensure it's up-to-date
+        self.current_user = database.get_user_by_id(self.current_user['id'])
+        dialog = UserProfileDialog(self.current_user, self)
+        if dialog.exec():
+            # If changes were saved, re-fetch user data and update avatar
+            self.current_user = database.get_user_by_id(self.current_user['id'])
+            self._set_user_avatar()
+
+    def _logout(self):
+        """Logs the current user out and shows the login screen."""
+        self.close()
+        # A bit of a hacky way to restart, but effective for a desktop app
+        # A more robust solution might use a dedicated controller class to manage windows
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
 
     def _update_menu_bar(self):
         """Creates or updates the main menu bar based on the current user's role."""
@@ -1440,8 +1492,17 @@ class GScapy(QMainWindow):
         self.refresh_combo.addItems(["1s", "2s", "5s", "Off"])
         resource_layout.addWidget(self.refresh_combo)
 
+        # --- User Profile Button ---
+        self.user_profile_button = QPushButton()
+        self.user_profile_button.setFlat(True)
+        self.user_profile_button.setIconSize(QSize(32, 32))
+        self.user_profile_button.setToolTip("User Profile & Logout")
+        resource_layout.addWidget(self.user_profile_button)
+
         self.main_layout.addWidget(resource_frame)
         self.refresh_combo.textActivated.connect(self._handle_refresh_interval_change)
+        self.user_profile_button.clicked.connect(self._show_user_menu)
+
 
     def _update_clock(self):
         """Updates the time label with the current time and timezone."""
@@ -1584,234 +1645,170 @@ class GScapy(QMainWindow):
         self.tab_widget.addTab(self.ai_assistant_tab, QIcon("icons/terminal.svg"), "AI Assistant")
 
         self.tab_widget.addTab(self._create_threat_intelligence_tab(), QIcon("icons/database.svg"), "Threat Intelligence")
-        self.tab_widget.addTab(self._create_history_tab(), QIcon("icons/layers.svg"), "History")
 
         self.tab_widget.addTab(self._create_community_tools_tab(), QIcon("icons/users.svg"), "Community Tools")
         self.tab_widget.addTab(self._create_system_info_tab(), QIcon("icons/info.svg"), "System Info")
 
-        self.tab_widget.currentChanged.connect(self._on_tab_changed)
-
-    def _on_tab_changed(self, index):
-        """Handle actions when a tab is selected."""
-        # Check if the selected tab is the History tab
-        if self.tab_widget.tabText(index) == "History":
-            self._populate_history_tab()
-
-    def _create_history_tab(self):
-        """Creates the UI for the user's activity history tab."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-
-        controls_layout = QHBoxLayout()
-        refresh_btn = QPushButton(QIcon("icons/refresh-cw.svg"), " Refresh History")
-        refresh_btn.clicked.connect(self._populate_history_tab)
-        controls_layout.addWidget(refresh_btn)
-        controls_layout.addStretch()
-        layout.addLayout(controls_layout)
-
-        self.history_tree = QTreeWidget()
-        self.history_tree.setColumnCount(3)
-        self.history_tree.setHeaderLabels(["Date/Time", "Action", "Summary"])
-        self.history_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.history_tree.header().setStretchLastSection(True)
-        self.history_tree.header().resizeSection(0, 180) # Timestamp
-        self.history_tree.header().resizeSection(1, 200) # Action
-        layout.addWidget(self.history_tree)
-
-        return widget
-
-    def _populate_history_tab(self):
-        """Fetches and displays the current user's history."""
-        if not self.current_user:
-            return
-
-        self.history_tree.clear()
-        try:
-            user_id = self.current_user.get('id')
-            history_records = database.get_history_for_user(user_id)
-
-            for record in history_records:
-                # record is a tuple: (id, user_id, timestamp, action, details, full_data)
-                timestamp = record[2]
-                action = record[3]
-                details = record[4]
-
-                main_item = QTreeWidgetItem([timestamp, action, details])
-                self.history_tree.addTopLevelItem(main_item)
-
-                # Add full data as a collapsible child item
-                full_data = record[5]
-                if full_data:
-                    try:
-                        # Pretty-print the JSON for readability
-                        pretty_json = json.dumps(json.loads(full_data), indent=2)
-                        child_item = QTreeWidgetItem(["Full Data:", pretty_json])
-                        main_item.addChild(child_item)
-                    except json.JSONDecodeError:
-                        child_item = QTreeWidgetItem(["Raw Data:", full_data])
-                        main_item.addChild(child_item)
-
-
-        except Exception as e:
-            logging.error(f"Failed to populate history tab: {e}", exc_info=True)
-            QMessageBox.critical(self, "Database Error", f"Could not load history: {e}")
-
     def _create_threat_intelligence_tab(self):
         """Creates the tab container for the Threat Intelligence tools."""
         threat_tabs = QTabWidget()
-        threat_tabs.addTab(self._create_cve_search_tab(), "CVE Search")
+        threat_tabs.addTab(self._create_recent_threats_tab(), "Recent Threats")
         threat_tabs.addTab(self._create_exploit_db_search_tab(), "Exploit-DB Search")
         return threat_tabs
 
-    def _create_cve_search_tab(self):
-        """Creates the UI for the CVE Search tool."""
+    def _create_recent_threats_tab(self):
+        """Creates the UI for displaying recent CVEs with pagination."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # --- Search Controls ---
+        # --- Controls ---
         controls_layout = QHBoxLayout()
-        controls_layout.addWidget(QLabel("Search CVEs:"))
-        self.cve_search_input = QLineEdit()
-        self.cve_search_input.setPlaceholderText("Enter keyword, CPE, or CVE-ID (e.g., 'apache http server 2.4.52', 'CVE-2021-44228')")
-        controls_layout.addWidget(self.cve_search_input)
-        self.cve_search_button = QPushButton("Search")
-        controls_layout.addWidget(self.cve_search_button)
+        self.fetch_threats_btn = QPushButton("Fetch Latest 30 CVEs")
+        controls_layout.addWidget(self.fetch_threats_btn)
+        controls_layout.addStretch()
+        controls_layout.addWidget(QLabel("Items per page:"))
+        self.threats_per_page_combo = QComboBox()
+        self.threats_per_page_combo.addItems(["10", "20", "30", "40"])
+        controls_layout.addWidget(self.threats_per_page_combo)
+        self.threats_prev_btn = QPushButton("<< Previous")
+        self.threats_next_btn = QPushButton("Next >>")
+        self.threats_page_label = QLabel("Page 1 / 1")
+        controls_layout.addWidget(self.threats_prev_btn)
+        controls_layout.addWidget(self.threats_page_label)
+        controls_layout.addWidget(self.threats_next_btn)
         layout.addLayout(controls_layout)
-
-        # Add a note about the API key
-        api_note = QLabel("<i>Note: Searches are rate-limited by the NIST NVD API. For faster results, get a free API key and place it in a file named 'nvd_api.key'.</i>")
-        api_note.setWordWrap(True)
-        layout.addWidget(api_note)
 
         # --- Results Display ---
         results_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.cve_results_table = QTreeWidget()
-        self.cve_results_table.setColumnCount(4)
-        self.cve_results_table.setHeaderLabels(["CVE ID", "Severity", "CVSS v3.1", "Description"])
-        self.cve_results_table.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.cve_results_table.header().setStretchLastSection(True)
-        results_splitter.addWidget(self.cve_results_table)
+        self.threats_table = QTreeWidget()
+        self.threats_table.setColumnCount(4)
+        self.threats_table.setHeaderLabels(["CVE ID", "Published", "CVSS", "Summary"])
+        self.threats_table.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.threats_table.header().setStretchLastSection(True)
+        self.threats_table.header().resizeSection(0, 150)
+        self.threats_table.header().resizeSection(1, 150)
+        self.threats_table.header().resizeSection(2, 50)
+        results_splitter.addWidget(self.threats_table)
 
-        self.cve_details_view = QTextBrowser()
-        self.cve_details_view.setOpenExternalLinks(True)
-        results_splitter.addWidget(self.cve_details_view)
-
+        self.threat_details_view = QTextBrowser()
+        self.threat_details_view.setOpenExternalLinks(True)
+        results_splitter.addWidget(self.threat_details_view)
         results_splitter.setSizes([300, 200])
         layout.addWidget(results_splitter)
 
+        # --- Instance variables for state ---
+        self.recent_threats_data = []
+        self.threats_current_page = 0
+        self.threats_items_per_page = 10
+
         # --- Connections ---
-        self.cve_search_button.clicked.connect(self.start_cve_search)
-        self.cve_results_table.currentItemChanged.connect(self.display_cve_details)
+        self.fetch_threats_btn.clicked.connect(self._start_fetch_threats)
+        self.threats_table.currentItemChanged.connect(self._display_threat_details)
+        self.threats_next_btn.clicked.connect(self._go_to_next_threats_page)
+        self.threats_prev_btn.clicked.connect(self._go_to_previous_threats_page)
+        self.threats_per_page_combo.currentTextChanged.connect(self._change_threats_per_page)
 
         return widget
 
-    def start_cve_search(self):
-        """Starts the CVE search worker thread."""
+    def _start_fetch_threats(self):
+        """Initiates the background thread to fetch recent CVEs."""
         if self.is_tool_running:
             QMessageBox.warning(self, "Busy", "Another tool is already running.")
             return
-        query = self.cve_search_input.text()
-        if not query:
-            QMessageBox.critical(self, "Input Error", "Please provide a search query.")
-            return
 
         self.is_tool_running = True
-        self.cve_search_button.setEnabled(False)
-        self.cve_results_table.clear()
-        self.cve_details_view.clear()
-        self.status_bar.showMessage(f"Searching for CVEs related to '{query}'...")
+        self.fetch_threats_btn.setEnabled(False)
+        self.status_bar.showMessage("Fetching latest CVEs from cve.circl.lu...")
+        self.threats_table.clear()
+        self.threat_details_view.clear()
 
-        # Read API key from file if it exists
-        api_key = None
-        try:
-            with open("nvd_api.key", "r") as f:
-                api_key = f.read().strip()
-                logging.info("Found NVD API key.")
-        except FileNotFoundError:
-            logging.info("NVD API key file ('nvd_api.key') not found. Using public, rate-limited access.")
-
-        self.worker = WorkerThread(self._cve_search_thread, args=(query, api_key))
+        self.worker = WorkerThread(self._recent_threats_thread)
         self.active_threads.append(self.worker)
         self.worker.start()
 
-    def _cve_search_thread(self, query, api_key):
-        """Worker thread to search for CVEs using nvdlib."""
+    def _recent_threats_thread(self):
+        """Worker thread to fetch the last 30 CVEs."""
         q = self.tool_results_queue
         try:
-            import nvdlib
-            # nvdlib handles a cveId search automatically if the format matches
-            if re.match(r"CVE-\d{4}-\d{4,7}", query, re.IGNORECASE):
-                results = nvdlib.searchCVE(cveId=query, key=api_key, delay=6 if not api_key else 0)
-            else:
-                results = nvdlib.searchCVE(keywordSearch=query, key=api_key, delay=6 if not api_key else 0)
-
-            if not results:
-                q.put(('cve_search_status', "No CVEs found for your query."))
-            else:
-                q.put(('cve_search_status', f"Found {len(results)} CVEs."))
-
-            for r in results:
-                # Get the English description
-                description = "No description available."
-                for desc in r.descriptions:
-                    if desc.lang == 'en':
-                        description = desc.value
-                        break
-
-                # Get V3.1 score/severity, fall back to V2 if not available
-                severity = "N/A"
-                score = "N/A"
-                if hasattr(r, 'v31severity') and r.v31severity:
-                    severity = r.v31severity
-                    score = r.v31score
-                elif hasattr(r, 'v2severity') and r.v2severity:
-                    severity = r.v2severity
-                    score = r.v2score
-
-                # Send a tuple of the data and the full object
-                q.put(('cve_result', (r.id, severity, score, description[:100] + '...'), r))
-
+            url = "https://cve.circl.lu/api/last"
+            with urllib.request.urlopen(url, timeout=15) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode('utf-8'))
+                    q.put(('recent_threats_result', data))
+                else:
+                    raise Exception(f"API request failed with status code {response.status}")
         except Exception as e:
-            logging.error(f"nvdlib search failed: {e}", exc_info=True)
-            q.put(('error', 'CVE Search Error', str(e)))
+            logging.error(f"Failed to fetch recent threats: {e}", exc_info=True)
+            q.put(('error', 'Threat Intelligence Error', str(e)))
         finally:
-            q.put(('tool_finished', 'cve_search'))
+            q.put(('tool_finished', 'fetch_threats'))
 
-    def display_cve_details(self, current_item, previous_item):
+    def _handle_recent_threats_result(self, data):
+        """Handles the successful result from the threat fetcher thread."""
+        self.recent_threats_data = data
+        self.threats_current_page = 0
+        self._update_threats_display()
+        self.status_bar.showMessage(f"Successfully fetched {len(data)} recent CVEs.", 5000)
+
+    def _update_threats_display(self):
+        """Updates the threat table and pagination controls based on the current state."""
+        self.threats_table.clear()
+
+        start_index = self.threats_current_page * self.threats_items_per_page
+        end_index = start_index + self.threats_items_per_page
+
+        page_data = self.recent_threats_data[start_index:end_index]
+
+        for cve in page_data:
+            cve_id = cve.get('id', 'N/A')
+            published = cve.get('Published', 'N/A')
+            cvss = str(cve.get('cvss', 'N/A'))
+            summary = cve.get('summary', '')
+
+            item = QTreeWidgetItem([cve_id, published, cvss, summary])
+            item.setData(0, Qt.ItemDataRole.UserRole, cve) # Store full data
+            self.threats_table.addTopLevelItem(item)
+
+        total_pages = (len(self.recent_threats_data) + self.threats_items_per_page - 1) // self.threats_items_per_page
+        self.threats_page_label.setText(f"Page {self.threats_current_page + 1} / {total_pages}")
+        self.threats_prev_btn.setEnabled(self.threats_current_page > 0)
+        self.threats_next_btn.setEnabled(end_index < len(self.recent_threats_data))
+
+    def _display_threat_details(self, current_item, previous_item):
         """Displays full details for the selected CVE."""
         if not current_item:
             return
-
-        # Retrieve the full CVE object stored in the item's data role
-        cve_obj = current_item.data(0, Qt.ItemDataRole.UserRole)
-        if not cve_obj:
+        cve_data = current_item.data(0, Qt.ItemDataRole.UserRole)
+        if not cve_data:
             return
 
-        # Build an HTML string for display
-        html = f"<h3>{cve_obj.id}</h3>"
+        html = f"<h3>{cve_data.get('id', 'N/A')}</h3>"
+        html += f"<p><b>Summary:</b><br>{cve_data.get('summary', 'No summary available.')}</p>"
+        html += f"<b>Published:</b> {cve_data.get('Published', 'N/A')}<br>"
+        html += f"<b>Modified:</b> {cve_data.get('Modified', 'N/A')}<br>"
+        html += f"<b>CVSS Score:</b> {cve_data.get('cvss', 'N/A')}<br>"
 
-        # Description
-        description = "No description available."
-        for desc in cve_obj.descriptions:
-            if desc.lang == 'en':
-                description = desc.value
-                break
-        html += f"<p><b>Description:</b><br>{description}</p>"
-
-        # Metrics
-        if hasattr(cve_obj, 'v31vector'):
-             html += f"<p><b>CVSS v3.1 Vector:</b> {cve_obj.v31vector} (<b>Score: {cve_obj.v31score}</b>)</p>"
-        elif hasattr(cve_obj, 'v2vector'):
-            html += f"<p><b>CVSS v2.0 Vector:</b> {cve_obj.v2vector} (<b>Score: {cve_obj.v2score}</b>)</p>"
-
-        # References
-        if hasattr(cve_obj, 'references') and cve_obj.references:
+        refs = cve_data.get('references', [])
+        if refs:
             html += "<p><b>References:</b><ul>"
-            for ref in cve_obj.references:
-                html += f'<li><a href="{ref.url}">{ref.url}</a></li>'
+            for ref in refs:
+                html += f'<li><a href="{ref}">{ref}</a></li>'
             html += "</ul></p>"
 
-        self.cve_details_view.setHtml(html)
+        self.threat_details_view.setHtml(html)
+
+    def _go_to_next_threats_page(self):
+        self.threats_current_page += 1
+        self._update_threats_display()
+
+    def _go_to_previous_threats_page(self):
+        self.threats_current_page -= 1
+        self._update_threats_display()
+
+    def _change_threats_per_page(self, text):
+        self.threats_items_per_page = int(text)
+        self.threats_current_page = 0 # Reset to first page
+        self._update_threats_display()
 
     def _create_exploit_db_search_tab(self):
         """Creates the UI for the Exploit-DB Search tool."""
@@ -2415,12 +2412,6 @@ class GScapy(QMainWindow):
 
         command.append(target)
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {target}, Ports: {controls['ports_edit'].text() or 'default'}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Nmap Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['cancel_btn'].setEnabled(True)
@@ -2690,12 +2681,6 @@ class GScapy(QMainWindow):
         if output_file := controls['output_edit'].text().strip():
             command.extend(["-o", output_file])
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Domain: {domain}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Subfinder Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['cancel_btn'].setEnabled(True)
@@ -2877,12 +2862,6 @@ class GScapy(QMainWindow):
         if controls['json_output_check'].isChecked():
             command.append("-json")
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target List: {target_list}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'httpx Probe', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['cancel_btn'].setEnabled(True)
@@ -3038,12 +3017,6 @@ class GScapy(QMainWindow):
             if nmap_args := controls['nmap_args_edit'].text().strip():
                 command.append("--")
                 command.extend(nmap_args.split())
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Targets: {targets}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'RustScan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3204,12 +3177,6 @@ class GScapy(QMainWindow):
             return
 
         command.append("--no-color")
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"URL: {url}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'dirsearch Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3387,12 +3354,6 @@ class GScapy(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "File Error", f"Could not create temporary file for ffuf report: {e}")
             return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"URL: {url}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'ffuf Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -3577,12 +3538,6 @@ class GScapy(QMainWindow):
 
         command.append(target)
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {target}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'enum4linux-ng Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['stop_btn'].setEnabled(True)
@@ -3752,12 +3707,6 @@ class GScapy(QMainWindow):
             QMessageBox.critical(self, "File Error", f"Could not create temporary file for dnsrecon report: {e}")
             return
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Domain: {domain}, Type: {scan_type}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'dnsrecon Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['stop_btn'].setEnabled(True)
@@ -3905,12 +3854,6 @@ class GScapy(QMainWindow):
         if delay := controls['delay_edit'].text().strip():
             command.extend(["--delay", delay])
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Domain: {domain}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Fierce Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['stop_btn'].setEnabled(True)
@@ -4042,11 +3985,6 @@ class GScapy(QMainWindow):
         if not domain:
             QMessageBox.critical(self, "Input Error", "Please provide a domain to scan.")
             return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Domain: {domain}"
-            database.log_activity(self.current_user['id'], 'Sublist3r Scan', log_details, f"Domain: {domain}")
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -4235,12 +4173,6 @@ class GScapy(QMainWindow):
             command.extend(["-Save", save_dir])
         if extra_opts := controls['extra_opts_edit'].text().strip():
             command.extend(extra_opts.split())
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Host: {target}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Nikto Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -4436,12 +4368,6 @@ class GScapy(QMainWindow):
         if controls['expanded_check'].isChecked():
             command.append("-e")
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"URL: {url}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Gobuster Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['stop_btn'].setEnabled(True)
@@ -4540,12 +4466,6 @@ class GScapy(QMainWindow):
 
         # Target(s) must be last
         command.extend(target.split())
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target(s): {target}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'WhatWeb Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         self.whatweb_start_btn.setEnabled(False)
@@ -4805,12 +4725,6 @@ class GScapy(QMainWindow):
         if extra_opts := self.sqlmap_extra_opts_edit.text().strip():
             command.extend(extra_opts.split())
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {url or reqfile}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'SQLMap Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         self.sqlmap_start_btn.setEnabled(False)
         self.sqlmap_stop_btn.setEnabled(True)
@@ -5056,12 +4970,6 @@ class GScapy(QMainWindow):
         if extra_opts := self.hashcat_extra_opts_edit.text().strip():
             command.extend(extra_opts.split())
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Hash File: {hashfile}, Mode: {attack_mode}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Hashcat', log_details, log_full_data)
-
         self.is_tool_running = True
         self.hashcat_start_btn.setEnabled(False)
         self.hashcat_stop_btn.setEnabled(True)
@@ -5278,12 +5186,6 @@ class GScapy(QMainWindow):
 
         command.extend(["-nC", "-json"]) # Always disable color and enable JSON for parsing
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {target}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Nuclei Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['stop_btn'].setEnabled(True)
@@ -5469,12 +5371,6 @@ class GScapy(QMainWindow):
         # Always add --json for parsing, but hide the checkbox from the user to avoid confusion
         command.append("--json")
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Source: {source_type}, Target: {target}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'TruffleHog Scan', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['stop_btn'].setEnabled(True)
@@ -5646,13 +5542,6 @@ class GScapy(QMainWindow):
 
         command.append(hash_file)
 
-        # Log the activity
-        if self.current_user:
-            mode = "Show" if not crack_mode else "Crack"
-            log_details = f"Mode: {mode}, Hash File: {hash_file}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'John the Ripper', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['show_btn'].setEnabled(False)
@@ -5820,12 +5709,6 @@ class GScapy(QMainWindow):
 
         command.append(f"{service}://{target}")
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {target}, Service: {service}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Hydra Attack', log_details, log_full_data)
-
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
         controls['stop_btn'].setEnabled(True)
@@ -5967,12 +5850,6 @@ class GScapy(QMainWindow):
             return
 
         command.extend(usernames.split())
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Usernames: {usernames}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Sherlock Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -6123,12 +6000,6 @@ class GScapy(QMainWindow):
             command.append("-q")
 
         command.append("-n") # Disable history logging for non-interactive use
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {target}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Spiderfoot Scan', log_details, log_full_data)
 
         self.is_tool_running = True
         controls['start_btn'].setEnabled(False)
@@ -6295,12 +6166,6 @@ class GScapy(QMainWindow):
 
         if extra_opts := self.masscan_extra_opts_edit.text().strip():
             command.extend(extra_opts.split())
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target(s): {target}, Rate: {rate}pps"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Masscan', log_details, log_full_data)
 
         self.is_tool_running = True
         self.masscan_start_btn.setEnabled(False)
@@ -7182,12 +7047,6 @@ class GScapy(QMainWindow):
         if self.wifite_kill_check.isChecked():
             command.append("--kill")
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target ESSID: {essid or 'All'}"
-            log_full_data = json.dumps({"command": " ".join(command)})
-            database.log_activity(self.current_user['id'], 'Wifite Audit', log_details, log_full_data)
-
         self.is_tool_running = True
         self.wifite_start_btn.setEnabled(False)
         self.wifite_stop_btn.setEnabled(True)
@@ -7425,11 +7284,6 @@ class GScapy(QMainWindow):
             QMessageBox.warning(self, "File Error", f"Wordlist file not found:\n{wordlist}")
             return
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Handshake File: {os.path.basename(pcap_file)}"
-            database.log_activity(self.current_user['id'], 'WPA Crack', log_details, log_details)
-
         self.wpa_crack_output.clear()
         self.wpa_crack_btn.setText("Stop Cracking")
         self.aircrack_thread = AircrackThread(pcap_file, wordlist, self, threads)
@@ -7500,11 +7354,6 @@ class GScapy(QMainWindow):
         if not bssid:
             QMessageBox.warning(self, "Target Error", "Please select a target network.")
             return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target BSSID: {bssid}"
-            database.log_activity(self.current_user['id'], 'WPA Handshake Capture', log_details, log_details)
 
         self.is_tool_running = True
         self.wpa_capture_btn.setText("Stop Capture")
@@ -7989,12 +7838,6 @@ class GScapy(QMainWindow):
         if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
         t = self.trace_target.text()
         if not t: QMessageBox.critical(self, "Error", "Please enter a target."); return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {t}"
-            database.log_activity(self.current_user['id'], 'Traceroute', log_details, log_details)
-
         self.trace_button.setEnabled(False)
         self.trace_cancel_button.setEnabled(True)
         self.is_tool_running = True
@@ -8040,11 +7883,6 @@ class GScapy(QMainWindow):
         if not t or not ps: QMessageBox.critical(self, "Error", "Target and ports required."); return
         try: ports=sorted(list(set(self._parse_ports(ps))))
         except ValueError: QMessageBox.critical(self, "Error","Invalid port format. Use '22, 80, 100-200'."); return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {t}, Ports: {ps}, Mode: {tcp_scan_type}"
-            database.log_activity(self.current_user['id'], 'Port Scan (Scapy)', log_details, log_details)
 
         self.scan_button.setEnabled(False)
         self.scan_cancel_button.setEnabled(True)
@@ -8136,12 +7974,6 @@ class GScapy(QMainWindow):
         if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
         t=self.arp_target.text()
         if not t: QMessageBox.critical(self, "Error", "Please enter a target network."); return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {t}"
-            database.log_activity(self.current_user['id'], 'ARP Scan (Scapy)', log_details, log_details)
-
         self.arp_scan_button.setEnabled(False); self.is_tool_running=True
         self.worker = WorkerThread(self._arp_scan_thread, args=(t,)); self.worker.start()
 
@@ -8333,11 +8165,6 @@ class GScapy(QMainWindow):
             QMessageBox.critical(self, "Input Error", "Please specify at least one port for TCP/UDP probes.")
             return
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {target_network}, Probe: {probe_type}"
-            database.log_activity(self.current_user['id'], 'Ping Sweep', log_details, log_details)
-
         self.is_tool_running = True
         self.ps_start_button.setEnabled(False)
         self.ps_cancel_button.setEnabled(True)
@@ -8447,11 +8274,6 @@ class GScapy(QMainWindow):
             QMessageBox.critical(self, "Error", "Invalid count, interval, or thread number.")
             return
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {target_ip}, Type: {template}"
-            database.log_activity(self.current_user['id'], 'Packet Flood', log_details, log_details)
-
         self.flood_button.setEnabled(False)
         self.stop_flood_button.setEnabled(True)
         self.is_tool_running = True
@@ -8530,11 +8352,6 @@ class GScapy(QMainWindow):
         self.krack_stop_btn.setEnabled(True)
         self.krack_results_tree.clear()
 
-        # Log the activity
-        if self.current_user:
-            log_details = f"Interface: {iface}"
-            database.log_activity(self.current_user['id'], 'KRACK Scan', log_details, log_details)
-
         self.krack_thread = KrackScanThread(iface, self)
         self.krack_thread.vulnerability_detected.connect(self.add_krack_result)
         self.krack_thread.start()
@@ -8562,12 +8379,6 @@ class GScapy(QMainWindow):
         if self.is_tool_running: QMessageBox.warning(self, "Busy", "Another tool is already running."); return
         t=self.fw_target.text(); ps_name=self.fw_probe_set.currentText()
         if not t: QMessageBox.critical(self, "Error", "Please enter a target."); return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Target: {t}, Probe Set: {ps_name}"
-            database.log_activity(self.current_user['id'], 'Firewall Test', log_details, log_details)
-
         self.fw_test_button.setEnabled(False); self.is_tool_running=True
         self.worker = WorkerThread(self._firewall_test_thread, args=(t,ps_name)); self.worker.start()
 
@@ -8608,12 +8419,6 @@ class GScapy(QMainWindow):
 
         self.wifi_scan_button.setEnabled(False)
         self.wifi_scan_stop_button.setEnabled(True)
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Interface: {iface}"
-            database.log_activity(self.current_user['id'], 'Wi-Fi Scan', log_details, log_details)
-
         self.is_tool_running = True
         self.found_networks = {}
         self.wifi_tree.clear()
@@ -8671,12 +8476,6 @@ class GScapy(QMainWindow):
         except ValueError: QMessageBox.critical(self, "Error", "Count must be an integer."); return
         warning_msg="This will send deauthentication packets which can disrupt a network. Are you sure you want to continue?"
         if QMessageBox.question(self, "Confirm Deauth", warning_msg) == QMessageBox.StandardButton.No: return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"BSSID: {bssid}, Client: {client}, Count: {count}"
-            database.log_activity(self.current_user['id'], 'Deauthentication Attack', log_details, log_details)
-
         self.deauth_button.setEnabled(False); self.is_tool_running = True
         args = (bssid, client, count)
         self.worker = WorkerThread(self._deauth_thread, args=args); self.worker.start()
@@ -8725,11 +8524,6 @@ class GScapy(QMainWindow):
         except ValueError as e:
             QMessageBox.critical(self, "Input Error", f"Invalid input for Count, Interval, or Channel: {e}")
             return
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"SSIDs: {len(ssids)}, Encryption: {enc_type}, Count: {count}"
-            database.log_activity(self.current_user['id'], 'Beacon Flood', log_details, log_details)
 
         self.is_tool_running = True
         self.bf_start_button.setEnabled(False)
@@ -8878,11 +8672,6 @@ class GScapy(QMainWindow):
 
         self.arp_spoof_current_victim = victim_ip
         self.arp_spoof_current_target = target_ip
-
-        # Log the activity
-        if self.current_user:
-            log_details = f"Victim: {victim_ip}, Target: {target_ip}"
-            database.log_activity(self.current_user['id'], 'ARP Spoof', log_details, log_details)
 
         self.is_tool_running = True
         self.arp_spoof_start_btn.setEnabled(False)
@@ -9264,6 +9053,7 @@ class GScapy(QMainWindow):
         self.result_handlers['nuclei_results'] = self._show_nuclei_results_popup
         self.result_handlers['masscan_output'] = self._handle_masscan_output
         self.result_handlers['report_finding'] = self._handle_report_finding
+        self.result_handlers['recent_threats_result'] = self._handle_recent_threats_result
 
     def _handle_report_finished(self, success, message):
         """Handles the result of the report generation thread."""
@@ -9298,6 +9088,7 @@ class GScapy(QMainWindow):
     def _aggregation_thread(self):
         """Parses tool outputs, enriches data, and sends it to the reporting tab."""
         q = self.tool_results_queue
+        use_offline_db = self.offline_cve_check.isChecked()
         try:
             if not LXML_AVAILABLE:
                 q.put(('error', 'Dependency Error', "The 'lxml' library is required for report generation. Please install it."))
@@ -9337,7 +9128,10 @@ class GScapy(QMainWindow):
                         full_service_str = f"{service_name} ({search_term})"
 
                         # Enrich data with CVEs and Exploits
-                        cve_details = self._query_cve_api(search_term)
+                        if use_offline_db:
+                            cve_details = self._query_local_cve_db(search_term)
+                        else:
+                            cve_details = self._query_cve_api(search_term)
                         exploit_details = self._query_searchsploit(search_term)
 
                         q.put(('report_finding', (address, port_service_str, full_service_str, f"{cve_details}\n{exploit_details}")))
@@ -9383,10 +9177,148 @@ class GScapy(QMainWindow):
 
         # 3. Start worker thread
         self.status_bar.showMessage("Generating report...")
-        self.report_generate_btn.setEnabled(False)
+        self.report_generate_html_btn.setEnabled(False)
         self.worker = WorkerThread(self._report_generation_thread, args=(report_data, file_path, template_name))
         self.active_threads.append(self.worker)
         self.worker.start()
+
+    def _start_cve_db_update(self):
+        """Starts the background thread to download/update the offline CVE database."""
+        if self.is_tool_running:
+            QMessageBox.warning(self, "Busy", "Another tool is already running.")
+            return
+
+        self.is_tool_running = True
+        self.update_cve_db_btn.setEnabled(False)
+        self.status_bar.showMessage("Starting offline CVE database update...")
+
+        self.worker = WorkerThread(self._update_cve_db_thread)
+        self.active_threads.append(self.worker)
+        self.worker.start()
+
+    def _update_cve_db_thread(self):
+        """Worker thread to download and process NVD data feeds into a local SQLite DB."""
+        q = self.tool_results_queue
+        db_path = "cve.db"
+        try:
+            # Step 1: Setup Database
+            con = sqlite3.connect(db_path)
+            cur = con.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS vulnerabilities (
+                    cve_id TEXT PRIMARY KEY,
+                    description TEXT,
+                    cvss_v3_score REAL,
+                    cvss_v2_score REAL,
+                    keywords TEXT,
+                    published_date TEXT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_keywords ON vulnerabilities(keywords);")
+            con.commit()
+
+            # Step 2: Define URLs
+            current_year = datetime.now().year
+            base_url = "https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-{year}.json.gz"
+            urls = [base_url.format(year=y) for y in range(2002, current_year + 1)]
+            urls.append("https://nvd.nist.gov/feeds/json/cve/1.1/nvdcve-1.1-modified.json.gz")
+
+            total_files = len(urls)
+            # Step 3: Download and Process each file
+            for i, url in enumerate(urls):
+                if self.tool_stop_event.is_set():
+                    q.put(('status', "CVE DB update cancelled."))
+                    break
+
+                filename = url.split('/')[-1]
+                q.put(('status', f"Downloading and processing file {i+1}/{total_files}: {filename}"))
+
+                req = urllib.request.Request(url, headers={'User-Agent': 'GScapy/1.0'})
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    compressed_file = response.read()
+
+                json_data = gzip.decompress(compressed_file)
+                data = json.loads(json_data)
+
+                cve_items = data.get('CVE_Items', [])
+                cves_to_insert = []
+                for cve_item in cve_items:
+                    cve_id = cve_item['cve']['CVE_data_meta']['ID']
+                    description = cve_item['cve']['description']['description_data'][0]['value']
+
+                    # Extract keywords from CPEs
+                    keywords = set()
+                    nodes = cve_item.get('configurations', {}).get('nodes', [])
+                    for node in nodes:
+                        cpe_matches = node.get('cpe_match', [])
+                        for cpe_match in cpe_matches:
+                            cpe_uri = cpe_match.get('cpe23Uri', '')
+                            # cpe:2.3:a:vendor:product:version:update:edition:language:sw_edition:target_sw:target_hw:other
+                            parts = cpe_uri.split(':')
+                            if len(parts) > 4:
+                                keywords.add(parts[3]) # vendor
+                                keywords.add(parts[4]) # product
+
+                    keywords_str = " ".join(sorted(list(keywords)))
+
+                    # Extract CVSS scores
+                    metrics_v3 = cve_item.get('impact', {}).get('baseMetricV3', {})
+                    cvss_v3_score = metrics_v3.get('cvssV3', {}).get('baseScore')
+                    metrics_v2 = cve_item.get('impact', {}).get('baseMetricV2', {})
+                    cvss_v2_score = metrics_v2.get('cvssV2', {}).get('baseScore')
+
+                    published_date = cve_item.get('publishedDate', '')
+
+                    cves_to_insert.append((cve_id, description, cvss_v3_score, cvss_v2_score, keywords_str, published_date))
+
+                # Step 4: Insert into DB
+                cur.executemany("INSERT OR REPLACE INTO vulnerabilities VALUES (?, ?, ?, ?, ?, ?)", cves_to_insert)
+                con.commit()
+                q.put(('status', f"Finished processing {filename}. {len(cves_to_insert)} records updated."))
+
+            if not self.tool_stop_event.is_set():
+                q.put(('status', "CVE Database update complete!"))
+
+        except Exception as e:
+            logging.error(f"Failed to update offline CVE DB: {e}", exc_info=True)
+            q.put(('error', 'CVE DB Error', str(e)))
+        finally:
+            if 'con' in locals() and con:
+                con.close()
+            q.put(('tool_finished', 'cve_db_update'))
+
+    def _query_local_cve_db(self, keyword):
+        """Queries the local SQLite CVE database for a given keyword."""
+        db_path = "cve.db"
+        if not os.path.exists(db_path):
+            return "Offline CVE database (cve.db) not found. Please update it first."
+
+        try:
+            con = sqlite3.connect(db_path)
+            cur = con.cursor()
+
+            search_terms = keyword.split()
+            query = "SELECT cve_id, cvss_v3_score, description FROM vulnerabilities WHERE "
+            query += " AND ".join(["keywords LIKE ?"] * len(search_terms))
+            query += " ORDER BY cvss_v3_score DESC LIMIT 5"
+
+            params = [f"%{term}%" for term in search_terms]
+
+            cur.execute(query, params)
+            results = cur.fetchall()
+            con.close()
+
+            if not results:
+                return "No CVEs found in offline DB."
+
+            output = ["--- CVEs (Offline) ---"]
+            for cve_id, score, description in results:
+                output.append(f"{cve_id} (Score: {score or 'N/A'}): {description[:100]}...")
+            return "\n".join(output)
+
+        except Exception as e:
+            logging.error(f"Offline CVE DB query for '{keyword}' failed: {e}")
+            return f"Offline CVE lookup failed: {e}"
 
     def _report_generation_thread(self, report_data, file_path, template_name):
         """Worker thread to generate the final HTML report."""
@@ -9679,14 +9611,19 @@ class GScapy(QMainWindow):
             self.status_bar.showMessage("Result aggregation and enrichment complete.", 5000)
             return
 
+        if tool == 'cve_db_update':
+            self.update_cve_db_btn.setEnabled(True)
+            self.status_bar.showMessage("CVE DB update finished.", 5000)
+            self.is_tool_running = False # Explicitly set this as it's a special case
+            return
+
         self.is_tool_running = False
         buttons = {'traceroute': self.trace_button, 'scanner': self.scan_button, 'arp_scan': self.arp_scan_button,
                    'flooder': self.flood_button, 'fw_tester': self.fw_test_button, 'wifi_scan': self.wifi_scan_button,
                    'deauth': self.deauth_button, 'arp_spoof': self.arp_spoof_start_btn,
                    'beacon_flood': self.bf_start_button, 'ping_sweep': self.ps_start_button, 'nmap_scan': self.nmap_controls['start_btn'],
                           'sublist3r_scan': self.subdomain_controls['start_btn'], 'subfinder_scan': self.subfinder_controls['start_btn'], 'httpx_scan': self.httpx_controls['start_btn'], 'trufflehog_scan': self.trufflehog_controls['start_btn'], 'rustscan_scan': self.rustscan_controls['start_btn'], 'dirsearch_scan': self.dirsearch_controls['start_btn'], 'ffuf_scan': self.ffuf_controls['start_btn'], 'jtr_scan': self.jtr_controls['start_btn'], 'hydra_scan': self.hydra_controls['start_btn'], 'enum4linux_ng_scan': self.enum4linux_ng_controls['start_btn'], 'dnsrecon_scan': self.dnsrecon_controls['start_btn'], 'fierce_scan': self.fierce_controls['start_btn'], 'sherlock_scan': self.sherlock_controls['start_btn'], 'spiderfoot_scan': self.spiderfoot_controls['start_btn'], 'arp_scan_cli_scan': self.arp_scan_cli_controls['start_btn'], 'wifite_scan': self.wifite_start_btn, 'nikto_scan': self.nikto_controls['start_btn'], 'gobuster_scan': self.gobuster_controls['start_btn'], 'sqlmap_scan': self.sqlmap_start_btn, 'whatweb_scan': self.whatweb_start_btn, 'hashcat_scan': self.hashcat_start_btn, 'masscan_scan': self.masscan_start_btn, 'nuclei_scan': self.nuclei_controls['start_btn'],
-                           'cve_search': self.cve_search_button,
-                           'exploit_search': self.exploitdb_search_button}
+                           'cve_search': self.cve_search_button, 'exploit_search': self.exploitdb_search_button, 'cve_db_update': self.update_cve_db_btn}
         cancel_buttons = {'scanner': self.scan_cancel_button, 'flooder': self.stop_flood_button,
                           'arp_spoof': self.arp_spoof_stop_btn, 'beacon_flood': self.bf_stop_button,
                           'ping_sweep': self.ps_cancel_button, 'fw_tester': self.fw_cancel_button,
@@ -9921,8 +9858,41 @@ class GScapy(QMainWindow):
         self.report_client_name = QLineEdit()
         self.report_assessment_dates = QLineEdit()
         self.report_objectives = QTextEdit()
+        self.report_objectives.setPlaceholderText(
+"""Example:
+- Objective 1: Determine the ability of a threat actor to compromise critical customer transactional data.
+- Objective 2: Evaluate the integrity of the customer's order database.
+- Objective 3: Assess the effectiveness of Incident Response procedures."""
+        )
         self.report_in_scope = QTextEdit()
+        self.report_in_scope.setPlaceholderText(
+"""Example:
+
+--- Authorized Target Space ---
+- IP Range(s): 10.10.12.0/24, 10.10.13.0/24
+- Domains: *.example.com
+- URLs: https://www.example.com/login
+- Network Segments: Corporate LAN, Guest Wi-Fi
+
+--- Authorized Hosts ---
+- All hosts not expressly restricted."""
+        )
         self.report_out_of_scope = QTextEdit()
+        self.report_out_of_scope.setPlaceholderText(
+"""Example:
+
+--- Explicit Restrictions ---
+- No Denial of Service (DoS) attacks.
+- No testing outside of business hours (9am-5pm Local Time).
+- Social engineering of staff is not permitted.
+
+--- Restricted IP Addresses ---
+- 10.10.10.0/24 (HR Department)
+- 10.10.11.0/24 (Accounting)
+
+--- Restricted Hosts ---
+- CRITICAL_DB_SERVER_01"""
+        )
         roe_layout.addRow("Client Name:", self.report_client_name)
         roe_layout.addRow("Assessment Dates:", self.report_assessment_dates)
         roe_layout.addRow("Objectives:", self.report_objectives)
@@ -9954,10 +9924,22 @@ class GScapy(QMainWindow):
         findings_box = QGroupBox("Aggregated Findings")
         findings_layout = QVBoxLayout(findings_box)
 
+        aggregation_controls = QHBoxLayout()
         self.report_aggregate_btn = QPushButton(QIcon("icons/search.svg"), " Aggregate & Enrich Results")
         self.report_aggregate_btn.setToolTip("Scan the results from all tool outputs in the current session and enrich them with CVE and Exploit-DB information.")
         self.report_aggregate_btn.clicked.connect(self._handle_aggregation)
-        findings_layout.addWidget(self.report_aggregate_btn)
+        aggregation_controls.addWidget(self.report_aggregate_btn)
+
+        self.update_cve_db_btn = QPushButton(QIcon("icons/download-cloud.svg"), "Update Offline DB")
+        self.update_cve_db_btn.setToolTip("Download or update the offline CVE database from NVD. This may take a while.")
+        self.update_cve_db_btn.clicked.connect(self._start_cve_db_update)
+        aggregation_controls.addWidget(self.update_cve_db_btn)
+
+        aggregation_controls.addStretch()
+        self.offline_cve_check = QCheckBox("Use offline CVE_DB")
+        self.offline_cve_check.setToolTip("Use a local copy of CVE data for enrichment. Requires initial download.")
+        aggregation_controls.addWidget(self.offline_cve_check)
+        findings_layout.addLayout(aggregation_controls)
 
         self.report_findings_tree = QTreeWidget()
         self.report_findings_tree.setColumnCount(4)
@@ -9968,8 +9950,31 @@ class GScapy(QMainWindow):
         right_layout.addWidget(findings_box)
 
         # Generation Box
-        generation_box = QGroupBox("Generate Report")
-        generation_layout = QFormLayout(generation_box)
+        generation_box = QGroupBox("Report Generation")
+        generation_layout = QVBoxLayout(generation_box)
+
+        # --- AI Generation ---
+        ai_box = QGroupBox("AI-Powered Generation")
+        ai_layout = QFormLayout(ai_box)
+        self.ai_persona_combo = QComboBox()
+        self.ai_persona_combo.addItems(["Default", "Technical Manager", "C-Suite Executive", "Lead Developer"])
+        self.ai_persona_combo.setToolTip("Select a persona for the AI to adopt when generating report sections.")
+        ai_layout.addRow("AI Persona:", self.ai_persona_combo)
+
+        self.ai_instructions_edit = QTextEdit()
+        self.ai_instructions_edit.setPlaceholderText("Optional: Provide custom instructions for the AI. For example, 'Focus on the financial impact of the SQL injection vulnerability'.")
+        self.ai_instructions_edit.setFixedHeight(80)
+        ai_layout.addRow("AI Instructions:", self.ai_instructions_edit)
+
+        self.report_generate_ai_btn = QPushButton(QIcon("icons/terminal.svg"), "Generate with AI")
+        self.report_generate_ai_btn.setToolTip("Use the AI Assistant to generate sections of the report based on findings.")
+        # self.report_generate_ai_btn.clicked.connect(self._handle_ai_report_generation) # Handler to be created
+        ai_layout.addRow(self.report_generate_ai_btn)
+        generation_layout.addWidget(ai_box)
+
+        # --- Final Report Generation ---
+        final_report_box = QGroupBox("Final Export")
+        final_report_layout = QFormLayout(final_report_box)
 
         self.report_template_combo = QComboBox()
         try:
@@ -9979,12 +9984,22 @@ class GScapy(QMainWindow):
             logging.error("report_templates directory not found. Report generation may fail.")
             self.report_template_combo.addItem("default_report.html")
 
-        generation_layout.addRow("Template:", self.report_template_combo)
+        final_report_layout.addRow("HTML Template:", self.report_template_combo)
 
-        self.report_generate_btn = QPushButton(QIcon("icons/file-text.svg"), "Generate Report")
-        self.report_generate_btn.setToolTip("Compile all the information above into a final report document.")
-        self.report_generate_btn.clicked.connect(self._handle_generate_report)
-        generation_layout.addRow(self.report_generate_btn)
+        self.report_generate_html_btn = QPushButton(QIcon("icons/file-text.svg"), "Generate Final HTML Report")
+        self.report_generate_html_btn.setToolTip("Compile all the information above into a final HTML report document.")
+        self.report_generate_html_btn.clicked.connect(self._handle_generate_report) # Connect to existing handler for now
+
+        self.report_generate_doc_btn = QPushButton(QIcon("icons/file.svg"), "Generate Report as Doc")
+        self.report_generate_doc_btn.setToolTip("Generate the report in various document formats (DOCX, PDF, etc.).")
+        # self.report_generate_doc_btn.clicked.connect(self._handle_generate_doc_report) # Need to create this handler
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.report_generate_html_btn)
+        button_layout.addWidget(self.report_generate_doc_btn)
+        final_report_layout.addRow(button_layout)
+
+        generation_layout.addWidget(final_report_box)
         right_layout.addWidget(generation_box)
 
         right_panel.setLayout(right_layout)

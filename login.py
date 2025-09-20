@@ -171,36 +171,28 @@ class LoginDialog(QDialog):
 
         # --- Header Section ---
         header_widget = QWidget()
-        header_layout = QHBoxLayout(header_widget) # Changed to QHBoxLayout
+        header_layout = QVBoxLayout(header_widget)
         header_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header_layout.setSpacing(20)
 
         # Logo
         self.logo_label = QLabel()
         script_dir = os.path.dirname(os.path.realpath(__file__))
         icon_path = os.path.join(script_dir, "icons", "new_logo.png")
         pixmap = QPixmap(icon_path)
-        self.logo_label.setPixmap(pixmap.scaled(80, 80, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.logo_label.setPixmap(pixmap.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         header_layout.addWidget(self.logo_label)
-
-        # Vertical layout for text
-        text_layout = QVBoxLayout()
-        text_layout.setSpacing(5)
 
         # App Name
         app_name_label = QLabel("GScapy + AI")
         app_name_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #bbbbbb;")
-        app_name_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        text_layout.addWidget(app_name_label)
+        app_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(app_name_label)
 
         # Slogan
         slogan_label = QLabel("The Modern Scapy Interface with AI")
         slogan_label.setStyleSheet("font-size: 14px; color: #888888;")
-        slogan_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        text_layout.addWidget(slogan_label)
-
-        header_layout.addLayout(text_layout)
-        header_layout.addStretch()
+        slogan_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(slogan_label)
 
         main_layout.addWidget(header_widget)
 
@@ -432,7 +424,7 @@ class LoginDialog(QDialog):
         form_layout.addRow(register_button)
 
         back_to_login_link = QLabel("<a href='#'>Back to Login</a>")
-        back_to_login_link.linkActivated.connect(lambda: self.stacked_widget.setCurrentWidget(self.login_page_stack))
+        back_to_login_link.linkActivated.connect(lambda: self.stacked_widget.setCurrentWidget(self.login_page))
         form_layout.addRow(back_to_login_link)
 
         layout.addWidget(register_box)

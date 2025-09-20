@@ -4,17 +4,12 @@ Welcome to the official user guide for GScapy + AI. This document provides a det
 
 ## Table of Contents
 1.  [Introduction](#introduction)
-2.  [Main Window Overview](#main-window-overview)
+2.  [User Accounts & Profiles](#user-accounts--profiles)
+3.  [Admin Panel](#admin-panel)
+4.  [Main Window Overview](#main-window-overview)
     -   [Resource Bar](#resource-bar)
     -   [Header Bar (Interface & Theme)](#header-bar)
-    -   [User Profile Menu](#user-profile-menu)
     -   [Live Log](#live-log)
-3.  [User & Admin Management](#user--admin-management)
-    -   [User Profile Dialog](#user-profile-dialog)
-    -   [Admin Panel (For Admins)](#admin-panel-for-admins)
-4.  [Threat Intelligence](#threat-intelligence)
-    -   [Recent Threats](#recent-threats)
-    -   [CVE & Exploit Search](#cve--exploit-search)
 5.  [Packet Sniffer](#packet-sniffer)
 6.  [Packet Crafter](#packet-crafter)
 7.  [Network Tools](#network-tools)
@@ -41,14 +36,13 @@ Welcome to the official user guide for GScapy + AI. This document provides a det
     -   [WPA Handshake Tool](#wpa-handshake-tool)
     -   [KRACK Scanner](#krack-scanner)
     -   [Wifite Auditor](#wifite-auditor)
-10. [Reporting & Analysis](#reporting--analysis)
-    -   [Rules of Engagement (ROE)](#rules-of-engagement-roe)
-    -   [Aggregated Findings](#aggregated-findings)
-    -   [AI-Assisted Reporting](#ai-assisted-reporting)
-    -   [Generating Reports](#generating-reports)
-11. [AI Assistant](#ai-assistant)
-12. [System Info](#system-info)
-13. [Community Tools](#community-tools)
+10. [Threat Intelligence](#threat-intelligence)
+11. [Reporting](#reporting)
+12. [History](#history)
+13. [AI Assistant](#ai-assistant)
+14. [System Info](#system-info)
+15. [Community Tools](#community-tools)
+16. [Exporting Results](#exporting-results)
 
 ---
 
@@ -71,52 +65,8 @@ The top-most bar provides a real-time overview of your system's performance.
 -   **Network Interface:** A crucial dropdown menu where you select the network interface for tools to use. For many tools (especially wireless ones), you must select the correct interface. "Automatic" will let Scapy decide, which is suitable for basic wired connections.
 -   **Theme:** Customize the application's look and feel by choosing from a list of themes.
 
-### User Profile Menu
-Located in the top-right corner of the resource bar, this menu provides access to user-specific functions.
--   **Profile:** Opens the User Profile dialog, where you can change your email, password, and profile avatar.
--   **Logout:** Logs you out of the application.
-
 ### Live Log
 The panel at the bottom of the window shows a live log of the application's actions, including tool commands, errors, and status updates. It is invaluable for debugging and understanding what the application is doing in the background.
-
----
-
-## User & Admin Management
-
-GScapy now includes multi-user support with different roles.
-
-### User Profile Dialog
-Accessible from the user profile menu, this dialog allows you to:
--   View your username.
--   Change your email address.
--   Update your password.
--   Upload a profile picture (avatar).
-
-### Admin Panel (For Admins)
-If you are logged in as an administrator, a new "Admin" menu will appear.
--   **Purpose:** To manage all users in the database.
--   **Features:**
-    -   View a list of all registered users and their status.
-    -   Add new users.
-    -   Edit existing users, including their username and email address.
-    -   Delete users.
-
----
-
-## Threat Intelligence
-
-This tab provides tools to stay updated on the latest vulnerabilities.
-
-### Recent Threats
--   **Purpose:** To automatically display the latest 30 CVEs for up-to-the-minute threat awareness.
--   **UI Layout:**
-    -   The tab automatically fetches and displays a list of the most recent CVEs from the CIRCL API.
-    -   The list is paginated, and you can control how many items are shown per page (10, 20, 30, or 40).
-    -   Clicking a CVE in the list shows its full details in the pane below.
-
-### CVE & Exploit Search
--   **CVE Search:** A frontend for the `nvdlib` library to search the National Vulnerability Database.
--   **Exploit-DB Search:** A frontend for the `getsploit` tool to search Exploit-DB for public exploits. Requires `getsploit` to be installed.
 
 ---
 
@@ -371,40 +321,6 @@ This tab contains tools specifically for 802.11 Wi-Fi network analysis and testi
 
 ---
 
-## Reporting & Analysis
-
-This tab is a powerful workspace for consolidating your findings and generating professional penetration test reports.
-
-### Rules of Engagement (ROE)
--   **Purpose:** To formally document the scope, objectives, and permissions for the engagement.
--   **UI Layout:** A tabbed interface guides you through filling out the critical components of the ROE:
-    -   **General:** Client name, assessment dates, and high-level objectives.
-    -   **Scope:** Detailed fields for in-scope and out-of-scope targets and restrictions.
-    -   **Authorization & POCs:** A field to list Points of Contact and a crucial checkbox to confirm you have written authorization to conduct the test.
-
-### Aggregated Findings
--   **Purpose:** To collect findings from various tools and enrich them with vulnerability data.
--   **UI Layout:**
-    -   **Aggregate & Enrich Results:** This button parses the results from other tools (like Nmap) and automatically queries for relevant CVEs and exploits.
-    -   **Use offline CVE_DB:** Check this box to use a local copy of the NVD for enrichment. The database can be downloaded from the "Threat Intelligence" -> "Offline DB Settings" tab.
-    -   The results are displayed in a table, showing the host, service, finding, and enriched details.
-
-### AI-Assisted Reporting
--   **Purpose:** To leverage an LLM to help write report sections.
--   **UI Layout:**
-    -   **AI Persona:** Select a target audience for the report (e.g., Executive, Technical Manager). The AI will tailor its language and focus accordingly.
-    -   **AI Instructions:** Provide specific, custom instructions to the AI (e.g., "Focus on the financial impact").
-    -   **Generate AI Content:** Sends the aggregated findings, persona, and instructions to the AI assistant.
-    -   The AI's response appears in the text box below, ready to be edited or copied into the Executive Summary.
-
-### Generating Reports
--   **Purpose:** To create the final deliverable.
--   **UI Layout:**
-    -   **Generate HTML Report:** Compiles all the ROE information and findings into a polished HTML report.
-    -   **Generate DOCX Report:** Creates a formal report in a Microsoft Word (`.docx`) file.
-
----
-
 ## AI Assistant
 
 The AI Assistant integrates with large language models (LLMs) to provide analysis and guidance.
@@ -419,7 +335,65 @@ The AI Assistant integrates with large language models (LLMs) to provide analysi
 
 ---
 
-## System Info & Community Tools
+## System Info, Community Tools, and Exporting
 
 -   **System Info:** Displays detailed information about your operating system, hardware (CPU, memory, GPU), network interfaces, and key library versions.
 -   **Community Tools:** Provides a curated list of other popular open-source tools in the Scapy and network security ecosystem, with links to their websites.
+-   **Exporting Results:** Most tools that produce results in a table have an "Export Results" button. This allows you to save the data in various formats for reporting and analysis:
+    -   **CSV:** Comma-Separated Values, for use in spreadsheets.
+    -   **HTML:** A web page for easy viewing.
+    -   **PDF:** A portable document format for reports.
+    -   **DOCX:** A Microsoft Word document.
+
+---
+
+## User Accounts & Profiles
+GScapy now supports a full user account system to provide a personalized and secure experience.
+
+-   **Login:** On startup, you will be prompted to log in or create a new account.
+-   **User Profile:** Access your profile by clicking the user icon in the top-right corner of the Resource Bar and selecting "Profile...".
+-   **Customization:** In your profile, you can:
+    -   Change your email address.
+    -   Update your password (you must enter it twice for confirmation).
+    -   Upload a custom avatar image.
+
+## Admin Panel
+Users marked as administrators have access to a special Admin Panel.
+
+-   **Access:** The Admin Panel is available from the "Admin" menu in the main menu bar.
+-   **User Management:** Administrators can:
+    -   View all registered users.
+    -   Activate or deactivate user accounts.
+    -   Change any user's email address.
+    -   Change any user's username.
+    -   Set a new password for any user.
+    -   Promote or demote other users to/from administrator status.
+
+## Threat Intelligence
+This tab provides tools to stay up-to-date with the latest security threats.
+
+-   **Recent Threats:** This sub-tab automatically fetches and displays the latest 30 CVEs from the `cve.circl.lu` API. It includes pagination controls to navigate through the list. Click on any CVE to see a detailed summary and links to references.
+-   **Exploit-DB Search:** This sub-tab allows you to search for exploits using the `getsploit` command-line tool, which queries the Vulners database. An API key from `vulners.com` is required.
+
+## Reporting
+The Reporting tab has been significantly enhanced to streamline the report creation process.
+
+-   **Rules of Engagement (ROE):** The ROE section is now pre-populated with a detailed template based on industry best practices. Simply fill in the client name, dates, and customize the scope and objectives.
+-   **Offline CVE Database:** The "Aggregated Findings" section now includes an option to "Use offline CVE_DB".
+    -   **Update Offline DB:** Click this button to download all CVE data from the NVD for the years 2002 to the present, plus the latest modifications. This data is stored in a local `cve.db` SQLite file. This process may take a long time on the first run.
+    -   When the "Use offline CVE_DB" checkbox is ticked, the "Aggregate & Enrich Results" button will use this local database instead of live APIs, allowing for offline work.
+-   **AI-Powered Generation:**
+    -   **AI Persona:** Select a persona (e.g., "Technical Manager", "C-Suite Executive") to guide the AI's tone and focus when generating content.
+    -   **AI Instructions:** Provide specific, custom instructions to the AI (e.g., "Focus on the financial impact of the SQL injection vulnerability").
+    -   **Generate with AI:** This button will use the AI to generate report sections based on the aggregated findings, the selected persona, and your custom instructions.
+-   **Final Export:**
+    -   **Generate Final HTML Report:** Creates a report based on the selected HTML template.
+    -   **Generate Report as Doc:** This button will provide options to export the final report in various document formats, such as DOCX, PDF, and CSV.
+
+## History
+*(This feature is under development)*
+
+The History tab will provide a complete audit trail of actions performed within the application.
+-   **User View:** Each user will be able to see a history of their own activities.
+-   **Admin View:** Administrators will be able to view a comprehensive history of all actions performed by all users, with options to filter by user.
+-   **Data Integrity:** Users will not be able to clear their own history, but administrators will have the ability to manage the history logs.

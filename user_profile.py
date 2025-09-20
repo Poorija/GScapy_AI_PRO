@@ -1,95 +1,83 @@
-import sys
-import io
+import os
+import logging
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QFormLayout, QMessageBox, QGroupBox, QFileDialog
+    QDialog, QVBoxLayout, QFormLayout, QLineEdit, QPushButton, QFileDialog,
+    QLabel, QMessageBox, QGroupBox
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtCore import Qt, QSize, QBuffer, QIODevice
 import database
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-
 
 class UserProfileDialog(QDialog):
-    """A dialog for viewing and editing user profile information."""
-    def __init__(self, user_id, parent=None):
+    def __init__(self, user, parent=None):
         super().__init__(parent)
-        self.user_id = user_id
+        self.user = user
         self.setWindowTitle("User Profile")
-        self.setModal(True)
-        self.setMinimumWidth(500)
-        self.new_avatar_data = None
-        self.original_email = ""
+        self.setMinimumSize(400, 500)
 
-        main_layout = QVBoxLayout(self)
+        self.main_layout = QVBoxLayout(self)
+        self._create_widgets()
+        self._populate_data()
 
+    def _create_widgets(self):
         # --- Avatar Section ---
-        avatar_box = QGroupBox("Profile Picture")
+        avatar_box = QGroupBox("Avatar")
         avatar_layout = QVBoxLayout(avatar_box)
-        avatar_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self.avatar_label = QLabel("No Avatar")
+        self.avatar_label = QLabel("No avatar set.")
+        self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.avatar_label.setFixedSize(128, 128)
         self.avatar_label.setStyleSheet("border: 1px solid #888; border-radius: 64px;")
-        self.avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        avatar_layout.addWidget(self.avatar_label)
-
         change_avatar_btn = QPushButton("Change Avatar")
-        change_avatar_btn.clicked.connect(self.change_avatar)
-        avatar_layout.addWidget(change_avatar_btn)
-        main_layout.addWidget(avatar_box)
+        change_avatar_btn.clicked.connect(self._change_avatar)
+        avatar_layout.addWidget(self.avatar_label, 0, Qt.AlignmentFlag.AlignCenter)
+        avatar_layout.addWidget(change_avatar_btn, 0, Qt.AlignmentFlag.AlignCenter)
+        self.main_layout.addWidget(avatar_box)
 
-        # --- Details Section ---
-        details_box = QGroupBox("User Details")
-        form_layout = QFormLayout(details_box)
-
-        self.username_edit = QLineEdit()
-        self.username_edit.setReadOnly(True)
+        # --- Profile Details Section ---
+        details_box = QGroupBox("Profile Details")
+        details_layout = QFormLayout(details_box)
+        self.username_label = QLabel()
         self.email_edit = QLineEdit()
+        self.full_name_edit = QLineEdit()
+        self.age_edit = QLineEdit()
+        self.job_title_label = QLabel()
+        details_layout.addRow("Username:", self.username_label)
+        details_layout.addRow("Email:", self.email_edit)
+        details_layout.addRow("Full Name:", self.full_name_edit)
+        details_layout.addRow("Age:", self.age_edit)
+        details_layout.addRow("Job Title:", self.job_title_label)
+        self.main_layout.addWidget(details_box)
 
-        form_layout.addRow("Username:", self.username_edit)
-        form_layout.addRow("Email:", self.email_edit)
-        main_layout.addWidget(details_box)
-
-        # --- Password Section ---
+        # --- Password Change Section ---
         password_box = QGroupBox("Change Password")
         password_layout = QFormLayout(password_box)
-        self.new_pass_edit = QLineEdit()
-        self.new_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.new_pass_edit.setPlaceholderText("Leave blank to keep current password")
-        self.confirm_pass_edit = QLineEdit()
-        self.confirm_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        password_layout.addRow("New Password:", self.new_pass_edit)
-        password_layout.addRow("Confirm New Password:", self.confirm_pass_edit)
-        main_layout.addWidget(password_box)
+        self.current_password_edit = QLineEdit()
+        self.current_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.new_password_edit = QLineEdit()
+        self.new_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.confirm_password_edit = QLineEdit()
+        self.confirm_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        password_layout.addRow("Current Password:", self.current_password_edit)
+        password_layout.addRow("New Password:", self.new_password_edit)
+        password_layout.addRow("Confirm New Password:", self.confirm_password_edit)
+        self.main_layout.addWidget(password_box)
 
-        # --- Action Buttons ---
-        button_layout = QHBoxLayout()
+        # --- Save Button ---
         self.save_btn = QPushButton("Save Changes")
-        self.save_btn.clicked.connect(self.save_changes)
-        button_layout.addStretch()
-        button_layout.addWidget(self.save_btn)
-        main_layout.addLayout(button_layout)
+        self.save_btn.clicked.connect(self._save_changes)
+        self.main_layout.addWidget(self.save_btn)
 
-        self.load_user_data()
+    def _populate_data(self):
+        """Populates the dialog with the user's current data."""
+        self.username_label.setText(self.user.get('username', 'N/A'))
+        self.email_edit.setText(self.user.get('email', ''))
+        self.full_name_edit.setText(self.user.get('full_name') or "")
+        age = self.user.get('age')
+        self.age_edit.setText(str(age) if age is not None else "")
+        self.job_title_label.setText(self.user.get('job_title') or "Not set")
 
-    def load_user_data(self):
-        """Loads user data from the database and populates the dialog."""
-        user_data = database.get_user_by_id(self.user_id)
-        if not user_data:
-            QMessageBox.critical(self, "Error", "Could not load user data.")
-            self.close()
-            return
-
-        self.username_edit.setText(user_data['username'])
-        self.email_edit.setText(user_data['email'])
-        self.original_email = user_data['email']
-
-        avatar_data = user_data['avatar']
+        # Load avatar
+        avatar_data = self.user.get('avatar')
         if avatar_data:
             pixmap = QPixmap()
             pixmap.loadFromData(avatar_data)
@@ -97,77 +85,62 @@ class UserProfileDialog(QDialog):
         else:
             self.avatar_label.setText("No Avatar")
 
-    def change_avatar(self):
+    def _change_avatar(self):
         """Opens a file dialog to select a new avatar image."""
-        if not PIL_AVAILABLE:
-            QMessageBox.critical(self, "Dependency Error", "The 'Pillow' library is required to change avatars. Please install it using 'pip install Pillow'.")
-            return
-
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Avatar", "", "Image Files (*.png *.jpg *.jpeg *.bmp)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Avatar", "", "Image Files (*.png *.jpg *.jpeg *.bmp)", options=QFileDialog.Option.DontUseNativeDialog)
         if file_path:
-            try:
-                with Image.open(file_path) as img:
-                    img.thumbnail((128, 128))
-                    byte_array = io.BytesIO()
-                    img.save(byte_array, format='PNG')
-                    self.new_avatar_data = byte_array.getvalue()
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(self.new_avatar_data)
-                    self.avatar_label.setPixmap(pixmap)
-            except Exception as e:
-                QMessageBox.critical(self, "Image Error", f"Could not process image: {e}")
+            pixmap = QPixmap(file_path)
+            self.avatar_label.setPixmap(pixmap.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
-    def save_changes(self):
-        """Saves all changed data to the database."""
-        changes_made = False
+    def _save_changes(self):
+        """Validates input and saves all changes to the database."""
+        try:
+            # --- Save Profile Info ---
+            new_email = self.email_edit.text().strip()
+            if new_email != self.user.get('email'):
+                database.update_user_email(self.user['id'], new_email)
 
-        # --- Save Avatar ---
-        if self.new_avatar_data:
-            try:
-                database.update_user_avatar(self.user_id, self.new_avatar_data)
-                self.new_avatar_data = None
-                changes_made = True
-            except Exception as e:
-                QMessageBox.critical(self, "Database Error", f"Failed to save avatar: {e}")
-                return
+            database.update_user_profile(
+                self.user['id'],
+                self.full_name_edit.text(),
+                self.age_edit.text(),
+                self.job_title_label.text() # This is a label, not editable by user directly
+            )
 
-        # --- Save Email ---
-        new_email = self.email_edit.text().strip()
-        if new_email != self.original_email:
-            if not new_email:
-                QMessageBox.warning(self, "Input Error", "Email cannot be empty.")
-                return
-            try:
-                database.update_user_email(self.user_id, new_email)
-                changes_made = True
-            except ValueError as ve:
-                QMessageBox.warning(self, "Input Error", str(ve))
-                return
-            except Exception as e:
-                QMessageBox.critical(self, "Database Error", f"Failed to update email: {e}")
-                return
+            # --- Save Avatar ---
+            # The pixmap is already on the label from _change_avatar
+            pixmap = self.avatar_label.pixmap()
+            if pixmap and not pixmap.isNull():
+                # Convert QPixmap to bytes
+                image = pixmap.toImage()
+                buffer = QtCore.QBuffer()
+                buffer.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+                image.save(buffer, "PNG")
+                avatar_data = buffer.data()
+                database.update_user_avatar(self.user['id'], avatar_data)
 
-        # --- Save Password ---
-        new_password = self.new_pass_edit.text()
-        confirm_password = self.confirm_pass_edit.text()
-        if new_password:
-            if len(new_password) < 8:
-                QMessageBox.warning(self, "Input Error", "New password must be at least 8 characters long.")
-                return
-            if new_password != confirm_password:
-                QMessageBox.warning(self, "Input Error", "Passwords do not match.")
-                return
-            try:
-                database.update_user_password(self.user_id, new_password)
-                changes_made = True
-            except Exception as e:
-                QMessageBox.critical(self, "Database Error", f"Failed to update password: {e}")
-                return
+            # --- Save Password ---
+            current_pass = self.current_password_edit.text()
+            new_pass = self.new_password_edit.text()
+            confirm_pass = self.confirm_password_edit.text()
 
-        if changes_made:
-            QMessageBox.information(self, "Success", "Profile updated successfully.")
+            if current_pass or new_pass or confirm_pass: # Only if user is trying to change password
+                # Verify current password
+                verified_user = database.verify_user(self.user['username'], current_pass)
+                if not verified_user:
+                    raise ValueError("Current password is not correct.")
+                if not new_pass:
+                    raise ValueError("New password cannot be empty.")
+                if new_pass != confirm_pass:
+                    raise ValueError("New passwords do not match.")
 
-        self.accept()
+                database.update_user_password(self.user['id'], new_pass)
 
-if __name__ == '__main__':
-    print("This dialog cannot be run directly. It must be launched from the main application.")
+            QMessageBox.information(self, "Success", "Your profile has been updated successfully.")
+            self.accept() # Close the dialog on success
+
+        except ValueError as ve:
+            QMessageBox.warning(self, "Input Error", str(ve))
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
+            logging.error(f"Error saving profile for user {self.user['id']}: {e}", exc_info=True)

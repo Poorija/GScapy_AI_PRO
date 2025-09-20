@@ -4,11 +4,23 @@
 
 GScapy + AI is a modern, feature-rich graphical user interface for the powerful Scapy packet manipulation library, now supercharged with AI analysis capabilities. Built with Python and PyQt6, it provides a user-friendly environment for network sniffing, packet crafting, and running various network tools for security testing and analysis.
 
+### What's New in Version 3.0
+- **User Accounts & Profiles:** The application now supports multiple user accounts with password protection and user avatars.
+- **Admin Panel:** A dedicated panel for administrators to manage users, including changing emails and usernames.
+- **Threat Intelligence:** A new tab to view the latest CVEs and search for exploits.
+- **Advanced Reporting:** The reporting tab has been overhauled with a comprehensive ROE template, an offline CVE database, and AI-powered report generation features.
+- **History & Auditing:** A new history tab tracks all actions performed by users, providing a complete audit trail (admin-only).
+
 ## Features
 
 GScapy is organized into a series of tabs, each dedicated to a specific function:
 
-### 1. AI Assistant (New!)
+### 1. User Accounts & Profiles
+- **Secure Login:** Support for multiple users with password-protected logins.
+- **User Profiles:** Users can manage their own profile, including changing their email, password, and uploading a custom avatar.
+- **Admin Panel:** A dedicated panel for administrators to manage all user accounts.
+
+### 2. AI Assistant (New!)
 - **Conversational Interface:** A redesigned, modern chat interface for interacting with local or online Large Language Models (LLMs).
 - **Security Analysis:** Paste scan results, code, or configurations and ask the AI to analyze them for vulnerabilities, misconfigurations, or interesting patterns.
 - **Guided Prompts:** A huge, built-in library of over 80 prompts for penetration testing, vulnerability analysis, reporting, and more.
@@ -59,19 +71,7 @@ GScapy is organized into a series of tabs, each dedicated to a specific function
 - **WPA Handshake & Cracker:** A comprehensive tool to capture WPA/WPA2 handshakes and then crack the password using `aircrack-ng` with a provided wordlist. Includes a helper to generate wordlists with `crunch`.
 - **KRACK Scanner:** Passively sniff for retransmitted EAPOL messages to detect networks vulnerable to Key Reinstallation Attacks (KRACK).
 
-### 7. Reporting & Analysis
-- **Comprehensive ROE:** A tabbed interface to define detailed Rules of Engagement, including scope, objectives, and points of contact.
-- **AI-Assisted Reporting:**
-    - **AI Personas:** Select a persona (e.g., Executive, Technical Manager) to tailor the tone and content of AI-generated report sections.
-    - **Custom Instructions:** Provide specific instructions to the AI to focus its analysis.
-- **Multi-Format Export:** Generate final reports in both HTML and DOCX formats.
-- **Offline CVE Database:** Download the NVD database to perform vulnerability enrichment without an internet connection.
-
-### 8. User & Admin Management
-- **User Profiles:** Users can manage their own profile, including changing their email, password, and avatar.
-- **Admin Panel:** A dedicated panel for administrators to manage users, including updating their username and email address.
-
-### 9. System & Community
+### 7. System & Community
 - **System Info:** View detailed information about your system, including OS, CPU, memory, disk, and network interfaces in a modern card-style layout.
 - **Community Tools:** A curated list of other popular open-source network security tools.
 

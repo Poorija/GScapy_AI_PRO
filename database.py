@@ -100,19 +100,6 @@ def create_tables():
     );
     """)
 
-    # New, more comprehensive activity log
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS activity_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        timestamp TEXT NOT NULL,
-        activity_type TEXT NOT NULL,
-        details TEXT,
-        full_data TEXT,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    );
-    """)
-
     conn.commit()
     conn.close()
     logging.info("Database tables created or already exist.")
@@ -175,7 +162,6 @@ def verify_user(username, password):
     hashed_password = hash_password(password)
     if user['password_hash'] == hashed_password and user['is_active'] == 1:
         clear_login_attempts(user['id']) # Success, clear attempts
-        log_activity(user['id'], 'User Login', 'Successful login.', '')
         conn.close()
         return user
     else:
@@ -298,66 +284,11 @@ def update_user_profile(user_id, full_name, age, job_title):
     conn.commit()
     conn.close()
 
-def update_user_email_by_admin(user_id, new_email):
-    """Updates the email for a given user, checking for uniqueness."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE email = ? AND id != ?", (new_email, user_id))
-    if cursor.fetchone():
-        conn.close()
-        raise ValueError("Email address is already in use by another account.")
-    cursor.execute("UPDATE users SET email = ? WHERE id = ?", (new_email, user_id))
-    conn.commit()
-    conn.close()
-
-def update_user_username_by_admin(user_id, new_username):
-    """Updates the username for a given user, checking for uniqueness."""
-    if new_username.lower() == 'admin' and user_id != 1: # Assuming admin ID is 1
-         raise ValueError("Cannot rename a user to 'admin'.")
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE username = ? AND id != ?", (new_username, user_id))
-    if cursor.fetchone():
-        conn.close()
-        raise ValueError("Username is already in use by another account.")
-    cursor.execute("UPDATE users SET username = ? WHERE id = ?", (new_username, user_id))
-    conn.commit()
-    conn.close()
-
 def set_user_active_status(user_id, is_active):
     """Updates the is_active status for a given user."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET is_active = ? WHERE id = ?", (int(is_active), user_id))
-    conn.commit()
-    conn.close()
-
-def get_user_by_id(user_id):
-    """Fetches a user by their ID."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
-
-def update_user_email(user_id, new_email):
-    """Updates the email for a given user, checking for uniqueness."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE email = ? AND id != ?", (new_email, user_id))
-    if cursor.fetchone():
-        conn.close()
-        raise ValueError("Email address is already in use by another account.")
-    cursor.execute("UPDATE users SET email = ? WHERE id = ?", (new_email, user_id))
-    conn.commit()
-    conn.close()
-
-def update_user_avatar(user_id, avatar_data):
-    """Updates the avatar for a given user."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET avatar = ? WHERE id = ?", (avatar_data, user_id))
     conn.commit()
     conn.close()
 
@@ -412,39 +343,6 @@ def verify_security_answers(user_id, answers_dict):
 
     conn.close()
     return True # All answers were correct
-
-def log_activity(user_id, activity_type, details, full_data=""):
-    """Logs a user's activity to the database."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    try:
-        cursor.execute("""
-            INSERT INTO activity_log (user_id, timestamp, activity_type, details, full_data)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, timestamp, activity_type, details, full_data))
-        conn.commit()
-    except Exception as e:
-        logging.error(f"Failed to log activity for user {user_id}: {e}")
-    finally:
-        conn.close()
-
-def get_history_for_user(user_id):
-    """Retrieves the activity history for a specific user."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, user_id, timestamp, activity_type, details, full_data FROM activity_log WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
-    history = cursor.fetchall()
-    conn.close()
-    return history
-
-def delete_history_record(record_id):
-    """Deletes a specific history record by its ID."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM activity_log WHERE id = ?", (record_id,))
-    conn.commit()
-    conn.close()
 
 def initialize_database():
     """
