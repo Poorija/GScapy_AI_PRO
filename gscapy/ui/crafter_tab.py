@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QMenu, QMessageBox, QApplication
 )
 from PyQt6.QtGui import QAction
+from PyQt6.QtCore import Qt
 
 # Scapy and other backend imports
 from scapy.all import *

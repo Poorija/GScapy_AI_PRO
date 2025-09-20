@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QFileDialog, QMessageBox
 )
 from PyQt6.QtGui import QIcon, QFont
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, Qt
 
 # Scapy and other backend imports
 from scapy.all import hexdump, Ether, IP, ARP, rdpcap, wrpcap
@@ -90,12 +90,12 @@ class SnifferTab(QWidget):
 
         # Main splitter for top (list) and bottom (details)
         main_splitter = QSplitter(self)
-        main_splitter.setOrientation(QVBoxLayout.Direction.Up)
+        main_splitter.setOrientation(Qt.Orientation.Vertical)
         main_splitter.addWidget(self.packet_list_widget)
 
         # Bottom splitter for details tree and hex view
         bottom_splitter = QSplitter(main_splitter)
-        bottom_splitter.setOrientation(QVBoxLayout.Direction.Up)
+        bottom_splitter.setOrientation(Qt.Orientation.Vertical)
 
         self.packet_details_tree = QTreeWidget()
         self.packet_details_tree.setHeaderLabels(["Field", "Value"])
